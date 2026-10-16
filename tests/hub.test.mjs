@@ -61,6 +61,49 @@ test("real socket hub: isolated spaces, task exchange, rollback and restart reco
   await assert.rejects(sync(returning), /moved|space|disconnected/);
 });
 
+test("push hints are opt-in, scoped, coalesced, and preserve partial request frames", { timeout: 12000 }, async t => {
+  const f = await fixture(t); await f.start();
+  const sender = await join(t, f, "sender", "w1:p1");
+  const worker = await join(t, f, "worker", "w1:p2");
+  const stranger = await join(t, f, "stranger", "w2:p1", "w2");
+  let notices = 0, otherNotices = 0, unsubscribedNotices = 0;
+  worker.onInboxReady = () => notices++;
+  stranger.onInboxReady = () => otherNotices++;
+  sender.onInboxReady = () => unsubscribedNotices++;
+  await worker.request({ op: "subscribe" });
+  await stranger.request({ op: "subscribe" });
+  const packets = []; let buffer = "";
+  worker.socket.on("data", chunk => {
+    buffer += chunk;
+    while (buffer.includes("\n")) {
+      const index = buffer.indexOf("\n");
+      packets.push(JSON.parse(buffer.slice(0, index))); buffer = buffer.slice(index + 1);
+    }
+  });
+  // A notification must not cancel read_line and discard this partial frame.
+  worker.socket.write('{"id":"frag');
+  await sender.request({ op: "send", to: "worker", text: "push, not polling", wake: false });
+  await eventually(() => notices === 1);
+  assert.deepEqual(packets.find(p => p.event), { event: "inbox_ready" });
+  worker.socket.write('ment","op":"sync","activity":"idle","receive":true}\n');
+  await eventually(() => packets.some(p => p.id === "fragment"));
+  const response = packets.find(p => p.id === "fragment");
+  assert.equal(response.ok, true);
+  assert.equal(response.result.inbox.text, "push, not polling");
+  await sender.request({ op: "send", to: "worker", text: "second", wake: false });
+  for (let i = 0; i < 3; i++) await sync(sender);
+  await delay(150);
+  assert.equal(notices, 1, "no more offers/hints while insertion is unconfirmed");
+  await worker.request({ op: "ack", message_id: response.result.inbox.id });
+  await eventually(() => notices === 2);
+  assert.equal((await receive(worker)).text, "second");
+  await worker.request({ op: "send", to: "sender", text: "legacy poller", wake: false });
+  await delay(150);
+  assert.equal(otherNotices, 0);
+  assert.equal(unsubscribedNotices, 0);
+  assert.equal((await receive(sender)).text, "legacy poller");
+});
+
 test("TODO waits for delegated work; disabling cancels pending automation", { timeout: 15000 }, async t => {
   const f = await fixture(t); await f.start();
   const driver = await join(t, f, "driver", "w1:p1");
@@ -120,11 +163,13 @@ else { console.error("Unexpected command"); process.exit(99); }
   assert.ok(calls.every(c => c.name === "git" ? c.args[0] === "rev-parse" : ["pr", "api"].includes(c.args[0])));
 });
 
-test("TUI restores alternate screen and uses terminal-native colors", { timeout: 15000, skip: process.platform !== "darwin" }, async t => {
+test("TUI opens its live space, restores alternate screen and uses terminal-native colors", { timeout: 15000, skip: process.platform !== "darwin" }, async t => {
   const f = await fixture(t);
+  // Live pane identity must win over inherited/stale workspace environment.
+  f.panes.set("w1:p0", { pane_id: "w1:p0", workspace_id: "w2", agent: null });
   const project = `${f.directory}/pty`; await mkdir(project);
   await writeFile(`${project}/pyproject.toml`, '[project]\nname = "mustr-pty-test"\nversion = "0.0.0"\nrequires-python = ">=3.9"\ndependencies = []\n');
-  const child = spawn("uv", ["run", "--project", project, fileURLToPath(new URL("pty-smoke.py", import.meta.url)), binary], { env: { ...f.env, TERM: "xterm-256color" }, stdio: ["pipe", "pipe", "pipe"] });
+  const child = spawn("uv", ["run", "--project", project, fileURLToPath(new URL("pty-smoke.py", import.meta.url)), binary], { env: { ...f.env, HERDR_WORKSPACE_ID: "w1", MUSTR_TEST_INITIAL_TAB: "2/2", TERM: "xterm-256color" }, stdio: ["pipe", "pipe", "pipe"] });
   f.track(child);
   let output = ""; child.stdout.on("data", b => output += b); child.stderr.on("data", b => output += b);
   const [code] = await once(child, "exit");

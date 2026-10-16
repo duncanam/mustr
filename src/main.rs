@@ -3,6 +3,7 @@
 
 mod cli;
 mod config;
+mod delivery;
 mod herdr;
 mod hub;
 mod install;
@@ -87,6 +88,7 @@ async fn main() -> Result<()> {
             } else {
                 tui::run(
                     server.service.clone(),
+                    server.initial_space.clone(),
                     config.ui.color && std::env::var_os("NO_COLOR").is_none(),
                 )
                 .await

@@ -252,8 +252,11 @@ impl Actor {
                     }
                 }
             }
-            self.snapshots
-                .send_replace(self.state.snapshot(self.spaces.clone(), self.error.clone()));
+            self.snapshots.send_replace(self.state.snapshot(
+                self.spaces.clone(),
+                self.error.clone(),
+                now,
+            ));
         }
     }
 }

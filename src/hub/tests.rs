@@ -1,5 +1,7 @@
 use super::*;
 
+mod delivery;
+
 fn request(id: &str, command: Command) -> Request {
     Request {
         id: id.into(),
@@ -72,6 +74,113 @@ fn assign(state: &mut State, architect: &AgentId, worker: &AgentId, config: &Sch
         .unwrap();
     serde_json::from_value(result["task_id"].clone()).unwrap()
 }
+#[test]
+fn working_recipients_receive_only_live_comments_without_head_of_line_blocking() {
+    let (mut state, architect, worker, config) = setup();
+    assign(&mut state, &architect, &worker, &config);
+    let space = SpaceId::new("w1");
+    for kind in [
+        MessageKind::Guide,
+        MessageKind::Checkin,
+        MessageKind::Continue,
+        MessageKind::Todo,
+        MessageKind::Pr,
+    ] {
+        state
+            .queue(
+                &space,
+                None,
+                &worker,
+                None,
+                kind,
+                "Idle-only work".into(),
+                true,
+                1,
+            )
+            .unwrap();
+    }
+    for kind in [
+        MessageKind::Info,
+        MessageKind::Request,
+        MessageKind::Status,
+        MessageKind::Blocked,
+        MessageKind::Done,
+    ] {
+        state
+            .queue(
+                &space,
+                Some(&architect),
+                &worker,
+                None,
+                kind,
+                "Live feedback".into(),
+                false,
+                1,
+            )
+            .unwrap();
+        for (activity, receive) in [(Activity::Paused, true), (Activity::Working, false)] {
+            let result = state
+                .apply(
+                    &request("gated", Command::Sync { activity, receive }),
+                    Some(&worker),
+                    2,
+                    &config,
+                )
+                .unwrap();
+            assert!(result["inbox"].is_null());
+        }
+        let result = state
+            .apply(
+                &request(
+                    "live",
+                    Command::Sync {
+                        activity: Activity::Working,
+                        receive: true,
+                    },
+                ),
+                Some(&worker),
+                2,
+                &config,
+            )
+            .unwrap();
+        let message: Message = serde_json::from_value(result["inbox"].clone()).unwrap();
+        assert_eq!(message.kind, kind);
+        state
+            .apply(
+                &request(
+                    "ack",
+                    Command::Ack {
+                        message_id: message.id,
+                    },
+                ),
+                Some(&worker),
+                2,
+                &config,
+            )
+            .unwrap();
+    }
+    let result = state
+        .apply(
+            &request(
+                "busy",
+                Command::Sync {
+                    activity: Activity::Working,
+                    receive: true,
+                },
+            ),
+            Some(&worker),
+            2,
+            &config,
+        )
+        .unwrap();
+    assert!(result["inbox"].is_null());
+    assert_eq!(state.messages[0].delivery, Delivery::Pending);
+    assert_eq!(
+        receive(&mut state, &worker, &config, 3).unwrap().kind,
+        MessageKind::Assignment
+    );
+}
+
 fn receive(state: &mut State, agent: &AgentId, config: &Scheduling, now: u64) -> Option<Message> {
     let result = state
         .apply(

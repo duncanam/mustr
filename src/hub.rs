@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 use crate::{
     config::Scheduling,
+    delivery::{Deferral, InsertionPolicy, Offered, Pending},
     paths::digest,
     protocol::*,
     roles::valid_name,
@@ -60,7 +61,7 @@ impl State {
         }
     }
 
-    pub fn snapshot(&self, spaces: Vec<Space>, error: Option<String>) -> Snapshot {
+    pub fn snapshot(&self, spaces: Vec<Space>, error: Option<String>, now: u64) -> Snapshot {
         let mut members: Vec<_> = self.members.values().cloned().collect();
         members.sort_by(|a, b| {
             (a.activity == Activity::Offline)
@@ -74,6 +75,25 @@ impl State {
             members,
             tasks,
             messages: self.messages.iter().rev().take(200).cloned().collect(),
+            ready: self
+                .members
+                .values()
+                .filter_map(|member| {
+                    if self
+                        .messages
+                        .iter()
+                        .any(|m| m.to == member.id && m.delivery == Delivery::Offered)
+                    {
+                        return None;
+                    }
+                    self.messages
+                        .iter()
+                        .find(|m| {
+                            Pending::eligible(m, &member.id, &member.space_id, member.activity, now)
+                        })
+                        .map(|m| (member.id.clone(), m.id.clone()))
+                })
+                .collect(),
             automation: self.automation.clone(),
             error,
         }
@@ -93,7 +113,11 @@ impl State {
         let fingerprint = digest(serde_json::to_vec(&request.command)?);
         let mutation = !matches!(
             request.command,
-            Command::Join { .. } | Command::Sync { .. } | Command::Ack { .. } | Command::Leave
+            Command::Join { .. }
+                | Command::Subscribe
+                | Command::Sync { .. }
+                | Command::Ack { .. }
+                | Command::Leave
         );
         if mutation
             && let Some(sender) = sender
@@ -200,7 +224,9 @@ impl State {
                 },
             );
             self.automation.entry(space_id.clone()).or_default();
-            return Ok(json!({"protocol": VERSION, "agent_id": agent_id}));
+            return Ok(
+                json!({"protocol": VERSION, "agent_id": agent_id, "delivery_policy": 1, "inbox_notifications": 1}),
+            );
         }
         let sender = sender.ok_or_else(|| eyre!("register before sending commands"))?;
         let member = self
@@ -210,6 +236,7 @@ impl State {
             .cloned()
             .ok_or_else(|| eyre!("participant is disconnected"))?;
         match command {
+            Command::Subscribe => Ok(json!({"subscribed":true})),
             Command::Sync { activity, receive } => {
                 ensure!(*activity != Activity::Offline, "use leave to disconnect");
                 let current = self
@@ -224,22 +251,26 @@ impl State {
                 if *activity == Activity::Paused {
                     self.cancel_auto_for(sender);
                 }
-                let position = if *receive && *activity == Activity::Idle {
+                // The hub, not a cooperative client's local flag, enforces one offer.
+                // Heartbeats continue while Pi takes arbitrarily long to insert it.
+                let in_flight = self
+                    .messages
+                    .iter()
+                    .any(|m| &m.to == sender && m.delivery == Delivery::Offered);
+                let position = if *receive && !in_flight {
                     self.messages.iter().position(|m| {
-                        &m.to == sender
-                            && m.space_id == member.space_id
-                            && m.delivery == Delivery::Pending
-                            && (m.kind != MessageKind::Pr || now.saturating_sub(m.created_at) <= 5)
+                        Pending::eligible(m, sender, &member.space_id, *activity, now)
                     })
                 } else {
                     None
                 };
-                let inbox = position.map(|i| {
-                    self.messages[i].delivery = Delivery::Offered;
-                    let mut envelope = self.messages[i].clone();
-                    envelope.pr_ack = None; // fingerprints are internal receipt bookkeeping, not model context
-                    envelope
-                });
+                let inbox = position
+                    .map(|i| {
+                        Pending::new(&mut self.messages[i])
+                            .map(|pending| pending.offer().envelope())
+                    })
+                    .transpose()?;
+                let insertion_policy = inbox.as_ref().map(|m| InsertionPolicy::for_kind(m.kind));
                 if *receive
                     && self.messages.iter().any(|m| {
                         &m.to == sender
@@ -282,7 +313,7 @@ impl State {
                     "pr":a.pr.as_ref().map(|p| json!({"url":p.url,"driver":p.driver,"next_at":p.next_at,"error":p.error}))
                 }));
                 Ok(
-                    json!({"members":members,"tasks":tasks,"tasks_truncated":relevant.len()>64,"inbox":inbox,"automation":automation}),
+                    json!({"members":members,"tasks":tasks,"tasks_truncated":relevant.len()>64,"inbox":inbox,"insertion_policy":insertion_policy,"automation":automation}),
                 )
             }
             Command::Send { to, text, wake } => {
@@ -479,31 +510,55 @@ impl State {
                         &m.id == message_id && &m.to == sender && m.space_id == member.space_id
                     })
                     .ok_or_else(|| eyre!("unknown recipient message"))?;
-                ensure!(
-                    matches!(message.delivery, Delivery::Offered | Delivery::Received),
-                    "message was not offered on this session"
-                );
-                message.delivery = Delivery::Received;
-                if matches!(message.kind, MessageKind::Assignment | MessageKind::Guide)
-                    && let Some(task) = message
+                if message.delivery == Delivery::Received {
+                    return Ok(
+                        json!({"received":true,"note":"receipt is not execution or completion"}),
+                    );
+                }
+                Offered::for_recipient(message, sender, &member.space_id)?
+                    .acknowledge()
+                    .apply(
+                        &mut self.tasks,
+                        self.automation.get_mut(&member.space_id),
+                        now,
+                    );
+                Ok(json!({"received":true,"note":"receipt is not execution or completion"}))
+            }
+            Command::Defer { message_id } => {
+                let message = self
+                    .messages
+                    .iter_mut()
+                    .find(|m| &m.id == message_id)
+                    .ok_or_else(|| eyre!("unknown recipient message"))?;
+                // Modes/tasks can change while Pi is deciding whether to insert.
+                // Returning an offer must not revive superseded or disabled work.
+                let enabled = !message.kind.automatic()
+                    || self
+                        .automation
+                        .get(&member.space_id)
+                        .is_some_and(|a| match message.kind {
+                            MessageKind::Todo | MessageKind::Continue => a.todo_enabled,
+                            MessageKind::Checkin => a.checkin_enabled,
+                            MessageKind::Pr => a.pr_enabled,
+                            _ => true,
+                        });
+                let superseded = message.wake
+                    && message
                         .task_id
                         .as_ref()
-                        .and_then(|id| self.tasks.get_mut(id))
-                    && task.state == TaskState::Assigned
-                    && Some(task.revision) == message.revision
-                {
-                    task.state = TaskState::Active;
-                    task.updated_at = now;
-                }
-                if let Some(baseline) = message.pr_ack.take()
-                    && let Some(pr) = self
-                        .automation
-                        .get_mut(&member.space_id)
-                        .and_then(|a| a.pr.as_mut())
-                {
-                    pr.baseline = Some(baseline);
-                }
-                Ok(json!({"received":true,"note":"receipt is not execution or completion"}))
+                        .and_then(|id| self.tasks.get(id))
+                        .is_some_and(|task| {
+                            task.state.finished()
+                                || message.revision != Some(task.revision)
+                                || (message.kind.automatic() && task.state != TaskState::Active)
+                        });
+                let disposition = if !enabled || superseded {
+                    Deferral::Discard
+                } else {
+                    Deferral::Requeue
+                };
+                Offered::for_recipient(message, sender, &member.space_id)?.defer(disposition);
+                Ok(json!({"deferred":true}))
             }
             Command::ConfigureTodo { path } => {
                 let path = std::path::PathBuf::from(path);

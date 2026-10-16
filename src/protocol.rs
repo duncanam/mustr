@@ -63,6 +63,8 @@ pub(crate) enum Command {
         pane_id: String,
         space_id: SpaceId,
     },
+    /// Opt in to content-free inbox-ready socket notifications.
+    Subscribe,
     Sync {
         activity: Activity,
         receive: bool,
@@ -99,6 +101,10 @@ pub(crate) enum Command {
         text: String,
     },
     Ack {
+        message_id: MessageId,
+    },
+    /// Release an offer only when the adapter has not attempted Pi insertion.
+    Defer {
         message_id: MessageId,
     },
     ConfigureTodo {
@@ -258,6 +264,9 @@ pub(crate) struct Snapshot {
     pub members: Vec<Member>,
     pub tasks: Vec<Task>,
     pub messages: Vec<Message>,
+    /// Actor-internal readiness over the full queue, not the bounded UI preview.
+    #[serde(skip)]
+    pub ready: std::collections::BTreeMap<AgentId, MessageId>,
     pub automation: std::collections::BTreeMap<SpaceId, Automation>,
     pub error: Option<String>,
 }

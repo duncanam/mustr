@@ -29,6 +29,7 @@ use crate::{
 
 pub(crate) struct Server {
     pub service: Service,
+    pub initial_space: SpaceId,
     stop: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
     socket: PathBuf,
@@ -37,7 +38,7 @@ pub(crate) struct Server {
 
 impl Server {
     pub async fn start(herdr: Herdr, paths: &Paths, config: &Config) -> Result<Self> {
-        herdr.discovery().await?;
+        let discovery = herdr.discovery().await?;
         let socket = herdr.hub_socket()?;
         let lock_path = socket.with_extension("lock");
         let lock = OpenOptions::new()
@@ -80,6 +81,7 @@ impl Server {
         tracing::info!(socket = %socket.display(), "hub started");
         Ok(Self {
             service,
+            initial_space: discovery.space_id,
             stop,
             tasks,
             socket,
@@ -146,15 +148,44 @@ async fn connection(stream: UnixStream, id: u64, herdr: &Herdr, service: &Servic
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
     let mut identity: Option<(String, SpaceId)> = None;
+    let mut recipient: Option<AgentId> = None;
+    let mut subscribed = false;
+    let mut notified: Option<MessageId> = None;
+    let mut snapshots = service.snapshots.clone();
     loop {
         let mut line = String::new();
-        let size = timeout(
-            Duration::from_secs(20),
-            (&mut reader)
-                .take(MAX_FRAME as u64 + 1)
-                .read_line(&mut line),
-        )
-        .await??;
+        let size = {
+            let mut limited = (&mut reader).take(MAX_FRAME as u64 + 1);
+            let reading = timeout(Duration::from_secs(20), limited.read_line(&mut line));
+            tokio::pin!(reading);
+            loop {
+                if subscribed {
+                    let ready = recipient
+                        .as_ref()
+                        .and_then(|agent| snapshots.borrow_and_update().ready.get(agent).cloned());
+                    if ready != notified {
+                        notified = ready.clone();
+                        if ready.is_some() {
+                            // Only a content-free, recipient-scoped hint. Normal sync
+                            // still checks identity, activity and transactional offering.
+                            timeout(
+                                Duration::from_secs(5),
+                                write.write_all(b"{\"event\":\"inbox_ready\"}\n"),
+                            )
+                            .await??;
+                        }
+                    }
+                }
+                tokio::select! {
+                    result = &mut reading => break result??,
+                    changed = snapshots.changed(), if subscribed => {
+                        ensure!(changed.is_ok(), "hub stopped");
+                    }
+                }
+                // Keep the SAME pinned read future across notifications: cancelling
+                // read_line and restarting it would lose partial client frames.
+            }
+        };
         if size == 0 {
             break;
         }
@@ -196,11 +227,21 @@ async fn connection(stream: UnixStream, id: u64, herdr: &Herdr, service: &Servic
                 break;
             }
         }
-        let joining = matches!(request.command, Command::Join { .. });
+        let joining = match &request.command {
+            Command::Join { agent_id, .. } => Some(agent_id.clone()),
+            _ => None,
+        };
+        let subscribing = matches!(request.command, Command::Subscribe);
         let leaving = matches!(request.command, Command::Leave);
         let response = service.request(id, request).await?;
-        if joining && response.ok {
-            identity = check;
+        if response.ok {
+            if let Some(agent) = joining {
+                identity = check;
+                recipient = Some(agent);
+            }
+            if subscribing {
+                subscribed = true;
+            }
         }
         let bytes = format!("{}\n", serde_json::to_string(&response)?);
         ensure!(bytes.len() <= MAX_FRAME, "response exceeds frame limit");

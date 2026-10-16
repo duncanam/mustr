@@ -14,6 +14,8 @@ export class HubClient {
   connected = false;
   /** @type {(() => void) | undefined} */
   onClose;
+  /** @type {(() => void) | undefined} Content-free hint; normal sync still owns delivery. */
+  onInboxReady;
 
   /** @param {string} path @param {Record<string, unknown>} hello */
   async connect(path, hello) {
@@ -54,6 +56,10 @@ export class HubClient {
       if (Buffer.byteLength(line) > MAX_FRAME) { this.close(); return; }
       let response;
       try { response = JSON.parse(line); } catch { this.close(); return; }
+      if (response?.event === "inbox_ready" && Object.keys(response).length === 1) {
+        this.onInboxReady?.();
+        continue;
+      }
       if (!response || Array.isArray(response) || typeof response.id !== "string" || typeof response.ok !== "boolean") { this.close(); return; }
       const p = this.pending.get(response.id);
       if (!p) continue;
@@ -86,9 +92,11 @@ export class HubClient {
   close() { this.socket?.destroy(); }
 }
 
-/** Receiving the same ID twice never injects a second model message. */
-export function alreadyReceived(entries, id) {
-  return entries.some(e => e.type === "custom" && e.customType === "mustr-received" && e.data?.id === id);
+/** Inspect only the current session branch. An attempt marker is NOT a receipt. */
+export function insertionEvidence(entries, id) {
+  if (entries.some(e => e.type === "custom_message" && e.customType === "mustr" && e.details?.id === id)) return "inserted";
+  if (entries.some(e => e.type === "custom" && e.customType === "mustr-received" && e.data?.id === id)) return "attempted";
+  return "absent";
 }
 
 export function messageText(message) {

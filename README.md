@@ -15,7 +15,7 @@ Restart Pi or `/reload`.
 
 ## Use
 
-Run `mustr` in one herdr tab. Open separate Pi sessions in other tabs of the same space, then select **one role in each session**:
+Run `mustr` in one herdr tab; its dashboard opens on that tab's current space. Open separate Pi sessions in other tabs of the same space, then select **one role in each session**:
 
 | Pi session | Command |
 |---|---|
