@@ -1,0 +1,109 @@
+//! Command-line surface; clap owns validation and help output.
+
+use std::path::PathBuf;
+
+use clap::{Parser, Subcommand};
+use clap_verbosity_flag::{InfoLevel, Verbosity};
+
+#[derive(Debug, Parser)]
+#[command(version, about, long_about = None)]
+pub(crate) struct Cli {
+    /// Configuration directory (defaults to $XDG_CONFIG_HOME/mustr or ~/.config/mustr).
+    #[arg(long, env = "MUSTR_CONFIG_DIR", global = true)]
+    pub config_dir: Option<PathBuf>,
+
+    #[command(flatten)]
+    pub verbosity: Verbosity<InfoLevel>,
+
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum Command {
+    /// Start the hub and dashboard (also the default command).
+    Run {
+        /// Run the hub without a terminal dashboard.
+        #[arg(long)]
+        headless: bool,
+    },
+    /// Create initial configuration and default roles, without overwriting files.
+    Init,
+    /// List resolved role definitions; usable before the hub starts.
+    Roles {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Install the adapter for an agent harness.
+    #[command(subcommand_value_name = "HARNESS")]
+    Install {
+        #[command(subcommand)]
+        harness: InstallTarget,
+    },
+    /// Print live caller identity and hub discovery information for adapters.
+    Context,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum InstallTarget {
+    /// Install the Pi adapter into its auto-discovered extensions directory.
+    Pi {
+        /// Pi agent directory, not its extensions directory.
+        #[arg(long, env = "PI_CODING_AGENT_DIR")]
+        agent_dir: Option<PathBuf>,
+    },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_is_consistent() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn install_selects_a_harness_and_scopes_its_options() {
+        let cli = Cli::try_parse_from([
+            "mustr",
+            "install",
+            "pi",
+            "--agent-dir",
+            "/tmp/pi",
+            "--config-dir",
+            "/tmp/mustr",
+            "-v",
+        ])
+        .unwrap();
+        assert_eq!(cli.config_dir, Some(PathBuf::from("/tmp/mustr")));
+        assert_eq!(cli.verbosity.to_string(), "debug");
+        assert!(
+            matches!(cli.command, Some(Command::Install { harness: InstallTarget::Pi { agent_dir: Some(path) } }) if path == std::path::Path::new("/tmp/pi"))
+        );
+    }
+
+    #[test]
+    fn install_requires_a_supported_harness() {
+        assert!(Cli::try_parse_from(["mustr", "install"]).is_err());
+        assert!(Cli::try_parse_from(["mustr", "install", "unknown"]).is_err());
+        assert!(Cli::try_parse_from(["mustr", "install", "--agent-dir", "/tmp/pi"]).is_err());
+        assert!(Cli::try_parse_from(["mustr", "install-pi"]).is_err());
+    }
+
+    #[test]
+    fn supports_verbosity_and_configuration_after_subcommands() {
+        let cli = Cli::try_parse_from([
+            "mustr",
+            "run",
+            "--headless",
+            "-vv",
+            "--config-dir",
+            "/tmp/x",
+        ])
+        .unwrap();
+        assert_eq!(cli.verbosity.to_string(), "trace");
+        assert!(matches!(cli.command, Some(Command::Run { headless: true })));
+    }
+}
