@@ -5,6 +5,10 @@ import { randomUUID } from "node:crypto";
 
 const MAX_FRAME = 256 * 1024;
 
+// A negative authoritative reply is distinct from a lost transport ACK. Only
+// the latter permits idempotent re-ack of an already-created fresh identity.
+export class HubRemoteError extends Error {}
+
 export class HubClient {
   /** @type {net.Socket | undefined} */
   socket;
@@ -65,7 +69,7 @@ export class HubClient {
       if (!p) continue;
       clearTimeout(p.timer); this.pending.delete(response.id);
       if (response.ok === true) p.resolve(response.result);
-      else p.reject(new Error(typeof response.error === "string" ? response.error : "Invalid hub response"));
+      else p.reject(new HubRemoteError(typeof response.error === "string" ? response.error : "Invalid hub response"));
     }
     if (Buffer.byteLength(this.buffer) > MAX_FRAME) this.close();
   }

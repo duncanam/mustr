@@ -6,7 +6,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use color_eyre::eyre::{Result, eyre};
+use color_eyre::eyre::{Result, ensure, eyre};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
@@ -30,6 +30,20 @@ pub(crate) enum Event {
         space: SpaceId,
         mode: Mode,
         enabled: bool,
+        epoch: u64,
+        reply: oneshot::Sender<std::result::Result<(), String>>,
+    },
+    ResetPreview {
+        space: SpaceId,
+        reply: oneshot::Sender<std::result::Result<ResetPreview, String>>,
+    },
+    ResetStart {
+        preview: ResetPreview,
+        reply: oneshot::Sender<std::result::Result<(), String>>,
+    },
+    ResetAbandon {
+        space: SpaceId,
+        plan_id: String,
         reply: oneshot::Sender<std::result::Result<(), String>>,
     },
     Todo {
@@ -86,15 +100,47 @@ impl Service {
 
     pub async fn mode(&self, space: SpaceId, mode: Mode, enabled: bool) -> Result<()> {
         let (reply, response) = oneshot::channel();
+        let epoch = self
+            .snapshots
+            .borrow()
+            .space_epochs
+            .get(&space)
+            .copied()
+            .unwrap_or_default();
         self.tx
             .send(Event::Mode {
                 space,
                 mode,
                 enabled,
+                epoch,
                 reply,
             })
             .await?;
         response.await?.map_err(|e| eyre!(e))
+    }
+
+    pub async fn reset_preview(&self, space: SpaceId) -> Result<ResetPreview> {
+        let (reply, response) = oneshot::channel();
+        self.tx.send(Event::ResetPreview { space, reply }).await?;
+        response.await?.map_err(|error| eyre!(error))
+    }
+
+    pub async fn reset_start(&self, preview: ResetPreview) -> Result<()> {
+        let (reply, response) = oneshot::channel();
+        self.tx.send(Event::ResetStart { preview, reply }).await?;
+        response.await?.map_err(|error| eyre!(error))
+    }
+
+    pub async fn reset_abandon(&self, space: SpaceId, plan_id: String) -> Result<()> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(Event::ResetAbandon {
+                space,
+                plan_id,
+                reply,
+            })
+            .await?;
+        response.await?.map_err(|error| eyre!(error))
     }
 
     pub async fn stop(&self) {
@@ -105,11 +151,27 @@ impl Service {
     }
 }
 
+#[derive(Clone)]
+struct Binding {
+    agent: AgentId,
+    space: SpaceId,
+    epoch: u64,
+    revoked: bool,
+}
+
+struct Preview {
+    approved: ResetPreview,
+    fingerprint: String,
+    incarnations: BTreeMap<AgentId, u64>,
+}
+
 struct Actor {
     state: State,
     store: Store,
     scheduling: Scheduling,
-    connections: BTreeMap<u64, AgentId>,
+    connections: BTreeMap<u64, Binding>,
+    incarnations: BTreeMap<AgentId, u64>,
+    previews: BTreeMap<SpaceId, Preview>,
     spaces: Vec<Space>,
     error: Option<String>,
     snapshots: watch::Sender<Snapshot>,
@@ -130,6 +192,8 @@ impl Actor {
             store,
             scheduling,
             connections: BTreeMap::new(),
+            incarnations: BTreeMap::new(),
+            previews: BTreeMap::new(),
             spaces: Vec::new(),
             error: None,
             snapshots,
@@ -144,6 +208,86 @@ impl Actor {
         Ok(())
     }
 
+    fn binding_valid(&self, connection: u64, binding: &Binding) -> bool {
+        !binding.revoked
+            && self.incarnations.get(&binding.agent) == Some(&connection)
+            && self
+                .state
+                .connection_epoch_valid(&binding.agent, &binding.space, binding.epoch)
+    }
+
+    fn sender(&self, connection: u64) -> Result<Option<AgentId>> {
+        self.connections
+            .get(&connection)
+            .map(|binding| {
+                ensure!(
+                    self.binding_valid(connection, binding),
+                    "connection is retired; rejoin explicitly from the correct session"
+                );
+                Ok(binding.agent.clone())
+            })
+            .transpose()
+    }
+
+    fn preview(&mut self, space: SpaceId) -> Result<ResetPreview> {
+        ensure!(
+            self.spaces.iter().any(|s| s.id == space),
+            "space no longer exists; refresh before confirming"
+        );
+        let mut approved = self.state.reset_preview(&space)?;
+        approved.nonce = uuid::Uuid::new_v4().to_string();
+        let incarnations = approved
+            .participants
+            .iter()
+            .map(|p| {
+                (
+                    p.agent_id.clone(),
+                    self.incarnations
+                        .get(&p.agent_id)
+                        .copied()
+                        .unwrap_or_default(),
+                )
+            })
+            .collect();
+        self.previews.insert(
+            space.clone(),
+            Preview {
+                approved: approved.clone(),
+                fingerprint: self.state.reset_fingerprint(&space)?,
+                incarnations,
+            },
+        );
+        Ok(approved)
+    }
+
+    fn start_reset(&mut self, preview: ResetPreview) -> Result<()> {
+        ensure!(
+            self.spaces.iter().any(|s| s.id == preview.space_id),
+            "space no longer exists; preview again"
+        );
+        let approved = self
+            .previews
+            .get(&preview.space_id)
+            .ok_or_else(|| eyre!("preview expired; preview and confirm again"))?;
+        ensure!(
+            approved.approved == preview
+                && approved.fingerprint == self.state.reset_fingerprint(&preview.space_id)?,
+            "reset preview changed; preview and confirm again"
+        );
+        ensure!(
+            approved
+                .incarnations
+                .iter()
+                .all(|(agent, connection)| self.incarnations.get(agent) == Some(connection)),
+            "participant connection changed; preview again"
+        );
+        let mut next = self.state.clone();
+        next.start_reset(&preview)?;
+        self.commit(next)?;
+        self.previews.remove(&preview.space_id);
+        Ok(())
+    }
+
     fn run(&mut self, mut rx: mpsc::Receiver<Event>) {
         while let Some(event) = rx.blocking_recv() {
             let now = now();
@@ -154,19 +298,18 @@ impl Actor {
                     reply,
                 } => {
                     let mut next = self.state.clone();
-                    let result = next
-                        .apply(
-                            &request,
-                            self.connections.get(&connection),
-                            now,
-                            &self.scheduling,
-                        )
+                    let result = self
+                        .sender(connection)
+                        .and_then(|sender| {
+                            next.apply(&request, sender.as_ref(), now, &self.scheduling)
+                        })
                         .and_then(|value| {
                             if matches!(request.command, Command::Sync { .. })
                                 && value["inbox"].is_null()
                                 && next.messages == self.state.messages
                                 && next.tasks == self.state.tasks
                                 && next.automation == self.state.automation
+                                && next.reset_metadata_equal(&self.state)
                             {
                                 // Only presence/idle timestamps may bypass persistence.
                                 // A no-inbox sync can still cancel automatic prompts or
@@ -180,11 +323,26 @@ impl Actor {
                         });
                     let response = match result {
                         Ok(value) => {
-                            if let Command::Join { agent_id, .. } = &request.command {
-                                self.connections.insert(connection, agent_id.clone());
+                            if let Command::Join {
+                                agent_id, space_id, ..
+                            } = &request.command
+                            {
+                                self.incarnations.insert(agent_id.clone(), connection);
+                                self.connections.insert(
+                                    connection,
+                                    Binding {
+                                        agent: agent_id.clone(),
+                                        space: space_id.clone(),
+                                        epoch: self.state.reset_epoch(space_id),
+                                        revoked: false,
+                                    },
+                                );
                             }
-                            if matches!(request.command, Command::Leave) {
-                                self.connections.remove(&connection);
+                            if matches!(request.command, Command::Leave)
+                                && let Some(binding) = self.connections.remove(&connection)
+                                && self.incarnations.get(&binding.agent) == Some(&connection)
+                            {
+                                self.incarnations.remove(&binding.agent);
                             }
                             Response::success(request.id, value)
                         }
@@ -196,11 +354,16 @@ impl Actor {
                     let _ = reply.send(response);
                 }
                 Event::Disconnect(connection) => {
-                    if let Some(agent) = self.connections.remove(&connection) {
-                        let mut next = self.state.clone();
-                        next.disconnect(&agent);
-                        if let Err(error) = self.commit(next) {
-                            self.error = Some(error.to_string());
+                    if let Some(binding) = self.connections.remove(&connection) {
+                        if self.binding_valid(connection, &binding) {
+                            let mut next = self.state.clone();
+                            next.disconnect(&binding.agent);
+                            if let Err(error) = self.commit(next) {
+                                self.error = Some(error.to_string());
+                            }
+                        }
+                        if self.incarnations.get(&binding.agent) == Some(&connection) {
+                            self.incarnations.remove(&binding.agent);
                         }
                     }
                 }
@@ -215,13 +378,54 @@ impl Actor {
                     space,
                     mode,
                     enabled,
+                    epoch,
+                    reply,
+                } => {
+                    let mut next = self.state.clone();
+                    let result = (|| {
+                        ensure!(
+                            epoch == self.state.reset_epoch(&space),
+                            "mode action predates reset; refresh first"
+                        );
+                        next.set_mode(&space, mode, enabled, now)
+                    })()
+                    .and_then(|()| self.commit(next))
+                    .map_err(|e| e.to_string());
+                    let _ = reply.send(result);
+                }
+                Event::ResetPreview { space, reply } => {
+                    let result = self.preview(space).map_err(|e| e.to_string());
+                    let _ = reply.send(result);
+                }
+                Event::ResetStart { preview, reply } => {
+                    let result = self.start_reset(preview).map_err(|e| e.to_string());
+                    let _ = reply.send(result);
+                }
+                Event::ResetAbandon {
+                    space,
+                    plan_id,
                     reply,
                 } => {
                     let mut next = self.state.clone();
                     let result = next
-                        .set_mode(&space, mode, enabled, now)
+                        .abandon_reset(&space, &plan_id)
                         .and_then(|()| self.commit(next))
                         .map_err(|e| e.to_string());
+                    if result.is_ok() {
+                        let originals: Vec<_> = self.state.snapshot(Vec::new(), None, now).resets
+                            [&space]
+                            .participants
+                            .iter()
+                            .map(|p| p.participant.agent_id.clone())
+                            .collect();
+                        for binding in self
+                            .connections
+                            .values_mut()
+                            .filter(|b| b.space == space && originals.contains(&b.agent))
+                        {
+                            binding.revoked = true;
+                        }
+                    }
                     let _ = reply.send(result);
                 }
                 Event::Stop(reply) => {
@@ -277,6 +481,8 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    mod reset;
+
     #[tokio::test]
     async fn no_inbox_sync_persists_cancellation_before_reply() {
         let directory = tempfile::tempdir().unwrap();
@@ -284,7 +490,16 @@ mod tests {
         let (snapshots, snapshot_rx) = watch::channel(Snapshot::default());
         let mut actor = Actor::new(path.clone(), Scheduling::default(), snapshots).unwrap();
         let worker = AgentId::new("worker");
-        actor.connections.insert(1, worker.clone());
+        actor.connections.insert(
+            1,
+            Binding {
+                agent: worker.clone(),
+                space: SpaceId::new("w1"),
+                epoch: 0,
+                revoked: false,
+            },
+        );
+        actor.incarnations.insert(worker.clone(), 1);
         actor.state.members.insert(
             worker.clone(),
             Member {
@@ -380,6 +595,7 @@ mod tests {
                             role: "custom".into(),
                             pane_id: format!("p{connection}"),
                             space_id: SpaceId::new("w1"),
+                            reset: None,
                         },
                     },
                 )

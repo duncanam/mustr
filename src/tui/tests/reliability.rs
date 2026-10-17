@@ -80,8 +80,15 @@ fn panels_have_complete_dim_outlines_and_normal_contrast_headings() {
             if let Some(message) = snapshot.messages.first_mut() {
                 message.text = "Long content wrapping inside its panel. ".repeat(20);
             }
-            for color in [false, true] {
-                let buffer = render(&snapshot, &selected_view(&snapshot), width, rows, color);
+            for (color, tab) in [
+                (false, WorkTab::Messages),
+                (true, WorkTab::Messages),
+                (false, WorkTab::Tasks),
+                (true, WorkTab::Tasks),
+            ] {
+                let mut view = selected_view(&snapshot);
+                view.work_tab = tab;
+                let buffer = render(&snapshot, &view, width, rows, color);
                 let text = screen(&buffer);
                 let mut panels = 0;
                 let assert_border = |x, y, symbol| {
@@ -116,18 +123,21 @@ fn panels_have_complete_dim_outlines_and_normal_contrast_headings() {
                             assert_border(right, row, "│");
                         }
                         for col in x + 1..right {
-                            assert_border(col, bottom, "─");
+                            // The shared pane's bottom border carries counts/range.
+                            if buffer[(col, bottom)].symbol() == "─" {
+                                assert_border(col, bottom, "─");
+                            }
                         }
                     }
                 }
-                assert_eq!(panels, 3, "{text}");
+                assert_eq!(panels, 2, "{text}");
                 for heading in ["Participants", "Tasks", "Messages"] {
                     let (x, y) = position(&text, heading);
                     let cell = &buffer[(height(x), height(y))];
                     assert!(cell.modifier.contains(Modifier::BOLD));
                     assert!(!cell.modifier.contains(Modifier::DIM));
                 }
-                assert!(text.contains("/role NAME") || text.contains("Refine dashboard"));
+                assert!(text.contains("/role NAME") || text.contains("Ada"));
             }
         }
     }
@@ -176,13 +186,10 @@ fn closing_all_agents_keeps_task_recovery_and_named_message_history() {
         state.disconnect(&member.id);
     }
     let snapshot = state.snapshot(fixture.spaces.clone(), None, 1);
-    let text = screen(&render(
-        &snapshot,
-        &selected_view(&snapshot),
-        160,
-        40,
-        false,
-    ));
+    let mut view = selected_view(&snapshot);
+    let messages = screen(&render(&snapshot, &view, 160, 40, false));
+    view.navigate(KeyCode::Char('f'), &snapshot);
+    let text = screen(&render(&snapshot, &view, 160, 40, false));
     assert!(text.contains("Participants 0"), "{text}");
     assert!(text.contains("No connected participants."));
     assert!(!text.contains("architect · w1:p1"));
@@ -190,7 +197,7 @@ fn closing_all_agents_keeps_task_recovery_and_named_message_history() {
     assert!(text.contains("paused"));
     assert!(text.contains("Refine dashboard"));
     assert!(text.contains("Ask Ada: reconcile, then guide/cancel"));
-    assert!(text.contains("Ada → Lin"));
+    assert!(messages.contains("Ada → Lin"));
     assert_eq!(
         snapshot.members.len(),
         2,
@@ -248,6 +255,7 @@ fn paused_work_shows_reason_requester_and_explicit_recovery_not_auto_resume() {
     snapshot.tasks[0].note = "Participant disconnected. Reconcile external jobs.".into();
     snapshot.tasks[1].state = TaskState::Accepted;
     let mut view = selected_view(&snapshot);
+    view.navigate(KeyCode::Char('f'), &snapshot);
     let text = screen(&render(&snapshot, &view, 140, 40, true));
     for expected in [
         "paused",
@@ -281,8 +289,13 @@ fn cancelled_completion_notification_is_not_presented_as_cancelled_task() {
         40,
         false,
     ));
-    assert!(text.contains("accepted"));
+    assert!(text.contains("2 tasks · 1 accepted"));
     assert!(text.contains("done · cancelled notification (not task)"));
+    let mut view = selected_view(&snapshot);
+    view.navigate(KeyCode::Char('f'), &snapshot);
+    let tasks = screen(&render(&snapshot, &view, 160, 40, false));
+    assert!(tasks.contains("accepted  Refine dashboard"), "{tasks}");
+    assert!(!tasks.contains("cancelled"));
 }
 
 #[test]

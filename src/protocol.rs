@@ -62,6 +62,20 @@ pub(crate) enum Command {
         role: String,
         pane_id: String,
         space_id: SpaceId,
+        #[serde(default)]
+        reset: Option<ResetReceipt>,
+    },
+    /// Negotiate the single-attempt reset control protocol for this connection.
+    ResetCapability,
+    ResetClaim {
+        plan_id: String,
+        token: String,
+    },
+    ResetStatus {
+        plan_id: String,
+        token: String,
+        status: ResetReport,
+        text: String,
     },
     /// Opt in to content-free inbox-ready socket notifications.
     Subscribe,
@@ -119,6 +133,101 @@ pub(crate) enum Command {
         enabled: bool,
     },
     Leave,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ResetReceipt {
+    pub plan_id: String,
+    pub token: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ResetParticipant {
+    pub agent_id: AgentId,
+    pub name: String,
+    pub role: String,
+    pub pane_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ResetPreview {
+    pub space_id: SpaceId,
+    pub nonce: String,
+    pub participants: Vec<ResetParticipant>,
+    pub task_count: usize,
+    pub message_count: usize,
+    pub offline_count: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ResetPhase {
+    Prepared,
+    Incomplete,
+    Completed,
+    Abandoned,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ResetAgentState {
+    Pending,
+    Claimed,
+    Blocked,
+    Cancelled,
+    Failed,
+    Uncertain,
+    Complete,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ResetReport {
+    Blocked,
+    Cancelled,
+    Failed,
+    Uncertain,
+}
+
+impl From<ResetReport> for ResetAgentState {
+    fn from(value: ResetReport) -> Self {
+        match value {
+            ResetReport::Blocked => Self::Blocked,
+            ResetReport::Cancelled => Self::Cancelled,
+            ResetReport::Failed => Self::Failed,
+            ResetReport::Uncertain => Self::Uncertain,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ResetProgress {
+    pub participant: ResetParticipant,
+    pub state: ResetAgentState,
+    pub new_agent_id: Option<AgentId>,
+    pub note: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub(crate) struct ResetSummary {
+    pub plan_id: String,
+    pub space_id: SpaceId,
+    pub state: ResetPhase,
+    pub participants: Vec<ResetProgress>,
+    pub note: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct ResetControl {
+    pub plan_id: String,
+    pub token: String,
+    pub space_id: SpaceId,
+    pub old_agent_id: AgentId,
+    pub name: String,
+    pub role: String,
+    pub pane_id: String,
+    pub state: ResetAgentState,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -268,6 +377,10 @@ pub(crate) struct Snapshot {
     #[serde(skip)]
     pub ready: std::collections::BTreeMap<AgentId, MessageId>,
     pub automation: std::collections::BTreeMap<SpaceId, Automation>,
+    #[serde(default)]
+    pub resets: std::collections::BTreeMap<SpaceId, ResetSummary>,
+    #[serde(default)]
+    pub space_epochs: std::collections::BTreeMap<SpaceId, u64>,
     pub error: Option<String>,
 }
 

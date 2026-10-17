@@ -3,46 +3,7 @@ import assert from "node:assert/strict";
 import { fixture, binary, eventually, delay, stop } from "../../tests/support.mjs";
 import { HubClient } from "../transport.mjs";
 
-function harness(directory) {
-  const events = new Map(), commands = new Map(), tools = new Map();
-  const entries = [], messages = [], notifications = [];
-  let active = ["read", "bash", "policy-tool"], idle = true, editor = "", pending = false, deferInsertion = false;
-  const context = {
-    cwd: directory, mode: "tui", isIdle: () => idle, hasPendingMessages: () => pending,
-    sessionManager: { getSessionId: () => "pi-session", getBranch: () => entries },
-    ui: { notify: (message, level) => notifications.push({ message, level }), setStatus() {}, getEditorText: () => editor },
-  };
-  async function emit(event, payload = {}) {
-    const results = [];
-    for (const fn of events.get(event) ?? []) results.push(await fn(payload, context));
-    return results;
-  }
-  async function insert(index) {
-    const { message, options } = messages[index];
-    // Real Pi persists context-only messages without emitting an extension event.
-    entries.push({ type: "custom_message", ...message });
-    if (options.triggerTurn) await emit("message_end", { message: { ...message, role: "custom" } });
-  }
-  const api = {
-    getCommands: () => [{ name: "architect" }], getActiveTools: () => active,
-    setActiveTools: names => { active = names; },
-    on: (event, handler) => { const handlers = events.get(event) ?? []; handlers.push(handler); events.set(event, handlers); },
-    registerCommand: (name, value) => commands.set(name, value),
-    registerTool: definition => tools.set(definition.name, definition),
-    appendEntry: (customType, data) => entries.push({ type: "custom", customType, data }),
-    sendMessage: (message, options) => {
-      messages.push({ message, options });
-      if (options.triggerTurn && idle) { idle = false; void emit("agent_start"); }
-      if (!deferInsertion) void insert(messages.length - 1);
-    },
-  };
-  return { api, commands, tools, entries, messages, notifications, context, emit,
-    active: () => active, editor: text => { editor = text; }, pending: value => { pending = value; },
-    deferInsertion: value => { deferInsertion = value; },
-    insert,
-    settle: async (aborted = false) => { idle = true; await emit("agent_settled", { aborted }); },
-  };
-}
+import { harness } from "./adapter-harness.mjs";
 
 test("adapter: explicit join before hub, human gating, settled report, policies and topology changes", { timeout: 30000 }, async t => {
   const f = await fixture(t);

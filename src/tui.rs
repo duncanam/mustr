@@ -21,11 +21,71 @@ use crate::{
     service::{Service, now},
 };
 
+mod reset_ui;
+
+#[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
+enum WorkTab {
+    #[default]
+    Messages,
+    Tasks,
+}
+
+#[derive(Clone, Default)]
+struct TaskBrowse {
+    selected: Option<TaskId>,
+    // The previous ordinal supplies a nearby fallback if the selected task disappears.
+    index: usize,
+    offset: usize,
+}
+
+impl TaskBrowse {
+    fn reconcile(&mut self, tasks: &[&Task]) {
+        self.index = self
+            .selected
+            .as_ref()
+            .and_then(|id| tasks.iter().position(|task| &task.id == id))
+            .unwrap_or_else(|| self.index.min(tasks.len().saturating_sub(1)));
+        self.selected = tasks.get(self.index).map(|task| task.id.clone());
+        self.offset = self.offset.min(tasks.len().saturating_sub(1));
+        if tasks.is_empty() {
+            *self = Self::default();
+        }
+    }
+
+    fn advance(&mut self, tasks: &[&Task], forward: bool) {
+        self.reconcile(tasks);
+        self.index = if forward {
+            self.index
+                .saturating_add(1)
+                .min(tasks.len().saturating_sub(1))
+        } else {
+            self.index.saturating_sub(1)
+        };
+        self.selected = tasks.get(self.index).map(|task| task.id.clone());
+    }
+
+    fn viewport(&mut self, count: usize, capacity: usize) -> std::ops::Range<usize> {
+        if capacity == 0 {
+            return self.offset..self.offset;
+        }
+        self.offset = self.offset.min(count.saturating_sub(capacity));
+        if self.index < self.offset {
+            self.offset = self.index;
+        } else if self.index >= self.offset.saturating_add(capacity) {
+            self.offset = self.index + 1 - capacity;
+        }
+        self.offset..self.offset.saturating_add(capacity).min(count)
+    }
+}
+
 #[derive(Clone, Default)]
 struct View {
     selected: Option<SpaceId>,
     initial_space: Option<SpaceId>,
     scroll: u16,
+    work_tab: WorkTab,
+    tasks: TaskBrowse,
+    reset_dialog: Option<reset_ui::Dialog>,
     help: bool,
     notice: String,
 }
@@ -52,16 +112,50 @@ impl View {
                     .filter(|id| snapshot.spaces.iter().any(|s| &s.id == id))
                     .unwrap_or_else(|| first.id.clone())
             });
-            self.scroll = 0;
+            self.reset_scroll();
         }
+        self.tasks.reconcile(&self.space_tasks(snapshot));
+    }
+
+    fn space_tasks<'a>(&self, snapshot: &'a Snapshot) -> Vec<&'a Task> {
+        snapshot
+            .tasks
+            .iter()
+            .filter(|task| Some(&task.space_id) == self.selected.as_ref())
+            .collect()
+    }
+
+    fn reset_scroll(&mut self) {
+        self.scroll = 0;
+        self.tasks = TaskBrowse::default();
+    }
+
+    // Some means consumed by the modal, even when it produced no action.
+    // The event loop must never fall through to navigation/automation in that case.
+    fn reset_key(&mut self, key: KeyCode, snapshot: &Snapshot) -> Option<reset_ui::Action> {
+        self.reset_dialog
+            .as_mut()
+            .map(|dialog| dialog.key(key, snapshot))
     }
 
     fn navigate(&mut self, key: KeyCode, snapshot: &Snapshot) -> bool {
         match key {
             KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => self.advance(snapshot, true),
             KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => self.advance(snapshot, false),
-            KeyCode::Down | KeyCode::Char('j') => self.scroll = self.scroll.saturating_add(1),
-            KeyCode::Up | KeyCode::Char('k') => self.scroll = self.scroll.saturating_sub(1),
+            KeyCode::Char('f') => {
+                self.work_tab = match self.work_tab {
+                    WorkTab::Messages => WorkTab::Tasks,
+                    WorkTab::Tasks => WorkTab::Messages,
+                };
+            }
+            KeyCode::Down | KeyCode::Char('j') => match self.work_tab {
+                WorkTab::Messages => self.scroll = self.scroll.saturating_add(1),
+                WorkTab::Tasks => self.tasks.advance(&self.space_tasks(snapshot), true),
+            },
+            KeyCode::Up | KeyCode::Char('k') => match self.work_tab {
+                WorkTab::Messages => self.scroll = self.scroll.saturating_sub(1),
+                WorkTab::Tasks => self.tasks.advance(&self.space_tasks(snapshot), false),
+            },
             _ => return false,
         }
         true
@@ -82,8 +176,11 @@ impl View {
         } else {
             (current + count - 1) % count
         };
-        self.selected = Some(snapshot.spaces[index].id.clone());
-        self.scroll = 0;
+        if self.selected.as_ref() != Some(&snapshot.spaces[index].id) {
+            self.selected = Some(snapshot.spaces[index].id.clone());
+            self.reset_scroll();
+            self.tasks.reconcile(&self.space_tasks(snapshot));
+        }
         self.notice.clear();
     }
 }
@@ -125,7 +222,39 @@ async fn event_loop(
             event = events.next() => match event {
                 Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) { break; }
+                    if let Some(action) = view.reset_key(key.code, &snapshot) {
+                        match action {
+                            reset_ui::Action::None => {},
+                            reset_ui::Action::Close => view.reset_dialog = None,
+                            reset_ui::Action::Start(preview) => {
+                                let space = preview.space_id.clone();
+                                view.reset_dialog = Some(match service.reset_start(preview).await {
+                                    Ok(()) => reset_ui::Dialog::progress(space),
+                                    Err(error) => reset_ui::Dialog::error(error.to_string()),
+                                });
+                            },
+                            reset_ui::Action::Abandon(space, plan) => {
+                                view.reset_dialog = Some(match service.reset_abandon(space.clone(), plan).await {
+                                    Ok(()) => reset_ui::Dialog::progress(space),
+                                    Err(error) => reset_ui::Dialog::error(error.to_string()),
+                                });
+                            },
+                        }
+                        continue;
+                    }
                     match key.code {
+                        KeyCode::Char('r') => {
+                            if let Some(space) = view.selected.clone() {
+                                view.reset_dialog = Some(if snapshot.resets.get(&space).is_some_and(|plan| matches!(plan.state, ResetPhase::Prepared | ResetPhase::Incomplete)) {
+                                    reset_ui::Dialog::progress(space)
+                                } else {
+                                    match service.reset_preview(space).await {
+                                        Ok(preview) => reset_ui::Dialog::confirm(preview),
+                                        Err(error) => reset_ui::Dialog::error(error.to_string()),
+                                    }
+                                });
+                            }
+                        },
                         KeyCode::Char('q') => break,
                         KeyCode::Char('?') => view.help = !view.help,
                         KeyCode::Esc => view.help = false,
@@ -228,8 +357,15 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, view: &mut View, color: bool) {
     let area = frame.area();
     frame.render_widget(Block::default().style(Style::reset()), area);
     if area.width < 35 || area.height < 12 {
+        if let Some(dialog) = &mut view.reset_dialog {
+            dialog.hide();
+        }
         frame.render_widget(
-            Paragraph::new("mustr · enlarge terminal (35×12 minimum)\nq quits"),
+            Paragraph::new(if view.reset_dialog.is_some() {
+                "mustr · enlarge terminal (35×12 minimum)\nEsc closes dialog; Ctrl-C quits"
+            } else {
+                "mustr · enlarge terminal (35×12 minimum)\nq quits"
+            }),
             area,
         );
         return;
@@ -241,7 +377,7 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, view: &mut View, color: bool) {
         .and_then(|space| snapshot.automation.get(space))
         .cloned()
         .unwrap_or_default();
-    let mode_lines = if view.help {
+    let mut mode_lines = if view.help {
         Vec::new()
     } else if view.selected.is_some() {
         automation_lines(&automation, area.width, color)
@@ -252,6 +388,10 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, view: &mut View, color: bool) {
         ])]
     };
     let spacious = area.height >= 20 && !view.help;
+    // At the supported minimum size, retain the mode controls but sacrifice
+    // watcher details before squeezing away the work pane's tabs/count border.
+    let reserved = if spacious { 10 } else { 8 } + u16::from(area.height >= 18);
+    mode_lines.truncate(usize::from(area.height.saturating_sub(reserved)));
     let [header, _, modes, _, body, footer] = Layout::vertical([
         Constraint::Length(if spacious { 3 } else { 2 }),
         Constraint::Length(u16::from(spacious)),
@@ -281,6 +421,9 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, view: &mut View, color: bool) {
         );
     }
     draw_footer(frame, footer, snapshot, view, color);
+    if let Some(dialog) = &mut view.reset_dialog {
+        dialog.draw(frame, snapshot);
+    }
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, snapshot: &Snapshot, view: &View, color: bool) {
@@ -470,11 +613,6 @@ fn draw_space(
         .iter()
         .filter(|m| &m.space_id == space && m.activity != Activity::Offline)
         .collect();
-    let tasks: Vec<_> = snapshot
-        .tasks
-        .iter()
-        .filter(|t| &t.space_id == space)
-        .collect();
     let [participants, work] = if area.width >= 96 && area.height >= 8 {
         let [participants, _, work] = Layout::horizontal([
             Constraint::Length((area.width / 3).clamp(33, 40)),
@@ -490,28 +628,19 @@ fn draw_space(
             height(members.len() * 2 + 3)
         };
         let [participants, _, work] = Layout::vertical([
-            Constraint::Length(wanted.min((area.height / 3).max(2))),
+            Constraint::Length(
+                wanted
+                    .min((area.height / 3).max(2))
+                    .min(area.height.saturating_sub(2)),
+            ),
             Constraint::Length(u16::from(area.height >= 16)),
             Constraint::Min(2),
         ])
         .areas(area);
         [participants, work]
     };
-    let task_height = if tasks.is_empty() {
-        // Include room for the wrapped next-action hint as well as both borders.
-        5
-    } else {
-        height(tasks.len() * usize::from(task_row_height(&tasks)) + 2)
-    };
-    let [task_area, _, messages] = Layout::vertical([
-        Constraint::Length(task_height.min((work.height / 2).max(2))),
-        Constraint::Length(u16::from(work.height >= 12)),
-        Constraint::Min(2),
-    ])
-    .areas(work);
     draw_members(frame, participants, &members, color);
-    draw_tasks(frame, task_area, snapshot, &tasks, color);
-    draw_messages(frame, messages, snapshot, space, automation, view, color);
+    draw_work(frame, work, snapshot, space, automation, view, color);
 }
 
 fn activity_style(activity: Activity, color: bool) -> Style {
@@ -534,7 +663,7 @@ fn task_style(state: TaskState, color: bool) -> Style {
     }
 }
 
-// Reserve a line for an explicit overflow count instead of silently clipping the roster/tasks.
+// Reserve a line for an explicit overflow count instead of silently clipping the roster.
 fn visible_rows(area: Rect, count: usize, row_height: u16) -> usize {
     let capacity = usize::from(area.height / row_height);
     if count > capacity {
@@ -612,6 +741,117 @@ fn draw_members(frame: &mut Frame, area: Rect, members: &[&Member], color: bool)
     }
 }
 
+fn work_tabs(
+    tab: WorkTab,
+    task_count: usize,
+    message_count: usize,
+    width: u16,
+    color: bool,
+) -> Line<'static> {
+    let messages = if width < 45 { "Msgs" } else { "Messages" };
+    let mut line = Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            format!("{messages} {message_count}"),
+            if tab == WorkTab::Messages {
+                accent(color).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                bold()
+            },
+        ),
+        Span::styled(" │ ", muted()),
+        Span::styled(
+            format!("Tasks {task_count}"),
+            if tab == WorkTab::Tasks {
+                accent(color).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+            } else {
+                bold()
+            },
+        ),
+        Span::raw(" "),
+    ]);
+    if line.width() + 4 <= usize::from(width.saturating_sub(2)) {
+        line.spans.push(Span::styled("[f] ", muted()));
+    }
+    line
+}
+
+fn draw_work(
+    frame: &mut Frame,
+    area: Rect,
+    snapshot: &Snapshot,
+    space: &SpaceId,
+    automation: &Automation,
+    view: &mut View,
+    color: bool,
+) {
+    let tasks = view.space_tasks(snapshot);
+    let message_count = snapshot
+        .messages
+        .iter()
+        .filter(|m| &m.space_id == space)
+        .count();
+    view.tasks.reconcile(&tasks);
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .padding(Padding::horizontal(1))
+        .border_style(muted())
+        .title_style(Style::default().remove_modifier(Modifier::DIM))
+        .title(work_tabs(
+            view.work_tab,
+            tasks.len(),
+            message_count,
+            area.width,
+            color,
+        ));
+    let inner = block.inner(area);
+    let range = if view.work_tab == WorkTab::Tasks {
+        let row_height = task_row_height(&tasks).min(inner.height.max(1));
+        view.tasks
+            .viewport(tasks.len(), usize::from(inner.height / row_height))
+    } else {
+        0..0
+    };
+    // Only requester acceptance is completion: Review (reported Done) and
+    // Cancelled must never inflate this number via TaskState::finished().
+    let accepted = tasks
+        .iter()
+        .filter(|task| task.state == TaskState::Accepted)
+        .count();
+    let counts = format!("{} tasks · {accepted} accepted", tasks.len());
+    let summary = if view.work_tab == WorkTab::Tasks && !tasks.is_empty() {
+        let visible = if range.is_empty() {
+            "0".into()
+        } else {
+            format!("{}–{}", range.start + 1, range.end)
+        };
+        let full = format!("{visible}/{counts}");
+        if Line::raw(&full).width() + 2 <= usize::from(area.width.saturating_sub(2)) {
+            full
+        } else {
+            // The tabs already label the task total, so omit only the repeated
+            // noun on narrow panes, never the accepted count or visible range.
+            format!("{visible}/{} · {accepted} accepted", tasks.len())
+        }
+    } else {
+        counts
+    };
+    let hint = match view.work_tab {
+        WorkTab::Messages => "addressed · newest first",
+        WorkTab::Tasks => "↑↓/jk browse only",
+    };
+    if Line::raw(&summary).width() + Line::raw(hint).width() + 7 < usize::from(area.width) {
+        block = block.title_bottom(Line::styled(format!(" {hint} "), muted()).right_aligned());
+    }
+    block = block.title_bottom(Line::raw(format!(" {summary} ")));
+    frame.render_widget(block, area);
+    match view.work_tab {
+        WorkTab::Messages => draw_messages(frame, inner, snapshot, space, automation, view, color),
+        WorkTab::Tasks => draw_tasks(frame, inner, snapshot, &tasks, &view.tasks, range, color),
+    }
+}
+
 fn task_row_height(tasks: &[&Task]) -> u16 {
     if tasks.iter().any(|t| t.state == TaskState::Paused) {
         4
@@ -620,8 +860,15 @@ fn task_row_height(tasks: &[&Task]) -> u16 {
     }
 }
 
-fn draw_tasks(frame: &mut Frame, area: Rect, snapshot: &Snapshot, tasks: &[&Task], color: bool) {
-    let inner = section(frame, area, "Tasks", tasks.len(), "");
+fn draw_tasks(
+    frame: &mut Frame,
+    inner: Rect,
+    snapshot: &Snapshot,
+    tasks: &[&Task],
+    browse: &TaskBrowse,
+    range: std::ops::Range<usize>,
+    color: bool,
+) {
     if tasks.is_empty() {
         frame.render_widget(
             Paragraph::new(vec![
@@ -634,8 +881,8 @@ fn draw_tasks(frame: &mut Frame, area: Rect, snapshot: &Snapshot, tasks: &[&Task
         return;
     }
     let row_height = task_row_height(tasks).min(inner.height.max(1));
-    let visible = visible_rows(inner, tasks.len(), row_height);
-    let rows = tasks.iter().take(visible).map(|task| {
+    let rows = tasks[range].iter().map(|task| {
+        let selected = browse.selected.as_ref() == Some(&task.id);
         let owner = snapshot
             .members
             .iter()
@@ -643,7 +890,14 @@ fn draw_tasks(frame: &mut Frame, area: Rect, snapshot: &Snapshot, tasks: &[&Task
             .map(|m| m.name.as_str())
             .unwrap_or(task.owner.as_str());
         let mut details = vec![
-            Line::styled(clean(&task.title), bold()),
+            Line::styled(
+                clean(&task.title),
+                if selected {
+                    bold().add_modifier(Modifier::UNDERLINED)
+                } else {
+                    bold()
+                },
+            ),
             Line::styled(
                 format!(
                     "{} · {} r{}",
@@ -662,7 +916,7 @@ fn draw_tasks(frame: &mut Frame, area: Rect, snapshot: &Snapshot, tasks: &[&Task
                 .map(|m| m.name.as_str())
                 .unwrap_or(task.requester.as_str());
             details.push(Line::styled(
-                elide(&clean(&task.note), inner.width.saturating_sub(10)),
+                elide(&clean(&task.note), inner.width.saturating_sub(12)),
                 tone(color, Color::Yellow),
             ));
             details.push(Line::styled(
@@ -671,21 +925,30 @@ fn draw_tasks(frame: &mut Frame, area: Rect, snapshot: &Snapshot, tasks: &[&Task
             ));
         }
         Row::new([
+            Cell::from(if selected { "›" } else { " " })
+                .style(accent(color).add_modifier(Modifier::BOLD)),
             Cell::from(label(task.state)).style(task_style(task.state, color)),
             Cell::from(Text::from(details)),
         ])
         .height(row_height)
     });
     frame.render_widget(
-        Table::new(rows, [Constraint::Length(9), Constraint::Min(1)]).column_spacing(1),
+        Table::new(
+            rows,
+            [
+                Constraint::Length(1),
+                Constraint::Length(9),
+                Constraint::Min(1),
+            ],
+        )
+        .column_spacing(1),
         inner,
     );
-    overflow(frame, inner, visible, tasks.len(), row_height, "tasks");
 }
 
 fn draw_messages(
     frame: &mut Frame,
-    area: Rect,
+    inner: Rect,
     snapshot: &Snapshot,
     space: &SpaceId,
     automation: &Automation,
@@ -697,13 +960,6 @@ fn draw_messages(
         .iter()
         .filter(|m| &m.space_id == space)
         .collect();
-    let inner = section(
-        frame,
-        area,
-        "Messages",
-        messages.len(),
-        "addressed · newest first",
-    );
     let mut lines = Vec::new();
     for (name, error) in [
         (
@@ -794,10 +1050,12 @@ fn draw_help(frame: &mut Frame, area: Rect, color: bool) {
         Line::styled("Keyboard", accent(color).add_modifier(Modifier::BOLD)),
         Line::raw("Tab / → / l     next space"),
         Line::raw("Shift-Tab / ← / h  previous space"),
-        Line::raw("↑ ↓ / k j       scroll messages"),
+        Line::raw("f               Messages / Tasks"),
+        Line::raw("↑ ↓ / k j       scroll active tab"),
         Line::raw("t  TODO / continuation on/off"),
         Line::raw("c  periodic check-ins on/off"),
         Line::raw("p  PR watcher on/off"),
+        Line::raw("r  start fresh / reset status (confirmation required)"),
         Line::raw("? / Esc         close help"),
         Line::raw("q / Ctrl-C      stop hub"),
     ];
@@ -817,6 +1075,8 @@ fn draw_help(frame: &mut Frame, area: Rect, color: bool) {
         ),
         Line::raw(""),
         Line::styled("Activity ≠ completion. Done ≠ accepted.", bold()),
+        Line::raw("Only accepted tasks are completed; cancelled is not completion."),
+        Line::raw("Task highlight is browse-only; no task actions."),
         Line::raw("Stopping the hub leaves agents and external jobs running."),
     ];
     if area.width >= 76 {
@@ -844,18 +1104,28 @@ fn draw_help(frame: &mut Frame, area: Rect, color: bool) {
 fn draw_footer(frame: &mut Frame, area: Rect, snapshot: &Snapshot, view: &View, color: bool) {
     let keys = if view.help {
         "? / Esc close help · q quit"
-    } else if area.width < 60 {
-        "Tab space ↑↓ msgs  ? help  q quit"
+    } else if area.width < 64 {
+        "Tab space f view r reset ? q quit"
     } else if area.width < 96 {
-        "Tab/←→ spaces · ↑↓/jk messages · ? help · q quit"
+        "Tab space · f view · ↑↓/jk · r reset · ? help · q quit"
     } else {
-        "Tab/←→/hl spaces   ↑↓/jk messages   t TODO  c Check-ins  p PR   ? help   q quit"
+        "Tab/←→/hl spaces  f Msgs/Tasks  ↑↓/jk scroll  t TODO c Check-ins p PR  r reset  ? help  q quit"
     };
     let error = snapshot.error.as_deref().filter(|s| !s.is_empty());
     let status = if let Some(error) = error {
         Line::styled(
             format!("! {}", clean(error)),
             tone(color, Color::Red).add_modifier(Modifier::BOLD),
+        )
+    } else if view
+        .selected
+        .as_ref()
+        .and_then(|space| snapshot.resets.get(space))
+        .is_some_and(|reset| matches!(reset.state, ResetPhase::Prepared | ResetPhase::Incomplete))
+    {
+        Line::styled(
+            "Reset incomplete · r for status",
+            tone(color, Color::Yellow).add_modifier(Modifier::BOLD),
         )
     } else if !view.notice.is_empty() {
         Line::raw(clean(&view.notice))
@@ -894,6 +1164,8 @@ mod tests {
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 
     mod reliability;
+    mod reset;
+    mod work_tabs;
 
     fn empty_space() -> Snapshot {
         Snapshot {
@@ -1031,10 +1303,19 @@ mod tests {
     }
 
     fn render(snapshot: &Snapshot, view: &View, width: u16, height: u16, color: bool) -> Buffer {
+        render_view(snapshot, &mut view.clone(), width, height, color)
+    }
+
+    fn render_view(
+        snapshot: &Snapshot,
+        view: &mut View,
+        width: u16,
+        height: u16,
+        color: bool,
+    ) -> Buffer {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        let mut view = view.clone();
         terminal
-            .draw(|frame| draw(frame, snapshot, &mut view, color))
+            .draw(|frame| draw(frame, snapshot, view, color))
             .unwrap();
         terminal.backend().buffer().clone()
     }
@@ -1063,22 +1344,31 @@ mod tests {
     }
 
     #[test]
-    fn empty_space_has_distinct_panels_and_actionable_hints() {
+    fn empty_space_has_shared_tabs_and_actionable_hints() {
         let snapshot = empty_space();
-        let text = screen(&render(&snapshot, &selected_view(&snapshot), 100, 24, true));
+        let mut view = selected_view(&snapshot);
+        let text = screen(&render(&snapshot, &view, 100, 24, true));
         assert!(text.contains("mustr  /  agent coordination"));
         assert!(text.contains("Orchard · w1"));
         assert!(text.contains("[t] TODO: off   │   [c] Check-in: off   │   [p] PR: off"));
         assert!(text.contains("/role NAME in Pi to join."));
-        assert!(text.contains("No tasks assigned."));
         assert!(text.contains("No addressed messages yet."));
+        assert!(!text.contains("No tasks assigned."));
         let (_, roster_row) = position(&text, "Participants 0");
         let (_, task_row) = position(&text, "Tasks 0");
         let (_, message_row) = position(&text, "Messages 0");
         assert_eq!(roster_row, task_row);
-        assert_eq!(message_row - task_row, 6);
-        for corner in ['╭', '╮', '╰', '╯'] {
-            assert_eq!(text.matches(corner).count(), 3, "{text}");
+        assert_eq!(message_row, task_row);
+        assert!(view.navigate(KeyCode::Char('f'), &snapshot));
+        let tasks = screen(&render(&snapshot, &view, 100, 24, true));
+        assert!(tasks.contains("No tasks assigned."));
+        assert!(tasks.contains("A joined agent can assign work to an idle participant."));
+        assert!(!tasks.contains("No addressed messages yet."));
+        for text in [&text, &tasks] {
+            assert!(text.contains("0 tasks · 0 accepted"));
+            for corner in ['╭', '╮', '╰', '╯'] {
+                assert_eq!(text.matches(corner).count(), 2, "{text}");
+            }
         }
     }
 
@@ -1095,20 +1385,25 @@ mod tests {
             assert!(text.contains(expected), "missing {expected:?}:\n{text}");
         }
         assert!(!text.contains("Participants"));
-        assert!(!text.contains("Tasks"));
+        assert!(!text.contains("Tasks 0"));
     }
 
     #[test]
     fn populated_wide_layout_preserves_the_status_and_message_hierarchy() {
         let snapshot = populated();
-        let buffer = render(&snapshot, &selected_view(&snapshot), 120, 30, true);
-        let text = screen(&buffer);
-        for (status, foreground) in [
-            ("working", Color::Cyan),
-            ("active", Color::Cyan),
-            ("blocked", Color::Red),
+        let mut view = selected_view(&snapshot);
+        let buffer = render(&snapshot, &view, 120, 30, true);
+        let messages = screen(&buffer);
+        view.navigate(KeyCode::Char('f'), &snapshot);
+        let task_buffer = render(&snapshot, &view, 120, 30, true);
+        let tasks_text = screen(&task_buffer);
+        let text = format!("{messages}\n{tasks_text}");
+        for (buffer, text, status, foreground) in [
+            (&buffer, &messages, "working", Color::Cyan),
+            (&task_buffer, &tasks_text, "active", Color::Cyan),
+            (&task_buffer, &tasks_text, "blocked", Color::Red),
         ] {
-            let (x, y) = position(&text, status);
+            let (x, y) = position(text, status);
             assert_eq!(buffer[(height(x), height(y))].fg, foreground);
         }
         for expected in [
@@ -1133,25 +1428,28 @@ mod tests {
         ] {
             assert!(text.contains(expected), "missing {expected:?}:\n{text}");
         }
-        let roster = position(&text, "Participants 2");
-        let tasks = position(&text, "Tasks 2");
-        let messages = position(&text, "Messages 2");
+        let roster = position(&messages, "Participants 2");
+        let tasks = position(&messages, "Tasks 2");
+        let messages = position(&messages, "Messages 2");
         assert_eq!(roster.1, tasks.1);
-        assert!(roster.0 < tasks.0);
-        assert_eq!(tasks.0, messages.0);
-        assert!(tasks.1 < messages.1);
+        assert!(roster.0 < messages.0);
+        assert_eq!(tasks.1, messages.1);
     }
 
     #[test]
     fn narrow_layout_stacks_sections_and_keeps_message_bodies_readable() {
         let snapshot = populated();
-        let text = screen(&render(&snapshot, &selected_view(&snapshot), 56, 34, true));
-        let roster = position(&text, "Participants 2");
-        let tasks = position(&text, "Tasks 2");
-        let messages = position(&text, "Messages 2");
-        assert_eq!(roster.0, tasks.0);
-        assert_eq!(tasks.0, messages.0);
-        assert!(roster.1 < tasks.1 && tasks.1 < messages.1);
+        let mut view = selected_view(&snapshot);
+        let messages_text = screen(&render(&snapshot, &view, 56, 34, true));
+        view.navigate(KeyCode::Char('f'), &snapshot);
+        let tasks_text = screen(&render(&snapshot, &view, 56, 34, true));
+        let roster = position(&messages_text, "Participants 2");
+        let tasks = position(&messages_text, "Tasks 2");
+        let messages = position(&messages_text, "Messages 2");
+        assert_eq!(roster.0, messages.0);
+        assert_eq!(tasks.1, messages.1);
+        assert!(roster.1 < messages.1);
+        let text = format!("{messages_text}\n{tasks_text}");
         for expected in [
             "architect · w1:p1",
             "implementor · w1:p2",
@@ -1172,9 +1470,14 @@ mod tests {
     fn no_color_resets_every_cell_and_color_uses_only_terminal_ansi_accents() {
         let snapshot = populated();
         for (width, height) in [(10, 4), (35, 12), (56, 34), (120, 30)] {
-            for help in [false, true] {
+            for (help, tab) in [
+                (false, WorkTab::Messages),
+                (false, WorkTab::Tasks),
+                (true, WorkTab::Messages),
+            ] {
                 let mut view = selected_view(&snapshot);
                 view.help = help;
+                view.work_tab = tab;
                 let plain = render(&snapshot, &view, width, height, false);
                 let colored = render(&snapshot, &view, width, height, true);
                 assert_eq!(screen(&plain), screen(&colored));
@@ -1201,10 +1504,13 @@ mod tests {
         view.help = true;
         for (width, height) in [(120, 30), (80, 24), (64, 40)] {
             let text = screen(&render(&snapshot, &view, width, height, false));
+            let unwrapped = text.split_whitespace().collect::<Vec<_>>().join(" ");
             for expected in [
                 "Tab / → / l",
                 "Shift-Tab / ← / h",
                 "↑ ↓ / k j",
+                "f               Messages / Tasks",
+                "scroll active tab",
                 "t  TODO / continuation on/off",
                 "c  periodic check-ins on/off",
                 "p  PR watcher on/off",
@@ -1217,9 +1523,14 @@ mod tests {
                 "undelivered prompts",
                 "not already-running work.",
                 "Done ≠ accepted.",
+                "Only accepted tasks are completed; cancelled is not completion.",
+                "Task highlight is browse-only; no task actions.",
                 "external jobs running.",
             ] {
-                assert!(text.contains(expected), "missing {expected:?}:\n{text}");
+                assert!(
+                    text.contains(expected) || unwrapped.contains(expected),
+                    "missing {expected:?}:\n{text}"
+                );
             }
             assert!(!text.contains("Refine dashboard"));
         }
@@ -1246,11 +1557,15 @@ mod tests {
         assert!(!text.contains("FOREIGN_"));
         view.advance(&snapshot, true);
         let text = screen(&render(&snapshot, &view, 120, 30, false));
-        for expected in ["FOREIGN_MEMBER", "FOREIGN_TASK", "FOREIGN_MESSAGE"] {
+        for expected in ["FOREIGN_MEMBER", "FOREIGN_MESSAGE"] {
             assert!(text.contains(expected), "missing {expected:?}:\n{text}");
         }
-        assert!(!text.contains("Refine dashboard"));
+        assert!(text.contains("1 tasks · 0 accepted"));
         assert!(text.contains("[t] TODO: off"));
+        view.navigate(KeyCode::Char('f'), &snapshot);
+        let text = screen(&render(&snapshot, &view, 120, 30, false));
+        assert!(text.contains("FOREIGN_TASK"), "{text}");
+        assert!(!text.contains("Refine dashboard"));
     }
 
     #[test]
@@ -1264,8 +1579,11 @@ mod tests {
         snapshot.tasks[0].title = "Refine\r dashboard".into();
         snapshot.messages[0].text = "Safe\u{1b}[31m text\nno bell\u{7}".into();
         snapshot.error = Some("dis\nconnected\u{7}".into());
-        let buffer = render(&snapshot, &selected_view(&snapshot), 120, 30, true);
-        let text = screen(&buffer);
+        let mut view = selected_view(&snapshot);
+        let buffer = render(&snapshot, &view, 120, 30, true);
+        view.navigate(KeyCode::Char('f'), &snapshot);
+        let task_buffer = render(&snapshot, &view, 120, 30, true);
+        let text = format!("{}\n{}", screen(&buffer), screen(&task_buffer));
         for expected in [
             "Orchard · w1",
             "architect · w1:p1",
@@ -1280,6 +1598,7 @@ mod tests {
             buffer
                 .content()
                 .iter()
+                .chain(task_buffer.content())
                 .all(|cell| cell.symbol().chars().all(|ch| !ch.is_control()))
         );
     }
@@ -1313,10 +1632,12 @@ mod tests {
             task.id = TaskId::new(format!("task-{index}"));
             snapshot.tasks.push(task);
         }
-        let view = selected_view(&snapshot);
+        let mut view = selected_view(&snapshot);
+        view.navigate(KeyCode::Char('f'), &snapshot);
         let text = screen(&render(&snapshot, &view, 120, 18, false));
         assert!(text.contains("more participants"), "{text}");
-        assert!(text.contains("more tasks"), "{text}");
+        assert!(text.contains("1–4/10 tasks · 0 accepted"), "{text}");
+        assert!(!text.contains("more tasks"));
         let smallest = screen(&render(&snapshot, &view, 35, 12, false));
         assert!(
             smallest.lines().nth(10).unwrap().contains("q quit"),
@@ -1378,13 +1699,17 @@ mod tests {
         for snapshot in [Snapshot::default(), empty_space(), populated()] {
             for width in [0, 1, 10, 34, 35, 40, 60, 96, 98, 120] {
                 for height in [0, 1, 4, 11, 12, 13, 18, 24] {
-                    let buffer = render(&snapshot, &selected_view(&snapshot), width, height, false);
-                    assert!(
-                        buffer
-                            .content()
-                            .iter()
-                            .all(|cell| cell.bg == Color::Reset && cell.fg == Color::Reset)
-                    );
+                    for tab in [WorkTab::Messages, WorkTab::Tasks] {
+                        let mut view = selected_view(&snapshot);
+                        view.work_tab = tab;
+                        let buffer = render(&snapshot, &view, width, height, false);
+                        assert!(
+                            buffer
+                                .content()
+                                .iter()
+                                .all(|cell| cell.bg == Color::Reset && cell.fg == Color::Reset)
+                        );
+                    }
                 }
             }
         }
@@ -1393,14 +1718,78 @@ mod tests {
     // Run `cargo test tui::tests::render_previews -- --nocapture` for reproducible visual review.
     #[test]
     fn render_previews() {
-        for (name, snapshot, width, height, help) in [
-            ("EMPTY", empty_space(), 100, 24, false),
-            ("POPULATED", populated(), 120, 30, false),
-            ("NARROW", populated(), 56, 34, false),
-            ("HELP", populated(), 120, 30, true),
+        let mut tasks = work_tabs::many_tasks(18);
+        tasks.tasks[0].state = TaskState::Accepted;
+        tasks.tasks[3].state = TaskState::Review;
+        tasks.tasks[5].state = TaskState::Cancelled;
+        tasks.tasks[17].state = TaskState::Paused;
+        tasks.tasks[17].note = "Participant disconnected. Reconcile external jobs.".into();
+        for (name, snapshot, width, height, help, tab, last) in [
+            (
+                "EMPTY MESSAGES",
+                empty_space(),
+                100,
+                24,
+                false,
+                WorkTab::Messages,
+                false,
+            ),
+            (
+                "EMPTY TASKS",
+                empty_space(),
+                100,
+                24,
+                false,
+                WorkTab::Tasks,
+                false,
+            ),
+            (
+                "POPULATED MESSAGES",
+                populated(),
+                120,
+                30,
+                false,
+                WorkTab::Messages,
+                false,
+            ),
+            (
+                "SCROLLED TASKS",
+                tasks.clone(),
+                120,
+                30,
+                false,
+                WorkTab::Tasks,
+                true,
+            ),
+            (
+                "NARROW MESSAGES",
+                populated(),
+                56,
+                34,
+                false,
+                WorkTab::Messages,
+                false,
+            ),
+            (
+                "NARROW TASKS",
+                tasks.clone(),
+                40,
+                20,
+                false,
+                WorkTab::Tasks,
+                true,
+            ),
+            ("MINIMUM TASKS", tasks, 35, 12, false, WorkTab::Tasks, true),
+            ("HELP", populated(), 120, 30, true, WorkTab::Messages, false),
         ] {
             let mut view = selected_view(&snapshot);
             view.help = help;
+            view.work_tab = tab;
+            if last {
+                for _ in 1..snapshot.tasks.len() {
+                    view.navigate(KeyCode::Down, &snapshot);
+                }
+            }
             let preview = screen(&render(&snapshot, &view, width, height, false));
             assert_eq!(
                 preview,

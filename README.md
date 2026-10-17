@@ -31,8 +31,12 @@ Roles can be selected before the hub starts. Agents keep their own normal Pi con
 | `t` | Toggle TODO/task continuation |
 | `c` | Toggle periodic check-ins |
 | `p` | Toggle PR watching |
-| `↑` / `↓`, `k` / `j` | Scroll messages |
+| `f` | Switch Messages / Tasks tab |
+| `r` | Start fresh in this space / inspect reset status (confirmation required) |
+| `↑` / `↓`, `k` / `j` | Scroll messages or browse tasks in the active tab |
 | `?`, `q` | Help, quit |
+
+Messages and Tasks share a pane with independent scroll positions. The pane border shows total tasks and accepted completions for the selected space; awaiting-review and cancelled tasks are not counted as completed.
 
 Modes start **off**. From the intended Pi recipient, attach a checklist with `/mustr-todo path/to/TODO.md` or a PR with `/mustr-pr https://github.com/OWNER/REPO/pull/123`, then enable its mode. `/mustr pause`, `/mustr resume`, and `/mustr leave` control participation. Escape pauses automated delivery.
 
@@ -42,6 +46,6 @@ Modes start **off**. From the intended Pi recipient, attach a checklist with `/m
 
 `mustr -v` enables debug logs; `-vv` enables trace logs in `~/.local/state/mustr/mustr.log`. The UI uses your terminal's foreground/background and ANSI palette; `NO_COLOR=1` disables color accents.
 
-[Configuration and roles](docs/configuration.md) · [Behavior and protocol](docs/architecture.md) · [Development](docs/development.md)
+[Configuration and roles](docs/configuration.md) · [Start fresh](docs/start-fresh.md) · [Behavior and protocol](docs/architecture.md) · [Development](docs/development.md)
 
 Licensed under [GPLv3](LICENSE) (`GPL-3.0-only`).

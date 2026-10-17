@@ -1,6 +1,6 @@
 //! Pure coordination state machine. The hub owns bookkeeping, not model decisions.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use color_eyre::eyre::{Result, bail, ensure, eyre};
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,8 @@ use crate::{
     watchers::{PrSnapshot, PrWatch, TodoSnapshot, TodoWatch, pr_target},
 };
 
+mod reset;
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct State {
     pub members: BTreeMap<AgentId, Member>,
@@ -24,6 +26,14 @@ pub(crate) struct State {
     pub automation: BTreeMap<SpaceId, Automation>,
     #[serde(default)]
     cache: Vec<Cached>,
+    #[serde(default)]
+    resets: BTreeMap<SpaceId, reset::ResetPlan>,
+    #[serde(default)]
+    reset_epochs: BTreeMap<SpaceId, u64>,
+    #[serde(default)]
+    retired: BTreeMap<AgentId, SpaceId>,
+    #[serde(skip)]
+    reset_capable: BTreeSet<AgentId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -32,10 +42,16 @@ struct Cached {
     id: String,
     fingerprint: String,
     result: Value,
+    #[serde(default)]
+    space: Option<SpaceId>,
+    #[serde(default)]
+    epoch: u64,
 }
 
 impl State {
     pub fn recover(&mut self) {
+        self.reset_capable.clear();
+        self.recover_resets();
         for member in self.members.values_mut() {
             member.activity = Activity::Offline;
         }
@@ -57,7 +73,7 @@ impl State {
             automation.todo_enabled = false;
             automation.checkin_enabled = false;
             automation.pr_enabled = false;
-            automation.generation += 1;
+            automation.generation = automation.generation.saturating_add(1);
         }
     }
 
@@ -79,6 +95,9 @@ impl State {
                 .members
                 .values()
                 .filter_map(|member| {
+                    if self.reset_frozen(&member.space_id) {
+                        return None;
+                    }
                     if self
                         .messages
                         .iter()
@@ -95,6 +114,12 @@ impl State {
                 })
                 .collect(),
             automation: self.automation.clone(),
+            resets: self
+                .resets
+                .iter()
+                .map(|(space, plan)| (space.clone(), plan.summary()))
+                .collect(),
+            space_epochs: self.reset_epochs.clone(),
             error,
         }
     }
@@ -110,6 +135,29 @@ impl State {
             !request.id.is_empty() && request.id.len() <= 100,
             "invalid request ID"
         );
+        // Check the fence before deduplication: cached success must never
+        // authorize an old context after a reset.
+        if !matches!(request.command, Command::Join { .. }) {
+            let sender = sender.ok_or_else(|| eyre!("register before sending commands"))?;
+            let member = self
+                .members
+                .get(sender)
+                .filter(|m| m.activity != Activity::Offline && !self.retired.contains_key(sender))
+                .ok_or_else(|| eyre!("participant is disconnected or retired"))?;
+            ensure!(
+                !self.reset_frozen(&member.space_id)
+                    || matches!(
+                        request.command,
+                        Command::Sync { .. }
+                            | Command::Subscribe
+                            | Command::ResetCapability
+                            | Command::ResetClaim { .. }
+                            | Command::ResetStatus { .. }
+                            | Command::Leave
+                    ),
+                "space is frozen for fresh start; ordinary work is blocked"
+            );
+        }
         let fingerprint = digest(serde_json::to_vec(&request.command)?);
         let mutation = !matches!(
             request.command,
@@ -118,13 +166,20 @@ impl State {
                 | Command::Sync { .. }
                 | Command::Ack { .. }
                 | Command::Leave
+                | Command::ResetCapability
+                | Command::ResetClaim { .. }
+                | Command::ResetStatus { .. }
         );
         if mutation
             && let Some(sender) = sender
-            && let Some(previous) = self
-                .cache
-                .iter()
-                .find(|c| &c.sender == sender && c.id == request.id)
+            && let Some(previous) = self.cache.iter().find(|c| {
+                &c.sender == sender
+                    && c.id == request.id
+                    && c.epoch == self.reset_epoch(&self.members[sender].space_id)
+                    && c.space
+                        .as_ref()
+                        .is_none_or(|space| space == &self.members[sender].space_id)
+            })
         {
             ensure!(
                 previous.fingerprint == fingerprint,
@@ -139,6 +194,11 @@ impl State {
                 id: request.id.clone(),
                 fingerprint,
                 result: result.clone(),
+                space: self.members.get(sender).map(|m| m.space_id.clone()),
+                epoch: self
+                    .members
+                    .get(sender)
+                    .map_or(0, |m| self.reset_epoch(&m.space_id)),
             });
             if self.cache.len() > 1024 {
                 self.cache.remove(0);
@@ -161,10 +221,35 @@ impl State {
             role,
             pane_id,
             space_id,
+            reset,
         } = command
         {
             ensure!(*version == VERSION, "unsupported mustr protocol version");
+            ensure!(
+                !agent_id.as_str().is_empty() && agent_id.as_str().len() <= 100,
+                "invalid agent ID"
+            );
+            ensure!(
+                valid_name(name) && valid_name(role),
+                "invalid participant or role name"
+            );
+            if let Some(receipt) = reset {
+                ensure!(
+                    sender.is_none_or(|id| id == agent_id),
+                    "already registered as another session"
+                );
+                return self.join_reset(agent_id, name, role, pane_id, space_id, receipt, now);
+            }
             ensure!(sender.is_none(), "already registered");
+            ensure!(
+                !self.retired.contains_key(agent_id),
+                "this session identity is retired; start a genuinely fresh session"
+            );
+            ensure!(
+                !self.reset_frozen(space_id)
+                    || self.approved_old_join(agent_id, name, role, pane_id, space_id),
+                "space is frozen; unapproved participants cannot join"
+            );
             ensure!(
                 valid_name(name) && valid_name(role),
                 "invalid participant or role name"
@@ -201,6 +286,10 @@ impl State {
             }
             if let Some(old) = self.members.get(agent_id) {
                 ensure!(
+                    !self.reset_frozen(&old.space_id) || old.space_id == *space_id,
+                    "original space is frozen; old contexts cannot move out of its reset"
+                );
+                ensure!(
                     old.space_id == *space_id
                         || !self.tasks.values().any(|t| !t.state.finished()
                             && (&t.owner == agent_id || &t.requester == agent_id)),
@@ -210,6 +299,7 @@ impl State {
                     self.disconnect(agent_id);
                 }
             }
+            self.reset_capable.remove(agent_id);
             self.members.insert(
                 agent_id.clone(),
                 Member {
@@ -225,7 +315,7 @@ impl State {
             );
             self.automation.entry(space_id.clone()).or_default();
             return Ok(
-                json!({"protocol": VERSION, "agent_id": agent_id, "delivery_policy": 1, "inbox_notifications": 1}),
+                json!({"protocol": VERSION, "agent_id": agent_id, "delivery_policy": 1, "inbox_notifications": 1, "reset_protocol": 1}),
             );
         }
         let sender = sender.ok_or_else(|| eyre!("register before sending commands"))?;
@@ -236,6 +326,17 @@ impl State {
             .cloned()
             .ok_or_else(|| eyre!("participant is disconnected"))?;
         match command {
+            Command::ResetCapability => {
+                self.reset_capable.insert(sender.clone());
+                Ok(json!({"reset_protocol":1}))
+            }
+            Command::ResetClaim { plan_id, token } => self.claim_reset(&member, plan_id, token),
+            Command::ResetStatus {
+                plan_id,
+                token,
+                status,
+                text,
+            } => self.report_reset(&member, plan_id, token, *status, text),
             Command::Subscribe => Ok(json!({"subscribed":true})),
             Command::Sync { activity, receive } => {
                 ensure!(*activity != Activity::Offline, "use leave to disconnect");
@@ -248,6 +349,9 @@ impl State {
                 }
                 current.activity = *activity;
                 current.last_seen = now;
+                if self.reset_frozen(&member.space_id) {
+                    return Ok(self.reset_sync(&member));
+                }
                 if *activity == Activity::Paused {
                     self.cancel_auto_for(sender);
                 }
@@ -628,7 +732,15 @@ impl State {
     }
 
     pub fn set_mode(&mut self, space: &SpaceId, mode: Mode, enabled: bool, now: u64) -> Result<()> {
+        ensure!(
+            !self.reset_frozen(space),
+            "space is frozen for fresh start; modes are blocked"
+        );
         let automation = self.automation.entry(space.clone()).or_default();
+        let generation = automation
+            .generation
+            .checked_add(1)
+            .ok_or_else(|| eyre!("watcher generation exhausted"))?;
         match mode {
             Mode::Todo => {
                 if let Some(todo) = &mut automation.todo {
@@ -649,7 +761,7 @@ impl State {
                 automation.pr_enabled = enabled;
             }
         }
-        automation.generation += 1;
+        automation.generation = generation;
         for message in &mut self.messages {
             let relevant = match mode {
                 Mode::Todo => matches!(message.kind, MessageKind::Todo | MessageKind::Continue),
@@ -671,6 +783,8 @@ impl State {
     }
 
     pub fn disconnect(&mut self, id: &AgentId) {
+        self.reset_capable.remove(id);
+        self.disconnect_reset(id);
         if let Some(member) = self.members.get_mut(id) {
             member.activity = Activity::Offline;
         }
@@ -698,7 +812,7 @@ impl State {
                 automation.pr_enabled = false;
             }
             if todo_driver || pr_driver {
-                automation.generation += 1;
+                automation.generation = automation.generation.saturating_add(1);
             }
         }
     }
@@ -813,7 +927,7 @@ impl State {
             self.disconnect(&id);
         }
         for mut task in self.tasks.values().cloned().collect::<Vec<_>>() {
-            if task.state != TaskState::Active {
+            if task.state != TaskState::Active || self.reset_frozen(&task.space_id) {
                 continue;
             }
             let Some(member) = self.members.get(&task.owner) else {
@@ -885,6 +999,9 @@ impl State {
         now: u64,
         scheduling: &Scheduling,
     ) -> Result<()> {
+        if self.reset_frozen(space) {
+            return Ok(());
+        }
         let Some(mut automation) = self.automation.get(space).cloned() else {
             return Ok(());
         };
@@ -942,6 +1059,9 @@ impl State {
         result: std::result::Result<PrSnapshot, String>,
         now: u64,
     ) -> Result<()> {
+        if self.reset_frozen(space) {
+            return Ok(());
+        }
         let Some(mut automation) = self.automation.get(space).cloned() else {
             return Ok(());
         };

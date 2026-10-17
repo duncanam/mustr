@@ -127,7 +127,8 @@ async fn accept_loop(
             result = listener.accept() => match result {
                 Ok((stream, _)) => {
                     let Ok(permit) = permits.clone().try_acquire_owned() else { continue; };
-                    sequence += 1;
+                    let Some(next) = sequence.checked_add(1) else { break; };
+                    sequence = next;
                     let id = sequence;
                     let herdr = herdr.clone(); let service = service.clone();
                     clients.spawn(async move {
@@ -253,6 +254,24 @@ async fn connection(stream: UnixStream, id: u64, herdr: &Herdr, service: &Servic
     Ok(())
 }
 
+fn retire_jobs(
+    jobs: &mut BTreeMap<SpaceId, (u64, JoinHandle<()>)>,
+    snapshot: &Snapshot,
+    enabled: impl Fn(&Automation) -> bool,
+) {
+    jobs.retain(|space, (generation, job)| {
+        let current = snapshot
+            .automation
+            .get(space)
+            .is_some_and(|a| enabled(a) && a.generation == *generation);
+        if !current {
+            // A blocking read can outlive abort; the actor also checks generation.
+            job.abort();
+        }
+        current
+    });
+}
+
 async fn observe(herdr: Herdr, service: Service, mut stop: watch::Receiver<bool>) {
     let mut ticks = interval(Duration::from_secs(1));
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -271,11 +290,9 @@ async fn observe(herdr: Herdr, service: Service, mut stop: watch::Receiver<bool>
                 }
                 let _ = service.tx.send(Event::Tick).await;
                 let snapshot = service.snapshots.borrow().clone();
+                retire_jobs(&mut todo_jobs, &snapshot, |a| a.todo_enabled);
+                retire_jobs(&mut pr_jobs, &snapshot, |a| a.pr_enabled);
                 for (space, automation) in &snapshot.automation {
-                    if let Some((generation, task)) = todo_jobs.get(space)
-                        && (!automation.todo_enabled || *generation != automation.generation) { task.abort(); }
-                    if let Some((generation, task)) = pr_jobs.get(space)
-                        && (!automation.pr_enabled || *generation != automation.generation) { task.abort(); }
                     if automation.todo_enabled && todo_jobs.get(space).is_none_or(|(_, job)| job.is_finished())
                         && let Some(todo) = &automation.todo {
                         let path = todo.path.clone(); let tx = service.tx.clone(); let space_id = space.clone(); let generation = automation.generation;

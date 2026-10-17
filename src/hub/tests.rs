@@ -1,6 +1,7 @@
 use super::*;
 
 mod delivery;
+mod reset;
 
 fn request(id: &str, command: Command) -> Request {
     Request {
@@ -32,6 +33,7 @@ fn setup() -> (State, AgentId, AgentId, Scheduling) {
                         role: "custom".into(),
                         pane_id: pane.into(),
                         space_id: SpaceId::new("w1"),
+                        reset: None,
                     },
                 ),
                 None,
