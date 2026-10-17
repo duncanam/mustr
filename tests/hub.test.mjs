@@ -7,9 +7,9 @@ import { once } from "node:events";
 import { HubClient } from "../pi/transport.mjs";
 import { fixture, binary, exec, eventually, delay, stop } from "./support.mjs";
 
-async function join(t, f, id, pane, space = "w1") {
+async function join(t, f, id, pane, space = "w1", role = "implementor") {
   const client = new HubClient(); t.after(() => client.close());
-  await client.connect(f.discovery.socket, { agent_id: id, name: id, role: "implementor", pane_id: pane, space_id: space });
+  await client.connect(f.discovery.socket, { agent_id: id, name: id, role, pane_id: pane, space_id: space });
   await client.request({ op: "sync", activity: "idle", receive: false });
   return client;
 }
@@ -19,6 +19,47 @@ async function receive(client) {
   if (snapshot.inbox) await client.request({ op: "ack", message_id: snapshot.inbox.id });
   return snapshot.inbox;
 }
+
+test("socket admission rejects invalid initial/reset joins and resolves shared components per agent", { timeout: 15000 }, async t => {
+  const f = await fixture(t);
+  const roles = `${f.directory}/config/roles`;
+  await writeFile(`${roles}/missing.md`, "+++\ncompose = [\"absent\"]\n+++\nBroken role.\n");
+  await writeFile(`${roles}/late-component.md`, "Selected component remains valid only until admission.\n");
+  await writeFile(`${roles}/late.md`, "+++\ncompose = [\"late-component\"]\n+++\nSelected role.\n");
+  await writeFile(`${roles}/shared.md`, "Shared instructions.\n");
+  await writeFile(`${roles}/shared-a.md`, "+++\ncompose = [\"shared\"]\n+++\nRole A.\n");
+  await writeFile(`${roles}/shared-b.md`, "+++\ncompose = [\"shared\"]\n+++\nRole B.\n");
+  const selected = await exec(binary, ["roles", "late", "--json"], { env: f.env });
+  assert.equal(JSON.parse(selected.stdout)[0].name, "late");
+  await writeFile(`${roles}/late-component.md`, "+++\ncompose = [\"absent-after-selection\"]\n+++\nChanged component.\n");
+  await f.start();
+
+  const staleSelection = new HubClient(); t.after(() => staleSelection.close());
+  await assert.rejects(staleSelection.connect(f.discovery.socket, {
+    agent_id: "stale-selection", name: "stale-selection", role: "late", pane_id: "w1:p1", space_id: "w1",
+  }), /late -> late-component -> absent-after-selection/);
+
+  const rejectedInitial = new HubClient(); t.after(() => rejectedInitial.close());
+  await assert.rejects(rejectedInitial.connect(f.discovery.socket, {
+    agent_id: "unadmitted", name: "unadmitted", role: "missing", pane_id: "w1:p1", space_id: "w1",
+  }), /missing -> absent/);
+  const rejectedReset = new HubClient(); t.after(() => rejectedReset.close());
+  await assert.rejects(rejectedReset.connect(f.discovery.socket, {
+    agent_id: "retryable", name: "retryable", role: "missing", pane_id: "w1:p1", space_id: "w1",
+    reset: { plan_id: "not-a-real-plan", token: "not-a-real-token" },
+  }), /missing -> absent/);
+
+  // A valid join with the same identity/pane after the rejected reset variant
+  // would fail if validation had partially registered the earlier request.
+  const first = await join(t, f, "retryable", "w1:p1", "w1", "shared-a");
+  const second = await join(t, f, "second", "w1:p2", "w1", "shared-b");
+  const members = (await sync(first)).members;
+  assert.deepEqual(members.map(member => [member.id, member.role]).sort(), [
+    ["retryable", "shared-a"], ["second", "shared-b"],
+  ]);
+  assert.equal(members.some(member => member.id === "unadmitted" || member.role === "missing"), false);
+  assert.equal((await sync(second)).members.length, 2);
+});
 
 test("real socket hub: isolated spaces, task exchange, rollback and restart reconciliation", { timeout: 20000 }, async t => {
   const f = await fixture(t);

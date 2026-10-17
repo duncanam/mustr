@@ -23,6 +23,7 @@ use crate::{
     herdr::Herdr,
     paths::{Paths, check_regular, private_dir},
     protocol::*,
+    roles,
     service::{Event, Service, now},
     watchers,
 };
@@ -74,6 +75,7 @@ impl Server {
                 listener,
                 herdr.clone(),
                 service.clone(),
+                paths.roles(),
                 stopping.clone(),
             )),
             tokio::spawn(observe(herdr, service.clone(), stopping)),
@@ -115,6 +117,7 @@ async fn accept_loop(
     listener: UnixListener,
     herdr: Herdr,
     service: Service,
+    roles_dir: PathBuf,
     mut stop: watch::Receiver<bool>,
 ) {
     let permits = Arc::new(Semaphore::new(128));
@@ -130,10 +133,10 @@ async fn accept_loop(
                     let Some(next) = sequence.checked_add(1) else { break; };
                     sequence = next;
                     let id = sequence;
-                    let herdr = herdr.clone(); let service = service.clone();
+                    let herdr = herdr.clone(); let service = service.clone(); let roles_dir = roles_dir.clone();
                     clients.spawn(async move {
                         let _permit = permit;
-                        if let Err(error) = connection(stream, id, &herdr, &service).await { tracing::debug!(connection = id, %error, "participant disconnected"); }
+                        if let Err(error) = connection(stream, id, &herdr, &service, &roles_dir).await { tracing::debug!(connection = id, %error, "participant disconnected"); }
                         let _ = service.tx.send(Event::Disconnect(id)).await;
                     });
                 }
@@ -145,7 +148,13 @@ async fn accept_loop(
     while clients.join_next().await.is_some() {}
 }
 
-async fn connection(stream: UnixStream, id: u64, herdr: &Herdr, service: &Service) -> Result<()> {
+async fn connection(
+    stream: UnixStream,
+    id: u64,
+    herdr: &Herdr,
+    service: &Service,
+    roles_dir: &std::path::Path,
+) -> Result<()> {
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
     let mut identity: Option<(String, SpaceId)> = None;
@@ -204,6 +213,20 @@ async fn connection(stream: UnixStream, id: u64, herdr: &Herdr, service: &Servic
                 break;
             }
         };
+        if let Command::Join { role, .. } = &request.command {
+            let roles_dir = roles_dir.to_path_buf();
+            let role = role.clone();
+            let validation = tokio::task::spawn_blocking(move || roles::resolve(&roles_dir, &role))
+                .await
+                .map_err(|error| eyre!("role validation worker failed: {error}"))?;
+            if let Err(error) = validation {
+                let response = Response::failure(request.id, error);
+                write
+                    .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
+                    .await?;
+                break;
+            }
+        }
         let check = match &request.command {
             Command::Join {
                 pane_id, space_id, ..
@@ -319,3 +342,6 @@ async fn observe(herdr: Herdr, service: Service, mut stop: watch::Receiver<bool>
         job.abort();
     }
 }
+
+#[cfg(test)]
+mod tests;

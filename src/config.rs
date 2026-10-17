@@ -95,14 +95,21 @@ impl Config {
     }
 }
 
-/// Only initial setup seeds roles. Removing a role later is respected.
+/// Implicit setup seeds roles only when it creates the initial configuration.
 pub(crate) fn initialize(paths: &Paths) -> Result<()> {
     private_dir(&paths.config)?;
     private_dir(&paths.roles())?;
     if create_file(&paths.config.join("config.toml"), DEFAULT_CONFIG.as_bytes())? {
-        for (name, text) in crate::roles::DEFAULTS {
-            create_file(&paths.roles().join(format!("{name}.md")), text.as_bytes())?;
-        }
+        seed_roles(paths)?;
+    }
+    Ok(())
+}
+
+/// Create missing shipped role files without replacing user-owned content.
+pub(crate) fn seed_roles(paths: &Paths) -> Result<()> {
+    private_dir(&paths.roles())?;
+    for (name, text) in crate::roles::DEFAULTS {
+        create_file(&paths.roles().join(format!("{name}.md")), text.as_bytes())?;
     }
     Ok(())
 }
@@ -128,6 +135,50 @@ mod tests {
         );
         assert!(!paths.roles().join("reviewer.md").exists());
         assert_eq!(Config::load(&paths).unwrap().version, 1);
+    }
+
+    #[test]
+    fn fresh_setup_seeds_base_without_overwriting_existing_role_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config: dir.path().join("config"),
+            state: dir.path().join("state"),
+        };
+        private_dir(&paths.config).unwrap();
+        private_dir(&paths.roles()).unwrap();
+        let customized = "+++\nextends = \"implementor\"\n+++\nKeep my prototype role.";
+        fs::write(paths.roles().join("reviewer.md"), customized).unwrap();
+        initialize(&paths).unwrap();
+        assert_eq!(
+            fs::read_to_string(paths.roles().join("base.md")).unwrap(),
+            include_str!("../roles/base.md")
+        );
+        assert_eq!(
+            fs::read_to_string(paths.roles().join("reviewer.md")).unwrap(),
+            customized
+        );
+        fs::write(paths.roles().join("base.md"), "My shared instructions.").unwrap();
+        initialize(&paths).unwrap();
+        assert_eq!(
+            fs::read_to_string(paths.roles().join("base.md")).unwrap(),
+            "My shared instructions."
+        );
+        fs::remove_file(paths.roles().join("base.md")).unwrap();
+        initialize(&paths).unwrap();
+        assert!(!paths.roles().join("base.md").exists());
+    }
+
+    #[test]
+    fn existing_configuration_does_not_implicitly_migrate_roles() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config: dir.path().join("config"),
+            state: dir.path().join("state"),
+        };
+        private_dir(&paths.config).unwrap();
+        fs::write(paths.config.join("config.toml"), DEFAULT_CONFIG).unwrap();
+        initialize(&paths).unwrap();
+        assert_eq!(fs::read_dir(paths.roles()).unwrap().count(), 0);
     }
 
     #[test]

@@ -19,7 +19,8 @@ test("adapter: explicit join before hub, human gating, settled report, policies 
   assert.equal((await h.emit("before_agent_start", { systemPrompt: "Base policy" }))[0], undefined);
   await h.commands.get("role").handler("implementor", h.context);
   await delay(150); assert.equal(h.messages.length, 0, "waiting for hub causes no model turns");
-  assert.ok(h.active().includes("mustr_send")); assert.ok(h.active().includes("policy-tool"));
+  assert.deepEqual(h.active(), ["read", "bash", "policy-tool"]);
+  assert.equal((await h.emit("before_agent_start", { systemPrompt: "Still unjoined" }))[0], undefined);
   await f.start();
   await eventually(() => h.tools.get("mustr_roster").execute("roster", {}, undefined));
   const prompt = (await h.emit("before_agent_start", { systemPrompt: "Base policy: protect private files." }))[0].systemPrompt;

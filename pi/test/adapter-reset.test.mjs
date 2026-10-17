@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { rm } from "node:fs/promises";
+import { rm, writeFile } from "node:fs/promises";
+import { HubClient, HubRemoteError } from "../transport.mjs";
 import { eventually, delay } from "../../tests/support.mjs";
 import extension from "../index.ts";
 import { harness } from "./adapter-harness.mjs";
@@ -165,6 +166,50 @@ test("missing local role prevents fresh role activation or receipt", async t => 
   await eventually(() => f.h.root.replacements === 1 && f.h.root.current.notifications.some(n => /manual/.test(n.message)));
   assert.deepEqual(f.h.root.current.active(), ["read", "bash", "policy-tool"]);
   assert.equal(f.hub.receiptAttempts.length, 0);
+  assertPrivate(f);
+});
+
+test("broken requested composition reports its path and prevents fresh receipt or activation", async t => {
+  const f = await resetFixture(t);
+  f.h.root.beforeFreshRestore = () => writeFile(`${f.f.directory}/config/roles/implementor.md`, '+++\ncompose = ["missing-fresh-component"]\n+++\nBroken fresh role');
+  f.hub.prepare(); await f.discover();
+  await eventually(() => f.h.root.current.notifications.some(n => /missing-fresh-component/.test(n.message)));
+  assert.deepEqual(f.h.root.current.active(), ["read", "bash", "policy-tool"]);
+  assert.equal((await f.h.root.current.emit("before_agent_start", { systemPrompt: "Base" }))[0], undefined);
+  assert.equal(f.hub.receiptAttempts.length, 0);
+  assert.ok(f.h.root.current.notifications.some(n => /manual/.test(n.message)));
+  assertPrivate(f);
+});
+
+test("fresh restore resolves updated role despite unrelated invalid graph", async t => {
+  const f = await resetFixture(t);
+  f.h.root.beforeFreshRestore = async () => {
+    await writeFile(`${f.f.directory}/config/roles/broken.md`, '+++\ncompose = ["missing"]\n+++\nBroken unrelated role');
+    await writeFile(`${f.f.directory}/config/roles/implementor.md`, "UPDATED FRESH ROLE");
+  };
+  f.hub.prepare(); await f.discover();
+  await eventually(() => f.hub.completed && f.h.root.current.active().includes("mustr_roster"));
+  const text = (await f.h.root.current.emit("before_agent_start", { systemPrompt: "Base" }))[0].systemPrompt;
+  assert.match(text, /UPDATED FRESH ROLE/);
+  assert.equal(f.hub.receiptAttempts.length, 1);
+  assertPrivate(f);
+});
+
+test("fresh server graph rejection shows cause without retrying receipt or activating tools", async t => {
+  const f = await resetFixture(t);
+  // Admission seam: reject AFTER local targeted resolution, before fake hub mutation.
+  const connect = HubClient.prototype.connect;
+  let attempts = 0;
+  HubClient.prototype.connect = async function(path, hello) {
+    if (hello.reset) { attempts++; throw new HubRemoteError("role implementor -> missing-fresh-component: unknown component"); }
+    return connect.call(this, path, hello);
+  };
+  f.hub.prepare(); await f.discover();
+  await eventually(() => f.h.root.current.notifications.some(n => /missing-fresh-component/.test(n.message)));
+  await delay(300);
+  assert.equal(attempts, 1); assert.equal(f.hub.completed, false);
+  assert.deepEqual(f.h.root.current.active(), ["read", "bash", "policy-tool"]);
+  assert.equal((await f.h.root.current.emit("before_agent_start", { systemPrompt: "Base" }))[0], undefined);
   assertPrivate(f);
 });
 

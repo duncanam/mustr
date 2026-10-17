@@ -42,7 +42,7 @@ Modes start **off**. From the intended Pi recipient, attach a checklist with `/m
 
 ## Configure
 
-`~/.config/mustr/config.toml` contains scheduling/UI settings. Editable prompts live in `~/.config/mustr/roles/*.md`; add your own or extend a default using TOML front matter. `$XDG_CONFIG_HOME` and `--config-dir` are supported. Existing role files are never overwritten.
+`~/.config/mustr/config.toml` contains scheduling/UI settings. Editable prompts live in `~/.config/mustr/roles/*.md`; add your own or compose reusable roles using TOML front matter. `$XDG_CONFIG_HOME` and `--config-dir` are supported. Existing role files are never overwritten.
 
 `mustr -v` enables debug logs; `-vv` enables trace logs in `~/.local/state/mustr/mustr.log`. The UI uses your terminal's foreground/background and ANSI palette; `NO_COLOR=1` disables color accents.
 

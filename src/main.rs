@@ -23,7 +23,7 @@ use color_eyre::eyre::Result;
 
 use crate::{
     cli::{Cli, Command, InstallTarget},
-    config::{Config, initialize},
+    config::{Config, initialize, seed_roles},
     paths::{Paths, private_dir},
 };
 
@@ -35,13 +35,19 @@ async fn main() -> Result<()> {
     initialize(&paths)?;
     let config = Config::load(&paths)?;
     match cli.command.unwrap_or(Command::Run { headless: false }) {
-        Command::Init => println!(
-            "Configuration: {}\nRoles: {}",
-            paths.config.display(),
-            paths.roles().display()
-        ),
-        Command::Roles { json } => {
-            let roles = roles::load(&paths.roles())?;
+        Command::Init => {
+            seed_roles(&paths)?;
+            println!(
+                "Configuration: {}\nRoles: {}",
+                paths.config.display(),
+                paths.roles().display()
+            );
+        }
+        Command::Roles { name, json } => {
+            let roles = match name {
+                Some(name) => vec![roles::resolve(&paths.roles(), &name)?],
+                None => roles::load(&paths.roles())?,
+            };
             if json {
                 println!("{}", serde_json::to_string(&roles)?);
             } else {

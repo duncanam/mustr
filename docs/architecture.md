@@ -68,7 +68,7 @@ Closure/merge disables watching. A failed or inconsistent poll, including branch
 
 ## Durability and wire protocol
 
-Protocol v1 is UTF-8 newline-delimited JSON over a same-user Unix socket. Each connection first sends `join` with protocol version, session ID, role/name, and pane/space IDs. The server checks the live pane and its Pi agent designation. Subsequent operations bind to that sender; recipients and task IDs cannot cross spaces.
+Protocol v1 is UTF-8 newline-delimited JSON over a same-user Unix socket. Each connection first sends `join` with protocol version, session ID, role/name, and pane/space IDs. The server checks the live pane and its Pi agent designation and resolves the requested role graph before admitting the participant, including reconnect and fresh-session joins. Invalid roles fail before participant/reset state changes; unrelated valid role graphs remain usable. Subsequent operations bind to that sender; recipients and task IDs cannot cross spaces.
 
 ```json
 {"id":"unique-request-id","op":"send","to":"recipient-session-id","text":"Please review task X","wake":true}

@@ -2,7 +2,7 @@
 
 ## Paths and CLI
 
-Run `mustr init` to create defaults, or let the first ordinary command initialize them. `--help` and `--version` do not need herdr or configuration.
+Run `mustr init` to create configuration and restore any missing shipped role files, without overwriting existing files. The first ordinary command also initializes a fresh configuration, but later ordinary commands respect deleted roles. `--help` and `--version` do not need herdr or configuration.
 
 | Purpose | Default | Override |
 |---|---|---|
@@ -17,7 +17,8 @@ Configuration, state, and Pi agent overrides must be absolute paths. The adapter
 mustr                      # hub and dashboard
 mustr run --headless        # same hub, no dashboard
 mustr roles                # available role names and descriptions
-mustr roles --json         # resolved role prompts for the adapter
+mustr roles --json         # valid resolved role prompts for the adapter
+mustr roles reviewer --json # resolve one requested graph; report its errors
 mustr -v                   # debug logging; -vv for trace, -q for warnings
 ```
 
@@ -45,12 +46,12 @@ Automation enablement is deliberately **not** an automatic-start configuration s
 
 ## Editable roles
 
-Role files are `roles/<name>.md`. A name is 1–48 lowercase ASCII letters, digits, or hyphens, starting with a letter. Plain Markdown is sufficient; optional TOML front matter supplies a description and one parent:
+Role files are `roles/<name>.md`. A name is 1–48 lowercase ASCII letters, digits, or hyphens, starting with a letter. Plain Markdown is sufficient; optional TOML front matter supplies a description and an ordered list of component roles:
 
 ```markdown
 +++
 description = "Review performance and benchmark evidence"
-extends = "reviewer"
+compose = ["reviewer"]
 +++
 
 Check algorithmic complexity and realistic benchmark coverage.
@@ -72,9 +73,26 @@ There are no role-name shortcut commands. `/role` lists roles; `/role NAME [PART
 
 Those commands belong in **separate Pi sessions**, not one session. Names identify participants in the dashboard; tools address their stable Pi session IDs.
 
-The initial architect, implementor, reviewer, and researcher prompts are examples, not privileged positions. The hub does not prescribe a hierarchy. Any role can request work; the requester owns guidance and acceptance for that task. Reviewer and researcher initially extend implementor, so edit their inheritance before removing that parent.
+The shipped architect, implementor, reviewer, and researcher roles all compose `base`, the shared coordination/safety instructions. `base` is normally a component rather than a standalone role, but selecting it is allowed. All roles can be components; there are no privileged positions or fixed hierarchy. Any role can request work; the requester owns guidance and acceptance for that task.
 
-Inheritance appends the child prompt to its parent's resolved prompt. Missing parents, cycles, unknown header keys, empty prompts, and oversized files are errors. Existing files are never overwritten, and a deleted role is not recreated while `config.toml` exists. `/role` reloads definitions; an already-selected role retains its prompt until reselected. An unfinished owner assignment prevents changing roles.
+For example, a custom role can combine implementation and review capabilities:
+
+```markdown
++++
+description = "Implement changes and review other participants' work"
+compose = ["implementor", "reviewer"]
++++
+
+Focus on database changes. Obtain independent review of your own implementation.
+```
+
+Composition expands depth-first in listed order, adding each component's dependencies before its own body, then appending the selected role's body. Each role appears once per resolution: this example expands `base`, `implementor`, `reviewer`, then the custom body. Shared dependencies (diamonds) are allowed. A direct list such as `["base", "base"]` is an error, as are self/indirect cycles. Tracking is local to one resolution, so separate agents can share components normally. This is additive instruction composition, not an override mechanism; write responsibilities that can coexist.
+
+Missing or invalid component names, malformed/unknown header fields, and empty prompts are errors. Limits are 32 nested first-visit expansions (including the root), 128 distinct roles per resolution, 64 KiB per source file, and 128 KiB for the expanded prompt. Reused components do not expand again. Diagnostics identify the dependency path. Listing roles returns usable roles with diagnostics for invalid ones; explicitly resolving a role reports its graph's error without letting unrelated broken files block it. The hub validates the requested graph before every initial, reconnect, or fresh-session join, before registering the participant.
+
+Existing files are never overwritten. Ordinary commands do not recreate deleted roles while `config.toml` exists; explicitly run `mustr init` to restore missing shipped files, including `base`, from the installed binary. This is missing-file repair, not migration: existing role contents remain untouched. **`extends` is no longer supported**, even alongside `compose`. For an existing custom role, manually replace `extends = "reviewer"` with `compose = ["reviewer"]`, and reconcile responsibilities with the current shipped defaults; avoid preserving old implementation-only instructions in research/review roles. To replace an old default wholesale, back it up outside `roles/`, remove only that file, and run `mustr init`. Do not delete `config.toml` or reset hub history to repair roles. If generated defaults still contain `extends`, rebuild/install the current binary and check which executable `command -v mustr` selects.
+
+`/role NAME` reloads that graph; reconnect and fresh-session restore also resolve it again. An active prompt is a snapshot: reselect to refresh it after edits, including edits made while a join was in flight. An unfinished owner assignment prevents changing roles. Selection before hub startup stays pending, without role prompts or mustr tools until admission succeeds. Disconnect deactivates them; invalid composition or authoritative join rejection stops automatic retries and shows the cause. Fix the diagnostic and explicitly `/role NAME` again. Fresh-start failures also require the documented [manual recovery](start-fresh.md).
 
 Role prompts do not remove existing system prompts, skills, source-control restrictions, protected-path rules, or user direction. A role is not a permission boundary.
 

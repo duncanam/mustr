@@ -27,10 +27,12 @@ pub(crate) enum Command {
         #[arg(long)]
         headless: bool,
     },
-    /// Create initial configuration and default roles, without overwriting files.
+    /// Create initial configuration and restore missing default roles without overwriting files.
     Init,
-    /// List resolved role definitions; usable before the hub starts.
+    /// List valid roles or resolve one role before the hub starts.
     Roles {
+        /// Resolve only this role and its dependencies.
+        name: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -82,6 +84,23 @@ mod tests {
         assert!(
             matches!(cli.command, Some(Command::Install { harness: InstallTarget::Pi { agent_dir: Some(path) } }) if path == std::path::Path::new("/tmp/pi"))
         );
+    }
+
+    #[test]
+    fn roles_accepts_an_optional_target_name() {
+        assert!(matches!(
+            Cli::try_parse_from(["mustr", "roles", "architect", "--json"])
+                .unwrap()
+                .command,
+            Some(Command::Roles { name: Some(name), json: true }) if name == "architect"
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["mustr", "roles"]).unwrap().command,
+            Some(Command::Roles {
+                name: None,
+                json: false
+            })
+        ));
     }
 
     #[test]
