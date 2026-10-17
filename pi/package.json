@@ -5,6 +5,7 @@
   "type": "module",
   "license": "GPL-3.0-only",
   "description": "Pi adapter bundled with the mustr Rust binary",
+  "engines": { "node": ">=22.19.0" },
   "pi": { "extensions": ["./index.ts"] },
   "scripts": {
     "typecheck": "tsc --noEmit",

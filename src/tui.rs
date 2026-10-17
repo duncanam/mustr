@@ -13,7 +13,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Cell, Paragraph, Row, Table, Tabs, Wrap},
+    widgets::{Block, BorderType, Borders, Cell, Padding, Paragraph, Row, Table, Tabs, Wrap},
 };
 
 use crate::{
@@ -207,15 +207,21 @@ fn elide(text: &str, width: u16) -> String {
     result
 }
 
-fn mode_span(key: char, name: &str, on: bool, color: bool) -> Span<'static> {
-    Span::styled(
-        format!("[{key}] {name} {}  ", if on { "ON" } else { "off" }),
-        if on {
-            accent(color).add_modifier(Modifier::BOLD)
-        } else {
-            muted()
-        },
-    )
+fn mode_spans(key: char, name: &str, on: bool, color: bool) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(format!("[{key}] "), muted()),
+        Span::styled(format!("{name}: "), bold()),
+        // State is distinct from both the label and the keyboard shortcut.
+        // Reserve the same width so toggling a mode never shifts the layout.
+        Span::styled(
+            if on { "ON " } else { "off" },
+            if on {
+                tone(color, Color::Green)
+            } else {
+                Style::default()
+            },
+        ),
+    ]
 }
 
 fn draw(frame: &mut Frame, snapshot: &Snapshot, view: &mut View, color: bool) {
@@ -235,30 +241,28 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, view: &mut View, color: bool) {
         .and_then(|space| snapshot.automation.get(space))
         .cloned()
         .unwrap_or_default();
-    let mode_height = if view.selected.is_none() {
-        1
+    let mode_lines = if view.help {
+        Vec::new()
+    } else if view.selected.is_some() {
+        automation_lines(&automation, area.width, color)
     } else {
-        u16::from(area.width < 60)
-            + 1
-            + u16::from(automation.todo.is_some() || automation.pr.is_some())
+        vec![Line::from(vec![
+            Span::styled("herdr: ", bold()),
+            Span::raw("waiting for spaces"),
+        ])]
     };
-    let [header, modes, _, body, footer] = Layout::vertical([
-        Constraint::Length(2),
-        Constraint::Length(mode_height),
+    let spacious = area.height >= 20 && !view.help;
+    let [header, _, modes, _, body, footer] = Layout::vertical([
+        Constraint::Length(if spacious { 3 } else { 2 }),
+        Constraint::Length(u16::from(spacious)),
+        Constraint::Length(height(mode_lines.len())),
         Constraint::Length(u16::from(area.height >= 18)),
         Constraint::Min(1),
         Constraint::Length(2),
     ])
     .areas(area);
     draw_header(frame, header, snapshot, view, color);
-    if view.selected.is_some() {
-        draw_modes(frame, modes, &automation, color);
-    } else {
-        frame.render_widget(
-            Paragraph::new("herdr · waiting for spaces").style(muted()),
-            modes,
-        );
-    }
+    frame.render_widget(Paragraph::new(mode_lines), modes);
     if view.help {
         draw_help(frame, body, color);
     } else if let Some(space) = view.selected.clone() {
@@ -280,7 +284,12 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, view: &mut View, color: bool) {
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, snapshot: &Snapshot, view: &View, color: bool) {
-    let [brand, navigation] = Layout::vertical([Constraint::Length(1); 2]).areas(area);
+    let [brand, _, navigation] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(area.height.saturating_sub(2)),
+        Constraint::Length(1),
+    ])
+    .areas(area);
     let [name, context] = Layout::horizontal([
         Constraint::Min(1),
         Constraint::Length(if area.width >= 65 { 20 } else { 0 }),
@@ -294,16 +303,18 @@ fn draw_header(frame: &mut Frame, area: Rect, snapshot: &Snapshot, view: &View, 
         name,
     );
     frame.render_widget(
-        Paragraph::new(format!(
-            "herdr · {} {}",
-            snapshot.spaces.len(),
-            if snapshot.spaces.len() == 1 {
-                "space"
-            } else {
-                "spaces"
-            }
-        ))
-        .style(muted())
+        Paragraph::new(Line::from(vec![
+            Span::styled("herdr: ", muted()),
+            Span::raw(format!(
+                "{} {}",
+                snapshot.spaces.len(),
+                if snapshot.spaces.len() == 1 {
+                    "space"
+                } else {
+                    "spaces"
+                }
+            )),
+        ]))
         .right_aligned(),
         context,
     );
@@ -315,12 +326,12 @@ fn draw_header(frame: &mut Frame, area: Rect, snapshot: &Snapshot, view: &View, 
         format!("{}/{}", index + 1, snapshot.spaces.len())
     });
     let [label, tabs, count_area] = Layout::horizontal([
-        Constraint::Length(7),
+        Constraint::Length(9),
         Constraint::Min(1),
         Constraint::Length(height(count.len() + 1)),
     ])
     .areas(navigation);
-    frame.render_widget(Paragraph::new("spaces").style(muted()), label);
+    frame.render_widget(Paragraph::new("Spaces").style(bold()), label);
     frame.render_widget(
         Paragraph::new(count).style(muted()).right_aligned(),
         count_area,
@@ -348,7 +359,7 @@ fn draw_header(frame: &mut Frame, area: Rect, snapshot: &Snapshot, view: &View, 
             .iter()
             .map(Line::width)
             .sum::<usize>()
-            + (selected - start) * 2
+            + (selected - start) * 7
             > usize::from(tabs.width)
     {
         start += 1;
@@ -357,48 +368,83 @@ fn draw_header(frame: &mut Frame, area: Rect, snapshot: &Snapshot, view: &View, 
         Tabs::new(titles.into_iter().skip(start))
             .select(selected - start)
             .padding("", "")
-            .divider("  ")
+            .divider(Span::styled("   │   ", muted()))
             .highlight_style(accent(color).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
         tabs,
     );
 }
 
-fn draw_modes(frame: &mut Frame, area: Rect, automation: &Automation, color: bool) {
-    let todo = mode_span('t', "TODO", automation.todo_enabled, color);
-    let checkin = mode_span('c', "Check-in", automation.checkin_enabled, color);
-    let pr = mode_span('p', "PR", automation.pr_enabled, color);
-    let mut lines = if area.width >= 60 {
-        vec![Line::from(vec![
-            Span::styled("auto  ", muted()),
-            todo,
-            checkin,
-            pr,
-        ])]
+fn automation_lines(automation: &Automation, width: u16, color: bool) -> Vec<Line<'static>> {
+    let inline = width >= 76;
+    let mut lines = Vec::new();
+    let mut line = if inline {
+        Line::from(Span::styled("Automation   ", bold()))
     } else {
-        vec![Line::from(vec![todo, checkin]), Line::from(pr)]
+        lines.push(Line::styled("Automation", bold()));
+        Line::default()
     };
-    let mut details = Vec::new();
+    let mut controls = 0;
+    for spans in [
+        mode_spans('t', "TODO", automation.todo_enabled, color),
+        mode_spans('c', "Check-in", automation.checkin_enabled, color),
+        mode_spans('p', "PR", automation.pr_enabled, color),
+    ] {
+        let size: usize = spans.iter().map(Span::width).sum();
+        if controls > 0 && line.width() + 7 + size > usize::from(width) {
+            lines.push(line);
+            line = Line::default();
+            controls = 0;
+        }
+        if controls > 0 {
+            line.spans.push(Span::styled("   │   ", muted()));
+        }
+        line.spans.extend(spans);
+        controls += 1;
+    }
+    lines.push(line);
+    let mut details = Line::default();
     if let Some(todo) = &automation.todo {
-        details.push(format!("TODO {}/{} open", todo.remaining, todo.total));
+        details.spans.extend([
+            Span::styled("TODO open: ", muted()),
+            Span::raw(format!("{}/{}", todo.remaining, todo.total)),
+        ]);
     }
     if let Some(pr) = &automation.pr {
-        details.push(format!("PR poll {}s", pr.next_at.saturating_sub(now())));
+        let spans = [
+            Span::styled("PR poll: ", muted()),
+            Span::raw(format!("{}s", pr.next_at.saturating_sub(now()))),
+        ];
+        if !details.spans.is_empty() {
+            if details.width() + 7 + spans.iter().map(Span::width).sum::<usize>()
+                > usize::from(width)
+            {
+                lines.push(details);
+                details = Line::default();
+            } else {
+                details.spans.push(Span::styled("   │   ", muted()));
+            }
+        }
+        details.spans.extend(spans);
     }
-    if !details.is_empty() {
-        lines.push(Line::styled(details.join(" · "), muted()));
+    if !details.spans.is_empty() {
+        lines.push(details);
     }
-    frame.render_widget(Paragraph::new(lines), area);
+    lines
 }
 
-// A single rule gives sections a hierarchy without framing empty space in big boxes.
+// Continuous, faint outlines keep each region legible even in a sparse space.
+// Dim the borders, not the headings; inherit the terminal palette in both themes.
 fn section(frame: &mut Frame, area: Rect, name: &str, count: usize, hint: &str) -> Rect {
     let title = Line::from(vec![
         Span::styled(format!(" {name} "), bold()),
         Span::styled(format!("{count} "), muted()),
     ]);
     let mut block = Block::default()
-        .borders(Borders::TOP)
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .padding(Padding::horizontal(1))
         .border_style(muted())
+        .title_style(Style::default().remove_modifier(Modifier::DIM))
         .title(title.clone());
     if !hint.is_empty() && title.width() + hint.len() + 4 < usize::from(area.width) {
         block = block.title(Line::styled(format!(" {hint} "), muted()).right_aligned());
@@ -431,17 +477,17 @@ fn draw_space(
         .collect();
     let [participants, work] = if area.width >= 96 && area.height >= 8 {
         let [participants, _, work] = Layout::horizontal([
-            Constraint::Length((area.width / 3).clamp(29, 36)),
-            Constraint::Length(3),
+            Constraint::Length((area.width / 3).clamp(33, 40)),
+            Constraint::Length(1),
             Constraint::Min(1),
         ])
         .areas(area);
         [participants, work]
     } else {
         let wanted = if members.is_empty() {
-            3
+            4
         } else {
-            height(members.len() * 2 + 2)
+            height(members.len() * 2 + 3)
         };
         let [participants, _, work] = Layout::vertical([
             Constraint::Length(wanted.min((area.height / 3).max(2))),
@@ -452,9 +498,10 @@ fn draw_space(
         [participants, work]
     };
     let task_height = if tasks.is_empty() {
-        3
+        // Include room for the wrapped next-action hint as well as both borders.
+        5
     } else {
-        height(tasks.len() * usize::from(task_row_height(&tasks)) + 1)
+        height(tasks.len() * usize::from(task_row_height(&tasks)) + 2)
     };
     let [task_area, _, messages] = Layout::vertical([
         Constraint::Length(task_height.min((work.height / 2).max(2))),
@@ -1016,12 +1063,12 @@ mod tests {
     }
 
     #[test]
-    fn empty_space_is_compact_and_actionable_without_empty_boxes() {
+    fn empty_space_has_distinct_panels_and_actionable_hints() {
         let snapshot = empty_space();
         let text = screen(&render(&snapshot, &selected_view(&snapshot), 100, 24, true));
         assert!(text.contains("mustr  /  agent coordination"));
         assert!(text.contains("Orchard · w1"));
-        assert!(text.contains("[t] TODO off  [c] Check-in off  [p] PR off"));
+        assert!(text.contains("[t] TODO: off   │   [c] Check-in: off   │   [p] PR: off"));
         assert!(text.contains("/role NAME in Pi to join."));
         assert!(text.contains("No tasks assigned."));
         assert!(text.contains("No addressed messages yet."));
@@ -1029,8 +1076,10 @@ mod tests {
         let (_, task_row) = position(&text, "Tasks 0");
         let (_, message_row) = position(&text, "Messages 0");
         assert_eq!(roster_row, task_row);
-        assert_eq!(message_row - task_row, 4);
-        assert!(!text.contains(['│', '┌', '┐', '└', '┘']));
+        assert_eq!(message_row - task_row, 6);
+        for corner in ['╭', '╮', '╰', '╯'] {
+            assert_eq!(text.matches(corner).count(), 3, "{text}");
+        }
     }
 
     #[test]
@@ -1080,7 +1129,7 @@ mod tests {
             "hub → Ada · info · pending",
             "Keep the dashboard compact and terminal-native.",
             "Waiting on an explicit review decision.",
-            "TODO 2/5 open · PR poll 0s",
+            "TODO open: 2/5   │   PR poll: 0s",
         ] {
             assert!(text.contains(expected), "missing {expected:?}:\n{text}");
         }
@@ -1112,7 +1161,7 @@ mod tests {
             "Ada → Lin · assignment · received",
             "Keep the dashboard compact and terminal-native.",
             "Waiting on an explicit review decision.",
-            "[p] PR off",
+            "[p] PR: off",
             "q quit",
         ] {
             assert!(text.contains(expected), "missing {expected:?}:\n{text}");
@@ -1201,7 +1250,7 @@ mod tests {
             assert!(text.contains(expected), "missing {expected:?}:\n{text}");
         }
         assert!(!text.contains("Refine dashboard"));
-        assert!(text.contains("[t] TODO off"));
+        assert!(text.contains("[t] TODO: off"));
     }
 
     #[test]

@@ -4,7 +4,7 @@ A terminal-native coordination hub for Pi agents in herdr. Each herdr space gets
 
 ## Install
 
-Requires Rust 1.89+, Pi 1.2+, and herdr's socket API. macOS and Linux; `gh` is needed only for PR watching.
+Requires Rust 1.89+, Node 22.19+, Pi 1.2+, and herdr's socket API. macOS and Linux; `gh` is needed only for PR watching.
 
 ```sh
 cargo install --path . --locked

@@ -163,7 +163,7 @@ else { console.error("Unexpected command"); process.exit(99); }
   assert.ok(calls.every(c => c.name === "git" ? c.args[0] === "rev-parse" : ["pr", "api"].includes(c.args[0])));
 });
 
-test("TUI opens its live space, restores alternate screen and uses terminal-native colors", { timeout: 15000, skip: process.platform !== "darwin" }, async t => {
+test("TUI opens its live space, restores alternate screen and uses terminal-native colors", { timeout: 15000, skip: !["darwin", "linux"].includes(process.platform) }, async t => {
   const f = await fixture(t);
   // Live pane identity must win over inherited/stale workspace environment.
   f.panes.set("w1:p0", { pane_id: "w1:p0", workspace_id: "w2", agent: null });

@@ -164,10 +164,14 @@ impl Actor {
                         .and_then(|value| {
                             if matches!(request.command, Command::Sync { .. })
                                 && value["inbox"].is_null()
+                                && next.messages == self.state.messages
+                                && next.tasks == self.state.tasks
+                                && next.automation == self.state.automation
                             {
-                                // Presence, idle timestamps and poll freshness are ephemeral.
-                                // Recovery makes every member offline and every pending offer uncertain.
-                                // Avoid rewriting the entire state on every one-second heartbeat.
+                                // Only presence/idle timestamps may bypass persistence.
+                                // A no-inbox sync can still cancel automatic prompts or
+                                // refresh a PR deadline: commit those before replying.
+                                // Sync cannot change membership or the deduplication cache.
                                 self.state = next;
                             } else {
                                 self.commit(next)?;
@@ -272,6 +276,70 @@ pub(crate) fn now() -> u64 {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn no_inbox_sync_persists_cancellation_before_reply() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hub.sqlite");
+        let (snapshots, snapshot_rx) = watch::channel(Snapshot::default());
+        let mut actor = Actor::new(path.clone(), Scheduling::default(), snapshots).unwrap();
+        let worker = AgentId::new("worker");
+        actor.connections.insert(1, worker.clone());
+        actor.state.members.insert(
+            worker.clone(),
+            Member {
+                id: worker.clone(),
+                name: "worker".into(),
+                role: "implementor".into(),
+                pane_id: "w1:p1".into(),
+                space_id: SpaceId::new("w1"),
+                activity: Activity::Idle,
+                last_seen: 0,
+                idle_since: 0,
+            },
+        );
+        actor.state.messages.push(Message {
+            id: MessageId::new("automatic"),
+            space_id: SpaceId::new("w1"),
+            from: None,
+            to: worker,
+            task_id: None,
+            revision: None,
+            kind: MessageKind::Checkin,
+            text: "Queued check-in".into(),
+            wake: true,
+            delivery: Delivery::Pending,
+            created_at: 0,
+            pr_ack: None,
+        });
+        actor.store.save(&actor.state).unwrap();
+        let (tx, rx) = mpsc::channel(8);
+        let handle = tokio::task::spawn_blocking(move || actor.run(rx));
+        let service = Service {
+            tx,
+            snapshots: snapshot_rx,
+        };
+        let response = service
+            .request(
+                1,
+                Request {
+                    id: "pause".into(),
+                    command: Command::Sync {
+                        activity: Activity::Paused,
+                        receive: false,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        assert!(response.ok);
+        assert!(response.result.unwrap()["inbox"].is_null());
+        // Read before shutdown or any later durable operation can mask the bug.
+        let stored = Store::open(&path).unwrap().load().unwrap();
+        assert_eq!(stored.messages[0].delivery, Delivery::Cancelled);
+        service.stop().await;
+        handle.await.unwrap();
+    }
 
     #[tokio::test]
     async fn assignment_queue_failure_rolls_back_inserted_task_and_heartbeats_are_ephemeral() {

@@ -30,11 +30,18 @@ pub(crate) fn install(paths: &Paths, agent_dir: Option<PathBuf>) -> Result<PathB
         .config
         .to_str()
         .ok_or_else(|| eyre!("config path is not UTF-8"))?;
+    // Native ESM imports can remain cached across Pi /reload. A changed transport
+    // must get a new URL, and old entry points must keep their original module.
+    let transport_name = format!("transport.{}.mjs", crate::paths::digest(TRANSPORT));
     let adapter = ADAPTER
         .replace("\"__MUSTR_BINARY__\"", &serde_json::to_string(binary)?)
-        .replace("\"__MUSTR_CONFIG__\"", &serde_json::to_string(config)?);
+        .replace("\"__MUSTR_CONFIG__\"", &serde_json::to_string(config)?)
+        .replace(
+            "\"./transport.mjs\"",
+            &serde_json::to_string(&format!("./{transport_name}"))?,
+        );
     let index = directory.join("index.ts");
-    if index.exists() {
+    if fs::symlink_metadata(&index).is_ok() {
         check_regular(&index)?;
         let installed = fs::read_to_string(&index)?;
         ensure!(
@@ -43,31 +50,34 @@ pub(crate) fn install(paths: &Paths, agent_dir: Option<PathBuf>) -> Result<PathB
             index.display()
         );
     }
-    let transport = directory.join("transport.mjs");
-    if transport.exists() {
-        check_regular(&transport)?;
+    let legacy_transport = directory.join("transport.mjs");
+    if fs::symlink_metadata(&legacy_transport).is_ok() {
+        check_regular(&legacy_transport)?;
         ensure!(
             index.exists(),
             "unmanaged transport exists; refusing to overwrite"
         );
     }
-    // Preserve the previous installed adapter for review before replacing it.
-    for (path, content) in [(&transport, TRANSPORT), (&index, adapter.as_str())] {
-        if path.exists() {
-            let previous = fs::read(path)?;
-            if previous == content.as_bytes() {
-                continue;
-            }
-            let backup = path.with_extension(format!(
-                "{}.{}.bak",
-                path.extension().and_then(|s| s.to_str()).unwrap_or("file"),
-                crate::paths::digest(&previous)
-            ));
+    let transport = directory.join(transport_name);
+    create_file(&transport, TRANSPORT.as_bytes())?;
+    check_regular(&transport)?;
+    ensure!(
+        fs::read(&transport)? == TRANSPORT.as_bytes(),
+        "immutable transport contents do not match; refusing to overwrite {}",
+        transport.display()
+    );
+    // Install the immutable dependency first, then atomically switch the entry
+    // point. Keep old transports and back up changed entry points for rollback.
+    if index.exists() {
+        let previous = fs::read(&index)?;
+        if previous != adapter.as_bytes() {
+            let backup =
+                index.with_extension(format!("ts.{}.bak", crate::paths::digest(&previous)));
             create_file(&backup, &previous)?;
-            replace(path, content)?;
-        } else {
-            create_file(path, content.as_bytes())?;
+            replace(&index, &adapter)?;
         }
+    } else {
+        create_file(&index, adapter.as_bytes())?;
     }
     Ok(index)
 }
@@ -101,6 +111,28 @@ mod tests {
             fs::read_to_string(destination.join("index.ts")).unwrap(),
             "user code"
         );
+    }
+
+    #[test]
+    fn refuses_dangling_links_without_replacing_them() {
+        for name in [
+            "index.ts".to_owned(),
+            "transport.mjs".to_owned(),
+            format!("transport.{}.mjs", crate::paths::digest(TRANSPORT)),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let paths = Paths {
+                config: dir.path().join("config"),
+                state: dir.path().join("state"),
+            };
+            let agent = dir.path().join("agent");
+            let destination = agent.join("extensions/mustr");
+            fs::create_dir_all(&destination).unwrap();
+            let link = destination.join(name);
+            std::os::unix::fs::symlink(dir.path().join("absent"), &link).unwrap();
+            assert!(install(&paths, Some(agent)).is_err());
+            assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+        }
     }
 
     #[test]

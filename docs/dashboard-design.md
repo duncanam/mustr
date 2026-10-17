@@ -4,7 +4,8 @@ The dashboard should read as a coordination console, not three equally weighted 
 
 ## Visual direction
 
-- **Hierarchy before decoration:** a compact identity/navigation area, secondary automation controls, then the selected space's content.
+- **Visible section boundaries:** like Lazygit, use complete thin, rounded outlines with titles embedded in the top border and narrow gutters between panels. Top rules alone are not sufficient: Participants, Tasks, and Messages must remain visibly separate even when sparse. Use terminal-default foreground with DIM for the outlines, normal-contrast bold titles, and one column of interior horizontal padding. Do not dim the entire panel or force a gray that only works on one background.
+- **Header hierarchy:** separate branding, space navigation, and automation with blank rows at normal terminal heights. Use wider, faint separators between space tabs and between automation controls. Distinguish bold labels (`Spaces`, `Automation`, `TODO:`), dim shortcut hints (`[t]`) and metric labels, and normal-contrast reported values (`off`, `2/5`). Enabled values use green, not the navigation accent. Reserve stable value widths so toggling a mode does not shift controls or panels. Narrow screens wrap controls; short screens reduce spacing, and help omits the automation strip to leave room for instructions.
 - **Balanced density:** bound participant information to a sidebar on wide terminals; give task descriptions and addressed communication the larger reading area. Stack content when space is constrained.
 - **Intentional empty states:** explain what is missing and the next useful action rather than showing empty table headers. Never invent participants, task progress, or messages to fill space.
 - **Restrained emphasis:** use an accent for navigation and headings, semantic status colors sparingly, and explicit text labels so meaning survives monochrome rendering.
@@ -16,6 +17,6 @@ The [Ratatui showcase](https://ratatui.rs/showcase/apps/) provides useful refere
 
 ## Review criteria
 
-Inspect both empty and populated fixtures at wide and narrow terminal sizes. Check long labels, help, all automation switches, and no-color output. TestBackend checks should cover readable content and terminal-default background behavior, not only whether drawing avoids a panic.
+Inspect both empty and populated fixtures at wide and narrow terminal sizes. Check long labels, help, all automation switches, and no-color output. TestBackend checks cover readable content, continuous borders on all four sides, dim border versus normal-contrast title styling, content containment, and terminal-default background behavior—not only whether drawing avoids a panic. Account for both border rows in content-sized panels, and calculate wrapping/scroll limits from the bordered inner rectangle.
 
 Synthetic render previews do not replace checking the running application in the user's terminal: font metrics, ANSI palette, dim-text contrast, and terminal background are environment-dependent. Updating the source does not replace or restart an already-running hub.

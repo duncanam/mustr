@@ -1,6 +1,139 @@
 use super::*;
 
 #[test]
+fn header_separates_navigation_controls_and_reported_values() {
+    for width in [35, 56, 80, 120, 240] {
+        let mut geometry = None;
+        for flags in 0..8 {
+            let mut snapshot = populated();
+            let automation = snapshot.automation.get_mut(&SpaceId::new("w1")).unwrap();
+            automation.todo_enabled = flags & 1 != 0;
+            automation.checkin_enabled = flags & 2 != 0;
+            automation.pr_enabled = flags & 4 != 0;
+            for color in [false, true] {
+                let buffer = render(&snapshot, &selected_view(&snapshot), width, 40, color);
+                let text = screen(&buffer);
+                let brand = position(&text, "mustr").1;
+                let navigation = position(&text, "Spaces").1;
+                let modes = position(&text, "Automation").1;
+                assert!(navigation >= brand + 2, "{text}");
+                assert!(modes >= navigation + 2, "{text}");
+                let current = [
+                    position(&text, "[t]"),
+                    position(&text, "[c]"),
+                    position(&text, "[p]"),
+                    position(&text, "Participants"),
+                ];
+                if let Some(expected) = geometry {
+                    assert_eq!(current, expected, "toggles must not shift the layout");
+                } else {
+                    geometry = Some(current);
+                }
+                for (key, name, on) in [
+                    ('t', "TODO", flags & 1 != 0),
+                    ('c', "Check-in", flags & 2 != 0),
+                    ('p', "PR", flags & 4 != 0),
+                ] {
+                    let (x, y) = position(&text, &format!("[{key}] {name}: "));
+                    let key_cell = &buffer[(height(x), height(y))];
+                    let label_cell = &buffer[(height(x + 4), height(y))];
+                    let value_cell = &buffer[(height(x + 4 + name.len() + 2), height(y))];
+                    assert!(key_cell.modifier.contains(Modifier::DIM));
+                    assert!(label_cell.modifier.contains(Modifier::BOLD));
+                    assert!(!label_cell.modifier.contains(Modifier::DIM));
+                    assert!(
+                        !value_cell
+                            .modifier
+                            .intersects(Modifier::BOLD | Modifier::DIM)
+                    );
+                    assert_eq!(value_cell.symbol(), if on { "O" } else { "o" });
+                    assert_eq!(
+                        value_cell.fg,
+                        if color && on {
+                            Color::Green
+                        } else {
+                            Color::Reset
+                        }
+                    );
+                }
+                let (x, y) = position(&text, "TODO open: 2/5");
+                assert!(
+                    buffer[(height(x), height(y))]
+                        .modifier
+                        .contains(Modifier::DIM)
+                );
+                assert!(
+                    !buffer[(height(x + "TODO open: ".len()), height(y))]
+                        .modifier
+                        .contains(Modifier::DIM)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn panels_have_complete_dim_outlines_and_normal_contrast_headings() {
+    for (width, rows) in [(100, 24), (120, 30), (240, 50), (56, 34)] {
+        for mut snapshot in [empty_space(), populated()] {
+            // Long wrapped messages must stay inside their own panel.
+            if let Some(message) = snapshot.messages.first_mut() {
+                message.text = "Long content wrapping inside its panel. ".repeat(20);
+            }
+            for color in [false, true] {
+                let buffer = render(&snapshot, &selected_view(&snapshot), width, rows, color);
+                let text = screen(&buffer);
+                let mut panels = 0;
+                let assert_border = |x, y, symbol| {
+                    let cell = &buffer[(x, y)];
+                    assert_eq!(cell.symbol(), symbol, "at ({x}, {y}):\n{text}");
+                    assert!(cell.modifier.contains(Modifier::DIM));
+                    assert_eq!(cell.fg, Color::Reset);
+                    assert_eq!(cell.bg, Color::Reset);
+                };
+                for y in 0..rows {
+                    for x in 0..width {
+                        if buffer[(x, y)].symbol() != "╭" {
+                            continue;
+                        }
+                        panels += 1;
+                        let right = (x + 1..width)
+                            .find(|&col| buffer[(col, y)].symbol() == "╮")
+                            .expect("top-right corner");
+                        let bottom = (y + 1..rows)
+                            .find(|&row| buffer[(x, row)].symbol() == "╰")
+                            .expect("bottom-left corner");
+                        for (col, row, symbol) in [
+                            (x, y, "╭"),
+                            (right, y, "╮"),
+                            (x, bottom, "╰"),
+                            (right, bottom, "╯"),
+                        ] {
+                            assert_border(col, row, symbol);
+                        }
+                        for row in y + 1..bottom {
+                            assert_border(x, row, "│");
+                            assert_border(right, row, "│");
+                        }
+                        for col in x + 1..right {
+                            assert_border(col, bottom, "─");
+                        }
+                    }
+                }
+                assert_eq!(panels, 3, "{text}");
+                for heading in ["Participants", "Tasks", "Messages"] {
+                    let (x, y) = position(&text, heading);
+                    let cell = &buffer[(height(x), height(y))];
+                    assert!(cell.modifier.contains(Modifier::BOLD));
+                    assert!(!cell.modifier.contains(Modifier::DIM));
+                }
+                assert!(text.contains("/role NAME") || text.contains("Refine dashboard"));
+            }
+        }
+    }
+}
+
+#[test]
 fn participant_roster_hides_offline_agents_and_restores_reconnected_agents() {
     for (width, rows) in [(140, 40), (56, 34)] {
         let mut snapshot = populated();
