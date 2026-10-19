@@ -48,6 +48,15 @@ pub(crate) enum Command {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum InstallTarget {
+    /// Register the Claude Code MCP adapter for the current user.
+    Claude {
+        /// Bundle directory (defaults to the mustr config's claude subdirectory; a registered server cannot be moved automatically).
+        #[arg(long)]
+        directory: Option<PathBuf>,
+        /// Generate a standalone MCP config without registering it with Claude Code.
+        #[arg(long)]
+        config_only: bool,
+    },
     /// Install the Pi adapter into its auto-discovered extensions directory.
     Pi {
         /// Pi agent directory, not its extensions directory.
@@ -84,6 +93,32 @@ mod tests {
         assert!(
             matches!(cli.command, Some(Command::Install { harness: InstallTarget::Pi { agent_dir: Some(path) } }) if path == std::path::Path::new("/tmp/pi"))
         );
+    }
+
+    #[test]
+    fn claude_install_has_separate_options() {
+        assert!(matches!(
+            Cli::try_parse_from(["mustr", "install", "claude", "--directory", "/tmp/claude"])
+                .unwrap()
+                .command,
+            Some(Command::Install { harness: InstallTarget::Claude { directory: Some(path), config_only: false } })
+                if path == std::path::Path::new("/tmp/claude")
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["mustr", "install", "claude", "--config-only"])
+                .unwrap()
+                .command,
+            Some(Command::Install {
+                harness: InstallTarget::Claude {
+                    config_only: true,
+                    ..
+                }
+            })
+        ));
+        assert!(
+            Cli::try_parse_from(["mustr", "install", "claude", "--agent-dir", "/tmp/x"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["mustr", "install", "pi", "--directory", "/tmp/x"]).is_err());
     }
 
     #[test]

@@ -46,7 +46,7 @@ async function fixture(t, { cancelOrder, rejectReceipt = false } = {}) {
   const { default: adapter } = await import(`../index.ts?runtime=${directory}`);
   const calls = [], sockets = new Set(), peerErrors = [];
   const freshAttempt = deferred(), releaseReceipt = deferred();
-  let oldId, freshId, control, claimed = false, complete = false, streamCalls = 0, runtime;
+  let oldId, freshId, control, claimed = false, complete = false, streamCalls = 0, snapshotRevision = 0, runtime;
   const token = "FIXTURE-PRIVATE-RESET-TICKET";
   const server = net.createServer(socket => {
     sockets.add(socket); socket.on("close", () => sockets.delete(socket)); socket.on("error", () => {});
@@ -87,7 +87,7 @@ async function fixture(t, { cancelOrder, rejectReceipt = false } = {}) {
           case "reset_capability": result = { reset_protocol: 1 }; break;
           case "subscribe": result = { subscribed: true }; break;
           case "sync":
-            result = { members: [], tasks: [], automation: {}, inbox: null };
+            result = { members: [{ id: joined, activity: "working", last_seen: ++snapshotRevision }], tasks: [], automation: {}, inbox: null };
             if (control && !complete) {
               result.reset_summary = { state: "incomplete", note: "Fixture history retained" };
               result.reset_control = { ...control };
@@ -146,8 +146,14 @@ async function fixture(t, { cancelOrder, rejectReceipt = false } = {}) {
     extension.commands.set("runtime-probe", { name: "runtime-probe", sourceInfo, async handler(_args, ctx) { promptOptions = ctx.getSystemPromptOptions(); } });
     state.prompt = async () => {
       await state.session.sendUserMessage("/runtime-probe", { expandPromptTemplates: true });
-      const result = await state.session.extensionRunner.emitBeforeAgentStart({ messageType: "custom", message: { customType: "probe", content: "No model", display: false } }, promptOptions);
-      return result.systemPromptOptions.forceSystemPrompt ?? state.session.systemPrompt;
+      let rendered;
+      const observers = extension.handlers.get("before_agent_start") ?? [];
+      const capture = event => { rendered = event.systemPrompt; };
+      observers.push(capture);
+      try {
+        const result = await state.session.extensionRunner.emitBeforeAgentStart({ messageType: "custom", message: { customType: "probe", content: "No model", display: false } }, promptOptions);
+        return { text: rendered, options: result.systemPromptOptions };
+      } finally { observers.splice(observers.indexOf(capture), 1); }
     };
     const observerPath = "<inline:runtime-lifecycle-observer>";
     const observer = { ...extension, path: observerPath, resolvedPath: observerPath, commands: new Map(), tools: new Map(), handlers: new Map([
@@ -249,9 +255,22 @@ test("production adapter + real Pi runtime: receipt-gated fresh factory restores
   assert.ok(fresh.getActiveToolNames().includes("policy-tool"));
   assert.ok(fresh.getActiveToolNames().includes("mustr_roster"));
   assert.match(fresh.systemPrompt, /BASE POLICY/);
-  const prompt = await f.states[1].prompt();
-  assert.ok(prompt.startsWith(policy));
-  assert.match(prompt, /Role: researcher/); assert.match(prompt, /APPROVED RESEARCH ROLE/);
+  const promptResult = await f.states[1].prompt();
+  assert.ok(promptResult.text.startsWith(policy));
+  assert.match(promptResult.text, /Role: researcher/); assert.match(promptResult.text, /APPROVED RESEARCH ROLE/);
+  assert.equal(promptResult.options.forceSystemPrompt, undefined, "mustr composes a named prompt section without flattening the base");
+  assert.match(promptResult.options.sections.mustr_role, /explicitly joined mustr participant/);
+  assert.match(promptResult.options.sections.mustr_role, /Role: researcher/);
+  assert.match(promptResult.options.sections.mustr_role, /APPROVED RESEARCH ROLE/);
+  const promptAgain = await f.states[1].prompt();
+  assert.equal(promptAgain.options.sections.mustr_role, promptResult.options.sections.mustr_role, "role/common section stays static across runs");
+  const firstRoster = await f.states[1].roster();
+  const contextAfterFirstRoster = await fresh.extensionRunner.emitContext(fresh.messages);
+  const secondRoster = await f.states[1].roster();
+  const contextAfterSecondRoster = await fresh.extensionRunner.emitContext(fresh.messages);
+  assert.notEqual(firstRoster.details.members[0].last_seen, secondRoster.details.members[0].last_seen, "fixture snapshot changes between syncs");
+  assert.deepEqual(contextAfterFirstRoster, contextAfterSecondRoster, "transient roster snapshots never enter each-request context");
+  assert.equal(contextAfterSecondRoster.some(message => message.customType === "mustr-state"), false);
   assert.equal(f.calls.filter(call => call.op === "reset_claim").length, 1);
   assert.equal(f.calls.filter(call => call.op === "join" && call.reset).length, 1);
   assert.equal(f.calls.some(call => call.op === "leave"), false, "authorized old shutdown never sends ordinary leave");
@@ -295,7 +314,8 @@ test("production adapter + real Pi runtime: denied fresh receipt never activates
   assert.deepEqual(fresh.getActiveToolNames(), ["policy-tool"]);
   assert.equal((await fresh.extensionRunner.emitContext([])).some(message => message.customType === "mustr-state"), false);
   const prompt = await f.states[1].prompt();
-  assert.equal(prompt.includes("APPROVED RESEARCH ROLE"), false);
+  assert.equal(prompt.text.includes("APPROVED RESEARCH ROLE"), false);
+  assert.equal(prompt.options.sections.mustr_role, undefined);
   assert.equal(f.calls.filter(call => call.op === "reset_claim").length, 1);
   assert.equal(f.calls.filter(call => call.op === "join" && call.reset).length, 1);
   assert.equal(JSON.stringify({ messages: fresh.messages, branch: fresh.sessionManager.getBranch(), notices: f.states[1].notifications }).includes(f.token), false);

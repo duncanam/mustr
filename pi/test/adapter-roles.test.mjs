@@ -23,7 +23,10 @@ async function setup(t) {
   return { f, h, write };
 }
 const active = ["read", "bash", "policy-tool"];
-async function prompt(h) { return (await h.emit("before_agent_start", { systemPrompt: "User policy" }))[0]?.systemPrompt; }
+async function prompt(h) {
+  const result = await h.prompt("User policy");
+  return result.options.sections.mustr_role ? result.text : undefined;
+}
 async function ready(h) { return eventually(() => h.tools.get("mustr_roster").execute("ready", {}, undefined)); }
 
 // These use the production targeted CLI and real hub admission, not a role stub.

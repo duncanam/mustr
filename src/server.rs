@@ -158,6 +158,9 @@ async fn connection(
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
     let mut identity: Option<(String, SpaceId)> = None;
+    // Bind the live harness as well as pane/space: replacing Pi with Claude (or
+    // vice versa) must not leave the previous participant connection admitted.
+    let mut harness: Option<String> = None;
     let mut recipient: Option<AgentId> = None;
     let mut subscribed = false;
     let mut notified: Option<MessageId> = None;
@@ -233,22 +236,29 @@ async fn connection(
             } => Some((pane_id.clone(), space_id.clone())),
             _ => identity.clone(),
         };
+        let mut checked_harness = None;
         if let Some((pane_id, space_id)) = &check {
             let validation = async {
                 let pane = herdr.pane(pane_id).await?;
                 ensure!(
-                    &pane.workspace_id == space_id && pane.agent.as_deref() == Some("pi"),
-                    "pane moved, disappeared, or no longer contains Pi; rejoin explicitly"
+                    &pane.workspace_id == space_id
+                        && pane.pane_id == *pane_id
+                        && matches!(pane.agent.as_deref(), Some("pi" | "claude"))
+                        && harness.as_ref().is_none_or(|bound| Some(bound) == pane.agent.as_ref()),
+                    "pane moved, disappeared, or changed its supported agent (Pi/Claude Code); rejoin explicitly"
                 );
-                Ok::<_, color_eyre::Report>(())
+                Ok::<_, color_eyre::Report>(pane.agent)
             }
             .await;
-            if let Err(error) = validation {
-                let response = Response::failure(request.id, error);
-                write
-                    .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
-                    .await?;
-                break;
+            match validation {
+                Ok(agent) => checked_harness = agent,
+                Err(error) => {
+                    let response = Response::failure(request.id, error);
+                    write
+                        .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
+                        .await?;
+                    break;
+                }
             }
         }
         let joining = match &request.command {
@@ -261,6 +271,7 @@ async fn connection(
         if response.ok {
             if let Some(agent) = joining {
                 identity = check;
+                harness = checked_harness;
                 recipient = Some(agent);
             }
             if subscribing {

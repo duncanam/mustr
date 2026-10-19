@@ -273,7 +273,7 @@ impl State {
             {
                 ensure!(
                     &member.id != agent_id,
-                    "this Pi session is already connected"
+                    "this participant is already connected"
                 );
                 ensure!(
                     member.pane_id != *pane_id,

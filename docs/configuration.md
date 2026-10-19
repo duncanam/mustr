@@ -10,8 +10,9 @@ Run `mustr init` to create configuration and restore any missing shipped role fi
 | Persistent state and logs | `~/.local/state/mustr` | `MUSTR_STATE_DIR`, then `XDG_STATE_HOME/mustr` |
 | Local transport | `/tmp/mustr-<uid>/<server-key>.sock` | Derived from herdr server identity |
 | Pi adapter | `~/.pi/agent/extensions/mustr` | `mustr install pi --agent-dir /absolute/agent-directory` or `PI_CODING_AGENT_DIR` |
+| Claude MCP bundle | `<mustr-config>/claude` | `mustr install claude --directory /absolute/output-directory` |
 
-Configuration, state, and Pi agent overrides must be absolute paths. The adapter remembers the installed binary and configuration directory; `MUSTR_BIN` and `MUSTR_CONFIG_DIR` override those. Re-run `mustr install pi` after moving the executable.
+Configuration, state, and adapter-directory overrides must be absolute paths. The adapter remembers the installed binary and configuration directory; `MUSTR_BIN` and `MUSTR_CONFIG_DIR` override those. Re-run the appropriate `mustr install pi` or `mustr install claude` command after moving the executable.
 
 ```sh
 mustr                      # hub and dashboard
@@ -71,7 +72,7 @@ There are no role-name shortcut commands. `/role` lists roles; `/role NAME [PART
 /role implementor ui-worker
 ```
 
-Those commands belong in **separate Pi sessions**, not one session. Names identify participants in the dashboard; tools address their stable Pi session IDs.
+Those commands belong in **separate Pi sessions**, not one session. Claude Code uses the `mustr_join` MCP tool instead; see [Claude Code](claude-code.md). Names identify participants in the dashboard; tools address IDs from the current roster (Pi session IDs or Claude adapter-process IDs).
 
 The shipped architect, implementor, reviewer, and researcher roles all compose `base`, the shared coordination/safety instructions. `base` is normally a component rather than a standalone role, but selecting it is allowed. All roles can be components; there are no privileged positions or fixed hierarchy. Any role can request work; the requester owns guidance and acceptance for that task.
 
@@ -98,9 +99,9 @@ Role prompts do not remove existing system prompts, skills, source-control restr
 
 ## Adapter installation and migration
 
-The installer takes an explicit harness: `mustr install <harness>`. Pi is currently the only supported target; other harnesses will require their own adapters and target-specific options.
+The installer takes an explicit harness: `mustr install pi` or `mustr install claude`. Each has separate target-specific options. Claude installation generates an adapter bundle and registers its MCP server at user scope through the Claude CLI; normal `claude` launches then discover it automatically. Unrelated MCP entries and permission/approval controls are preserved. Use `mustr install claude --config-only` to generate only the standalone `mcp.json` and assets, for optional loading with `claude --mcp-config PATH`. See [Claude Code setup and lifecycle limits](claude-code.md).
 
-`mustr install pi` installs only `index.ts` and `transport.mjs`. It does not edit `settings.json`, remove other extensions, or join any session. Updating an existing mustr-managed adapter preserves changed files in content-addressed `.bak` files. Unmanaged entry points are not overwritten.
+`mustr install pi` installs only `index.ts` and content-addressed `transport.<hash>.mjs` modules. It does not edit `settings.json`, remove other extensions, or join any session. Updating an existing mustr-managed adapter preserves changed files in content-addressed `.bak` files. Unmanaged entry points are not overwritten.
 
 Disable the old pair, TODO, and PR-watch schedulers before selecting a mustr role: `/pair-disable`, `/todo-disable`, `/pr-watch off`, where installed. Remove their extension registrations if you no longer need them. mustr cannot safely infer or take over another extension's private scheduler state, and does not silently deactivate unrelated extensions. Running both scheduling systems is unsupported.
 

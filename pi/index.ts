@@ -46,7 +46,8 @@ export default function mustr(pi: ExtensionAPI) {
   let generation = 0;
   let busy = false;
   let paused = false;
-  let humanTurn = false;
+  let inputGeneration = 0;
+  const pendingInputGenerations: number[] = [];
   let dialogs = 0;
   let stoppedAfterReport = false;
   let snapshot: any = {};
@@ -103,10 +104,11 @@ export default function mustr(pi: ExtensionAPI) {
     if (disposed) return;
     ctx?.ui.setStatus("mustr", role ? `mustr · ${role.name} · ${held || frozen ? "fresh start suspended" : paused ? "paused" : detail ?? (admitted && client?.connected ? "connected" : "waiting for hub")}` : undefined);
   }
-  function activity() { return held || frozen || paused || humanTurn || dialogs > 0 ? "paused" : busy || ctx?.isIdle() === false ? "working" : "idle"; }
+  function activity() { return held || frozen || paused || dialogs > 0 ? "paused" : busy || pendingInputGenerations.length > 0 || ctx?.isIdle() === false ? "working" : "idle"; }
   function canReceive() {
-    return !held && !frozen && !!ctx && !paused && !humanTurn && dialogs === 0 && !staged && !ctx.hasPendingMessages() && !ctx.ui.getEditorText().trim() && !delivery;
+    return !held && !frozen && !!ctx && !paused && pendingInputGenerations.length === 0 && dialogs === 0 && !staged && !ctx.hasPendingMessages() && !ctx.ui.getEditorText().trim() && !delivery;
   }
+  function clearInputTracking() { pendingInputGenerations.length = 0; }
   function notifyError(error: unknown) {
     if (disposed) return;
     const message = held || frozen || restoring ? recovery : error instanceof Error ? error.message : String(error);
@@ -135,7 +137,7 @@ export default function mustr(pi: ExtensionAPI) {
     return !disposed && mine === generation && !!ctx && (!current || client === current);
   }
   function resetIdle(context: ExtensionContext) {
-    return !disposed && context.isIdle() && !busy && !humanTurn && !paused && dialogs === 0 && !toolDepth
+    return !disposed && context.isIdle() && !busy && pendingInputGenerations.length === 0 && !paused && dialogs === 0 && !toolDepth
       && !staged && !delivery && !context.hasPendingMessages() && !context.ui.getEditorText().trim();
   }
   function resetSafe(attempt: HeldReset, context: ExtensionContext) {
@@ -382,7 +384,7 @@ export default function mustr(pi: ExtensionAPI) {
         throw new Error("Pi did not confirm message insertion; delivery is uncertain.");
       }
       if (mine !== generation || client !== current) return;
-      if (staged && ctx.isIdle() && !paused && !humanTurn) {
+      if (staged && ctx.isIdle() && !paused && pendingInputGenerations.length === 0) {
         const report = staged; staged = undefined;
         // Never replay a report after uncertain acknowledgement.
         await current.request(report);
@@ -428,7 +430,7 @@ export default function mustr(pi: ExtensionAPI) {
     staged = undefined; stoppedAfterReport = false;
     const previous = client;
     client = undefined; role = undefined; admitted = false; identity = undefined; snapshot = {};
-    paused = false; humanTurn = false; busy = false; dialogs = 0; lastError = "";
+    paused = false; clearInputTracking(); busy = false; dialogs = 0; lastError = "";
     activeTools(false); status();
     if (sendLeave && previous?.connected) { try { await previous.request({ op: "leave" }, 1500); } catch { /* close is authoritative disconnect */ } }
     previous?.close();
@@ -475,7 +477,13 @@ export default function mustr(pi: ExtensionAPI) {
         if (words[0] === "leave") { await leave(!held); return; }
         if ((held || frozen || restoring) && words[0] !== "status") { commandCtx.ui.notify(recovery, "warning"); return; }
         if (words[0] === "pause") { paused = true; status(); return; }
-        if (words[0] === "resume") { paused = false; humanTurn = false; status(); wake(); return; }
+        if (words[0] === "resume") {
+          paused = false;
+          // Pi does not expose whether a later input hook handled/rejected a prompt.
+          // Recover that fail-closed preflight fence only on explicit, truly idle resume.
+          if (commandCtx.isIdle() && !commandCtx.hasPendingMessages()) clearInputTracking();
+          status(); wake(); return;
+        }
         if (["todo", "checkin", "pr"].includes(words[0]) && ["on", "off"].includes(words[1]) && words.length === 2) {
           if (!client?.connected) throw new Error("Join a role and connect to the hub first.");
           await client.request({ op: "mode", mode: words[0], enabled: words[1] === "on" });
@@ -501,7 +509,7 @@ export default function mustr(pi: ExtensionAPI) {
   const text = Type.String({ minLength: 1, maxLength: 6000 });
   const task = { task_id: Type.String(), revision: Type.Integer({ minimum: 1 }), text };
   const definitions = [
-    { name: "mustr_roster", description: "Refresh participants and task ownership in this space. IDs, not role names, address recipients.", parameters: Type.Object({}), op: "sync" },
+    { name: "mustr_roster", description: "Refresh participants and task ownership in this space; the result identifies self explicitly. IDs, not role names, address recipients.", parameters: Type.Object({}), op: "sync" },
     { name: "mustr_send", description: "Send an addressed request or informational message. Does not assign task ownership. Call alone.", parameters: Type.Object({ to: Type.String(), text, wake: Type.Boolean({ description: "true for an actionable question/request; false for information" }) }), op: "send" },
     { name: "mustr_assign", description: "Assign a self-contained task with constraints and acceptance criteria to an idle participant. Call alone; queued is not executed.", parameters: Type.Object({ to: Type.String(), title: Type.String({ maxLength: 160 }), text }), op: "assign" },
     { name: "mustr_report", description: "Report on your task. progress requires evidenced advancement; status alone is not progress. blocked/waiting/done stop this run and publish only once fully settled. Call alone.", parameters: Type.Object({ ...task, kind: Type.Union(["status", "progress", "blocked", "waiting", "done"].map(k => Type.Literal(k))) }), op: "report" },
@@ -530,7 +538,9 @@ export default function mustr(pi: ExtensionAPI) {
       }
       if (definition.op === "sync") {
         const safe = await sync(current, mine, false);
-        return { content: [{ type: "text", text: JSON.stringify(safe) }], details: safe };
+        if (!currentSession(mine, current)) throw new Error("mustr session changed");
+        const roster = { ...safe, self: { id: ctx!.sessionManager.getSessionId(), name, role: role!.name } };
+        return { content: [{ type: "text", text: JSON.stringify(roster) }], details: roster };
       }
       if (definition.op === "report" && ["blocked", "waiting", "done"].includes(params.kind)) {
         if (staged) throw new Error("A terminal report is already staged");
@@ -554,6 +564,7 @@ export default function mustr(pi: ExtensionAPI) {
     if (resetSwitch && event.reason === "new") {
       // No leave/report/ack or Pi calls from the disposed old runtime.
       generation++; clearTimeout(timer); clearTimeout(resetTimer);
+      clearInputTracking();
       const previous = client; client = undefined; ctx = undefined; role = undefined;
       disposed = true; delivery = undefined; staged = undefined; previous?.close();
       await Promise.allSettled([...commands]);
@@ -571,21 +582,34 @@ export default function mustr(pi: ExtensionAPI) {
   pi.on("session_before_fork", async () => { await leave(); });
   pi.on("session_before_tree", async () => { await leave(); });
   pi.on("session_tree", async () => { await leave(); });
-  pi.on("before_agent_start", event => admitted && role ? { systemPrompt: `${event.systemPrompt}\n\n${common}\n\nRole: ${role.name}\n${role.prompt}` } : undefined);
-  pi.on("context", event => admitted && role ? { messages: [...event.messages, { role: "custom" as const, customType: "mustr-state", content: `Current mustr state: ${client?.connected ? "connected" : "disconnected; do not assume peer work stopped"}; ${paused ? "human-paused" : "enabled"}. Your ID: ${ctx?.sessionManager.getSessionId()}.\n${JSON.stringify({ members: snapshot.members ?? [], tasks: snapshot.tasks ?? [] })}`, display: false, timestamp: Date.now() }] } : undefined);
+  pi.on("before_agent_start", event => {
+    if (admitted && role) event.systemPromptOptions.sections.mustr_role = `${common}\n\nRole: ${role.name}\n${role.prompt}`;
+  });
   pi.on("input", event => {
-    if (event.source !== "extension") {
-      humanInputs++;
-      if (role || restoring) { humanTurn = true; stoppedAfterReport = false; staged = undefined; }
+    const human = event.source !== "extension";
+    if (human) humanInputs++;
+    if (role || restoring) {
+      // Pi's later user `message_start` omits InputEvent.source, so count every
+      // input origin. Each accepted user boundary consumes one outstanding slot.
+      pendingInputGenerations.push(++inputGeneration);
+      if (human) { stoppedAfterReport = false; staged = undefined; }
     }
   });
   pi.on("agent_start", () => { busy = true; wake(); });
   pi.on("turn_end", () => { wake(); });
   pi.on("agent_settled", event => {
-    busy = false; humanTurn = false;
+    busy = false;
     if (event.aborted) { paused = true; staged = undefined; status(); }
     // Schedule outside settlement; never dispatch recursively from a Pi hook.
     wake();
+  });
+  pi.on("message_start", (event, context) => {
+    if (role && event.message.role === "user" && pendingInputGenerations.length > 0) {
+      // Consume one slot, not the whole queue: out-of-order human/extension starts
+      // cannot release delivery while any input hook remains unaccepted.
+      pendingInputGenerations.shift();
+      if (pendingInputGenerations.length === 0 && !context.hasPendingMessages()) wake();
+    }
   });
   pi.on("message_end", event => {
     const message = event.message as any;

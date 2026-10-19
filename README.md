@@ -1,10 +1,10 @@
 <p align="center"><img src="assets/mustr-logo.jpg" alt="mustr" width="640"></p>
 
-A terminal-native coordination hub for Pi agents in herdr. Each herdr space gets a dashboard tab; agents join with editable roles and exchange addressed messages. The hub handles task ownership and opt-in scheduling—not model reasoning.
+A terminal-native coordination hub for Pi and Claude Code agents in herdr. Each herdr space gets a dashboard tab; agents join with editable roles and exchange addressed messages. The hub handles task ownership and opt-in scheduling—not model reasoning.
 
 ## Install
 
-Requires Rust 1.89+, Node 22.19+, Pi 1.2+, and herdr's socket API. macOS and Linux; `gh` is needed only for PR watching.
+Requires Rust 1.89+, Node 22.19+, and herdr's socket API, plus Pi 1.2+ or Claude Code with stdio MCP support. macOS and Linux; `gh` is needed only for PR watching.
 
 ```sh
 cargo install --path . --locked
@@ -12,6 +12,8 @@ mustr install pi
 ```
 
 Restart Pi or `/reload`.
+
+For Claude Code, run `mustr install claude` once to install and register the user-wide MCP server, then launch `claude` normally in a herdr pane. Ask Claude to join a mustr role and wait for work. Claude uses explicit MCP wait/ack tools; background wake and session reset are not supported. See [Claude Code setup and limits](docs/claude-code.md).
 
 ## Use
 
@@ -23,7 +25,7 @@ Run `mustr` in one herdr tab; its dashboard opens on that tab's current space. O
 | Implementor's tab | `/role implementor` |
 | Optional reviewer's tab | `/role reviewer` |
 
-Roles can be selected before the hub starts. Agents keep their own normal Pi conversations. Closing mustr disconnects coordination; it does **not** kill agents or external jobs.
+Roles can be selected before the hub starts. Agents keep their own normal conversations. Closing mustr disconnects coordination; it does **not** kill agents or external jobs.
 
 | Dashboard key | Action |
 |---|---|
@@ -46,6 +48,6 @@ Modes start **off**. From the intended Pi recipient, attach a checklist with `/m
 
 `mustr -v` enables debug logs; `-vv` enables trace logs in `~/.local/state/mustr/mustr.log`. The UI uses your terminal's foreground/background and ANSI palette; `NO_COLOR=1` disables color accents.
 
-[Configuration and roles](docs/configuration.md) · [Start fresh](docs/start-fresh.md) · [Behavior and protocol](docs/architecture.md) · [Development](docs/development.md)
+[Claude Code](docs/claude-code.md) · [Configuration and roles](docs/configuration.md) · [Start fresh](docs/start-fresh.md) · [Behavior and protocol](docs/architecture.md) · [Development](docs/development.md)
 
 Licensed under [GPLv3](LICENSE) (`GPL-3.0-only`).

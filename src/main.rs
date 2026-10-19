@@ -1,4 +1,4 @@
-//! mustr: a user-owned, herdr-scoped hub. Agent reasoning remains in Pi.
+//! mustr: a user-owned, herdr-scoped hub. Agent reasoning remains in its harness.
 //! Internal modules deliberately do not form a public library API.
 
 mod cli;
@@ -64,6 +64,27 @@ async fn main() -> Result<()> {
                 "Installed {}\nRestart Pi or /reload, then /role. Other extensions and settings are unchanged.",
                 destination.display()
             );
+        }
+        Command::Install {
+            harness:
+                InstallTarget::Claude {
+                    directory,
+                    config_only,
+                },
+        } => {
+            if config_only {
+                let destination = install::install_claude_config_only(&paths, directory)?;
+                println!(
+                    "Generated {}\nLaunch Claude Code in herdr with --mcp-config pointing to this file.\nAsk Claude to join mustr with a role, then wait for work. Claude settings and permissions are unchanged.",
+                    destination.display()
+                );
+            } else {
+                let launcher = install::install_claude(&paths, directory).await?;
+                println!(
+                    "Installed {}\nRegistered the user-scoped mustr MCP server. Restart Claude Code to use it; tool permissions and managed-policy checks are unchanged.",
+                    launcher.display()
+                );
+            }
         }
         Command::Context => println!(
             "{}",

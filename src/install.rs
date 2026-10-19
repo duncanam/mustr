@@ -1,4 +1,9 @@
-//! Explicit, non-destructive Pi adapter installation. Never edits settings.json.
+//! Explicit harness installers; Claude registration is delegated to Claude Code's CLI.
+
+mod claude;
+pub(crate) use claude::{
+    install_config_only as install_claude_config_only, install_registered as install_claude,
+};
 
 use std::{
     env, fs,

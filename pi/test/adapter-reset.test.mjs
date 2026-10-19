@@ -31,7 +31,10 @@ test("actual adapter commands replace factory/session/history only after one cla
   assert.equal(f.hub.receiptAttempts.length, 1);
   assert.equal(f.hub.capabilities, 2, "old and fresh connections negotiate independently");
   assert.ok(fresh.active().includes("policy-tool"));
-  const prompt = (await fresh.emit("before_agent_start", { systemPrompt: "BASE POLICY: protected paths" }))[0].systemPrompt;
+  const promptResult = await fresh.prompt("BASE POLICY: protected paths");
+  const prompt = promptResult.text;
+  assert.equal(promptResult.options.forceSystemPrompt, undefined, "prompt sections are not flattened");
+  assert.equal(promptResult.options.sections.preamble, "BASE POLICY: protected paths");
   assert.match(prompt, /^BASE POLICY: protected paths/);
   assert.match(prompt, /Role: implementor/);
   assert.equal(JSON.stringify(fresh.entries).includes("OLD SENTINEL"), false);
@@ -103,7 +106,7 @@ for (const first of [true, false]) test(`cancellation ${first ? "before" : "afte
   assert.equal(f.hub.receiptAttempts.length, 0);
   assert.ok(f.h.active().includes("mustr_roster"));
   assert.ok(f.h.active().includes("policy-tool"));
-  const prompt = (await f.h.emit("before_agent_start", { systemPrompt: "Base" }))[0].systemPrompt;
+  const prompt = (await f.h.prompt("Base")).text;
   assert.match(prompt, /Role: implementor/);
   await f.discover(); await delay(30);
   assert.equal(f.h.root.attempts, 1);
@@ -142,6 +145,16 @@ test("lost fresh Join ACK re-acknowledges SAME fresh identity without another re
   assert.equal(f.h.root.replacements, 1);
   assert.equal(f.hub.claims, 1);
   assert.equal(f.hub.receiptAttempts[0].agent_id, f.hub.receiptAttempts[1].agent_id);
+  assertPrivate(f);
+});
+
+test("extension-origin input is not treated as a human interruption during fresh restore", async t => {
+  const f = await resetFixture(t);
+  f.h.root.beforeFreshRestore = fresh => fresh.emit("input", { source: "extension", text: "Extension-origin prompt" });
+  f.hub.prepare(); await f.discover();
+  await eventually(() => f.hub.completed && f.h.root.current.active().includes("mustr_roster"));
+  assert.equal(f.hub.claims, 1);
+  assert.equal(f.hub.receiptAttempts.length, 1);
   assertPrivate(f);
 });
 
@@ -189,7 +202,10 @@ test("fresh restore resolves updated role despite unrelated invalid graph", asyn
   };
   f.hub.prepare(); await f.discover();
   await eventually(() => f.hub.completed && f.h.root.current.active().includes("mustr_roster"));
-  const text = (await f.h.root.current.emit("before_agent_start", { systemPrompt: "Base" }))[0].systemPrompt;
+  const promptResult = await f.h.root.current.prompt("Base");
+  const text = promptResult.text;
+  assert.equal(promptResult.options.forceSystemPrompt, undefined);
+  assert.match(promptResult.options.sections.mustr_role, /UPDATED FRESH ROLE/);
   assert.match(text, /UPDATED FRESH ROLE/);
   assert.equal(f.hub.receiptAttempts.length, 1);
   assertPrivate(f);

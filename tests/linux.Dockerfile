@@ -16,10 +16,12 @@ WORKDIR /work
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY roles ./roles
+COPY claude ./claude
 COPY pi/package.json pi/package-lock.json pi/tsconfig.json pi/index.ts pi/transport.mjs ./pi/
 RUN npm --prefix pi ci --ignore-scripts --engine-strict
 COPY pi/test ./pi/test
 COPY tests/*.mjs tests/*.py ./tests/
 RUN cargo test --locked \
     && npm --prefix pi run typecheck \
-    && npm --prefix pi test
+    && npm --prefix pi test \
+    && node --test claude/test/*.test.mjs

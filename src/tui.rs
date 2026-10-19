@@ -412,7 +412,9 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, view: &mut View, color: bool) {
             Paragraph::new(vec![
                 Line::styled("No herdr spaces yet.", bold()),
                 Line::raw(""),
-                Line::raw("Open a herdr space, then join from Pi with /role NAME."),
+                Line::raw(
+                    "Open a herdr space, then join with /role NAME in Pi or mustr_join in Claude.",
+                ),
                 Line::raw(""),
                 Line::styled("No agent sessions are read or launched.", muted()),
             ])
@@ -697,6 +699,7 @@ fn draw_members(frame: &mut Frame, area: Rect, members: &[&Member], color: bool)
             Paragraph::new(vec![
                 Line::styled("No connected participants.", muted()),
                 Line::raw("/role NAME in Pi to join."),
+                Line::raw("Claude: mustr_join + mustr_wait."),
             ]),
             inner,
         );
@@ -1020,7 +1023,7 @@ fn draw_messages(
     if messages.is_empty() {
         lines.push(Line::styled("No addressed messages yet.", bold()));
         lines.push(Line::styled(
-            "Join from Pi with /role NAME, then ask an agent to coordinate.",
+            "Join with /role NAME in Pi or mustr_join in Claude; Claude receives during mustr_wait.",
             muted(),
         ));
     }
@@ -1064,7 +1067,7 @@ fn draw_help(frame: &mut Frame, area: Rect, color: bool) {
             "Connect your workflow",
             accent(color).add_modifier(Modifier::BOLD),
         ),
-        Line::raw("Join each Pi session with /role NAME."),
+        Line::raw("Join: Pi /role NAME; Claude mustr_join."),
         Line::raw("Attach from the intended Pi recipient:"),
         Line::raw("/mustr-todo [path/to/TODO.md]"),
         Line::raw("/mustr-pr https://github.com/OWNER/REPO/pull/N"),
@@ -1352,6 +1355,7 @@ mod tests {
         assert!(text.contains("Orchard · w1"));
         assert!(text.contains("[t] TODO: off   │   [c] Check-in: off   │   [p] PR: off"));
         assert!(text.contains("/role NAME in Pi to join."));
+        assert!(text.contains("Claude: mustr_join"));
         assert!(text.contains("No addressed messages yet."));
         assert!(!text.contains("No tasks assigned."));
         let (_, roster_row) = position(&text, "Participants 0");

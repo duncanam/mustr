@@ -6,6 +6,11 @@ import defaultFactory from "../index.ts";
 export function harness(directory, options = {}) {
   const root = { states: [], errors: [], staleCalls: [], dispatches: [], replacements: 0, attempts: 0,
     factory: options.factory ?? defaultFactory, cancel: false, cancelFirst: false, depth: 0 };
+  function renderPromptSections(promptOptions) {
+    if (promptOptions.forceSystemPrompt !== undefined) return promptOptions.forceSystemPrompt;
+    return Object.entries(promptOptions.sections ?? {}).map(([name, content]) =>
+      name === "preamble" ? content : `<${name}>\n${content}\n</${name}>`).join("\n\n");
+  }
   function create(id) {
     const events = new Map(), commands = new Map(), tools = new Map();
     const entries = [], messages = [], notifications = [], statuses = [];
@@ -32,6 +37,14 @@ export function harness(directory, options = {}) {
       },
     };
     async function emit(event, payload = {}) {
+      if (event === "before_agent_start") {
+        payload.systemPromptOptions ??= { sections: { preamble: payload.systemPrompt ?? "" } };
+        payload.systemPromptOptions.sections ??= {};
+        Object.defineProperty(payload, "systemPrompt", {
+          configurable: true, enumerable: true,
+          get: () => renderPromptSections(payload.systemPromptOptions),
+        });
+      }
       const results = []; root.depth++;
       try {
         for (const fn of events.get(event) ?? []) {
@@ -70,6 +83,7 @@ export function harness(directory, options = {}) {
       },
     };
     const state = { api, context, emit, commands, tools, entries, messages, notifications, statuses, root,
+      prompt: async base => { const event = { systemPrompt: base ?? "" }; await emit("before_agent_start", event); return { text: event.systemPrompt, options: event.systemPromptOptions }; },
       active: () => active, editor: text => { editor = text; }, pending: value => { pending = value; }, idle: value => { idle = value; },
       deferInsertion: value => { deferInsertion = value; }, insert,
       settle: async (aborted = false) => { idle = true; await emit("agent_settled", { aborted }); },
