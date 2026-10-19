@@ -1,12 +1,12 @@
 use super::*;
 
 #[test]
-fn header_separates_navigation_controls_and_reported_values() {
+fn header_separates_fixed_identity_controls_and_reported_values() {
     for width in [35, 56, 80, 120, 240] {
         let mut geometry = None;
         for flags in 0..8 {
             let mut snapshot = populated();
-            let automation = snapshot.automation.get_mut(&SpaceId::new("w1")).unwrap();
+            let automation = &mut snapshot.automation;
             automation.todo_enabled = flags & 1 != 0;
             automation.checkin_enabled = flags & 2 != 0;
             automation.pr_enabled = flags & 4 != 0;
@@ -14,7 +14,7 @@ fn header_separates_navigation_controls_and_reported_values() {
                 let buffer = render(&snapshot, &selected_view(&snapshot), width, 40, color);
                 let text = screen(&buffer);
                 let brand = position(&text, "mustr").1;
-                let navigation = position(&text, "Spaces").1;
+                let navigation = position(&text, "Space").1;
                 let modes = position(&text, "Automation").1;
                 assert!(navigation >= brand + 2, "{text}");
                 assert!(modes >= navigation + 2, "{text}");
@@ -170,7 +170,7 @@ fn participant_roster_hides_offline_agents_and_restores_reconnected_agents() {
 #[test]
 fn closing_all_agents_keeps_task_recovery_and_named_message_history() {
     let fixture = populated();
-    let mut state = crate::hub::State::default();
+    let mut state = crate::hub::State::new(SpaceId::new("w1"));
     state.members = fixture
         .members
         .iter()
@@ -185,7 +185,7 @@ fn closing_all_agents_keeps_task_recovery_and_named_message_history() {
     for member in &fixture.members {
         state.disconnect(&member.id);
     }
-    let snapshot = state.snapshot(fixture.spaces.clone(), None, 1);
+    let snapshot = state.snapshot(fixture.space.clone(), None, 1);
     let mut view = selected_view(&snapshot);
     let messages = screen(&render(&snapshot, &view, 160, 40, false));
     view.navigate(KeyCode::Char('f'), &snapshot);
@@ -208,44 +208,67 @@ fn closing_all_agents_keeps_task_recovery_and_named_message_history() {
 }
 
 #[test]
-fn starts_in_own_space_after_empty_snapshot_and_respects_manual_selection() {
+fn bound_identity_survives_initial_missing_metadata_rename_and_disappearance() {
     let mut snapshot = populated();
-    let mut view = View::in_space(SpaceId::new("w2"));
-    view.reconcile(&Snapshot::default());
-    assert!(view.selected.is_none());
+    let mut view = View::in_space(SpaceId::new("w1"));
+    let unavailable = Snapshot::empty(SpaceId::new("w1"));
+    view.reconcile(&unavailable);
+    assert_eq!(view.space_id, SpaceId::new("w1"));
+    let text = screen(&render(&unavailable, &view, 120, 30, false));
+    assert!(text.contains("Bound space w1 is unavailable."), "{text}");
     view.reconcile(&snapshot);
-    assert_eq!(view.selected, Some(SpaceId::new("w2")));
-    view.navigate(KeyCode::Left, &snapshot);
-    assert_eq!(view.selected, Some(SpaceId::new("w1")));
-    snapshot.spaces.reverse();
+    snapshot.space.as_mut().unwrap().label = "Renamed project".into();
     view.reconcile(&snapshot);
-    assert_eq!(
-        view.selected,
-        Some(SpaceId::new("w1")),
-        "refresh must not jump home"
-    );
-    snapshot.spaces.retain(|s| s.id != SpaceId::new("w1"));
+    let text = screen(&render(&snapshot, &view, 120, 30, false));
+    assert!(text.contains("Renamed project · w1"), "{text}");
+    assert!(!text.contains("Orchard"));
+    snapshot.space = None;
     view.reconcile(&snapshot);
-    assert_eq!(view.selected, Some(SpaceId::new("w2")));
-    snapshot.spaces.clear();
+    let text = screen(&render(&snapshot, &view, 120, 30, false));
+    assert_eq!(view.space_id, SpaceId::new("w1"));
+    assert!(text.contains("w1 · unavailable"), "{text}");
+    assert!(text.contains("This dashboard never switches spaces."));
+    // A different space reusing the old label is not a replacement for w1.
+    snapshot.space = Some(Space {
+        id: SpaceId::new("w2"),
+        label: "Orchard".into(),
+    });
     view.reconcile(&snapshot);
-    assert!(view.selected.is_none());
+    let text = screen(&render(&snapshot, &view, 120, 30, false));
+    assert_eq!(view.space_id, SpaceId::new("w1"));
+    assert!(text.contains("Bound space w1 is unavailable."), "{text}");
+    assert!(!text.contains("Orchard"));
+    assert!(!text.contains("w2"));
 }
 
 #[test]
-fn missing_startup_space_falls_back_once_without_future_selection_theft() {
+fn missing_bound_space_never_falls_back_and_same_identity_can_return() {
     let mut snapshot = empty_space();
+    snapshot.space_id = SpaceId::new("w2");
     let mut view = View::in_space(SpaceId::new("w2"));
     view.reconcile(&snapshot);
-    assert_eq!(view.selected, Some(SpaceId::new("w1")));
-    snapshot.spaces.push(Space {
+    let text = screen(&render(&snapshot, &view, 120, 30, false));
+    assert_eq!(view.space_id, SpaceId::new("w2"));
+    assert!(text.contains("Bound space w2 is unavailable."), "{text}");
+    assert!(!text.contains("Orchard"));
+    for key in [
+        KeyCode::Tab,
+        KeyCode::Left,
+        KeyCode::Right,
+        KeyCode::Char('h'),
+        KeyCode::Char('l'),
+    ] {
+        assert!(!view.navigate(key, &snapshot));
+    }
+    snapshot.space = Some(Space {
         id: SpaceId::new("w2"),
         label: "Returned".into(),
     });
     view.reconcile(&snapshot);
-    assert_eq!(view.selected, Some(SpaceId::new("w1")));
-    view.navigate(KeyCode::Right, &snapshot);
-    assert_eq!(view.selected, Some(SpaceId::new("w2")));
+    let text = screen(&render(&snapshot, &view, 120, 30, false));
+    assert_eq!(view.space_id, SpaceId::new("w2"));
+    assert!(text.contains("Returned · w2"), "{text}");
+    assert!(!text.contains("unavailable"));
 }
 
 #[test]
@@ -268,11 +291,11 @@ fn paused_work_shows_reason_requester_and_explicit_recovery_not_auto_resume() {
     }
     let narrow = screen(&render(&snapshot, &view, 40, 16, false));
     assert!(narrow.contains("Paused task: ask requester to guide"));
-    view.advance(&snapshot, true);
+    snapshot.tasks[0].space_id = SpaceId::new("w2");
     let text = screen(&render(&snapshot, &view, 140, 40, true));
     assert!(
         !text.contains("Paused work:"),
-        "other spaces must not show this recovery warning"
+        "foreign tasks must not show this recovery warning"
     );
 }
 

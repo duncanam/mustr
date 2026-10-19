@@ -367,21 +367,38 @@ pub(crate) struct Space {
     pub label: String,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Snapshot {
-    pub spaces: Vec<Space>,
+    pub space_id: SpaceId,
+    /// Live herdr metadata. The identity remains available if the space disappears.
+    pub space: Option<Space>,
     pub members: Vec<Member>,
     pub tasks: Vec<Task>,
     pub messages: Vec<Message>,
     /// Actor-internal readiness over the full queue, not the bounded UI preview.
     #[serde(skip)]
     pub ready: std::collections::BTreeMap<AgentId, MessageId>,
-    pub automation: std::collections::BTreeMap<SpaceId, Automation>,
-    #[serde(default)]
-    pub resets: std::collections::BTreeMap<SpaceId, ResetSummary>,
-    #[serde(default)]
-    pub space_epochs: std::collections::BTreeMap<SpaceId, u64>,
+    pub automation: Automation,
+    pub reset: Option<ResetSummary>,
+    pub epoch: u64,
     pub error: Option<String>,
+}
+
+impl Snapshot {
+    pub fn empty(space_id: SpaceId) -> Self {
+        Self {
+            space_id,
+            space: None,
+            members: Vec::new(),
+            tasks: Vec::new(),
+            messages: Vec::new(),
+            ready: std::collections::BTreeMap::new(),
+            automation: Automation::default(),
+            reset: None,
+            epoch: 0,
+            error: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

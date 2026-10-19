@@ -17,7 +17,7 @@ The installer creates its adapter bundle and registers `mustr` with Claude Code 
 claude
 ```
 
-Approve any prompts Claude presents; registration does not weaken tool permissions or managed-policy checks. Start the mustr hub in another tab with `mustr`. Restart Claude after installing or updating the integration, after reconciling any active work. Starting Claude or its MCP server does not automatically join mustr.
+Approve any prompts Claude presents; registration does not weaken tool permissions or managed-policy checks. Start `mustr` in another tab of the same herdr space. For another space, launch a separate mustr instance there; the adapter discovers only its own space's hub. Restart Claude after installing or updating the integration, after reconciling any active work. Starting Claude or its MCP server does not automatically join mustr.
 
 For bundle generation without registration, use:
 

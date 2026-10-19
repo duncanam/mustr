@@ -25,6 +25,10 @@ struct ResetAgent {
 }
 
 impl ResetPlan {
+    pub(super) fn belongs_to(&self, space: &SpaceId) -> bool {
+        &self.space_id == space
+    }
+
     fn active(&self) -> bool {
         matches!(self.state, ResetPhase::Prepared | ResetPhase::Incomplete)
     }
@@ -42,46 +46,42 @@ impl ResetPlan {
 
 impl State {
     pub fn reset_metadata_equal(&self, other: &Self) -> bool {
-        self.resets == other.resets
-            && self.reset_epochs == other.reset_epochs
+        self.reset == other.reset
+            && self.reset_epoch == other.reset_epoch
             && self.retired == other.retired
     }
 
     pub fn reset_fingerprint(&self, space: &SpaceId) -> Result<String> {
-        let tasks: Vec<_> = self
-            .tasks
-            .values()
-            .filter(|t| &t.space_id == space)
-            .collect();
-        let messages: Vec<_> = self
-            .messages
-            .iter()
-            .filter(|m| &m.space_id == space)
-            .collect();
+        self.validate_space(space)?;
         Ok(digest(serde_json::to_vec(&(
-            tasks,
-            messages,
-            self.automation.get(space),
-            self.reset_epoch(space),
+            &self.tasks,
+            &self.messages,
+            &self.automation,
+            self.reset_epoch,
         ))?))
     }
 
     pub fn reset_epoch(&self, space: &SpaceId) -> u64 {
-        self.reset_epochs.get(space).copied().unwrap_or_default()
+        if space == &self.space_id {
+            self.reset_epoch
+        } else {
+            0
+        }
     }
 
     pub fn reset_frozen(&self, space: &SpaceId) -> bool {
-        self.resets.get(space).is_some_and(ResetPlan::active)
+        space == &self.space_id && self.reset.as_ref().is_some_and(ResetPlan::active)
     }
 
     pub fn reset_preview(&self, space: &SpaceId) -> Result<ResetPreview> {
+        self.validate_space(space)?;
         ensure!(
             !self.reset_frozen(space),
             "reset already in progress; inspect its recovery status"
         );
         let mut participants = Vec::new();
         let mut offline_count = 0;
-        for member in self.members.values().filter(|m| &m.space_id == space) {
+        for member in self.members.values() {
             if member.activity == Activity::Offline {
                 offline_count += 1;
                 continue;
@@ -115,12 +115,8 @@ impl State {
             space_id: space.clone(),
             nonce: String::new(),
             participants,
-            task_count: self.tasks.values().filter(|t| &t.space_id == space).count(),
-            message_count: self
-                .messages
-                .iter()
-                .filter(|m| &m.space_id == space)
-                .count(),
+            task_count: self.tasks.len(),
+            message_count: self.messages.len(),
             offline_count,
         })
     }
@@ -132,12 +128,13 @@ impl State {
             current == *preview,
             "reset inventory changed; preview and confirm again"
         );
+        self.validate_space(&preview.space_id)?;
         let space = &preview.space_id;
         let epoch = self
-            .reset_epoch(space)
+            .reset_epoch
             .checked_add(1)
             .ok_or_else(|| eyre!("reset epoch exhausted"))?;
-        let automation = self.automation.entry(space.clone()).or_default();
+        let automation = &mut self.automation;
         automation.generation = automation
             .generation
             .checked_add(1)
@@ -145,8 +142,8 @@ impl State {
         automation.todo_enabled = false;
         automation.checkin_enabled = false;
         automation.pr_enabled = false;
-        self.reset_epochs.insert(space.clone(), epoch);
-        self.resets.insert(space.clone(), ResetPlan {
+        self.reset_epoch = epoch;
+        self.reset = Some(ResetPlan {
             plan_id: Uuid::new_v4().to_string(),
             space_id: space.clone(),
             epoch,
@@ -165,22 +162,23 @@ impl State {
             }).collect(),
         });
         if preview.participants.is_empty() {
-            self.finish_reset(space);
+            self.finish_reset();
         }
         Ok(())
     }
 
     pub fn connection_epoch_valid(&self, agent: &AgentId, space: &SpaceId, epoch: u64) -> bool {
-        if self.retired.contains_key(agent)
+        if space != &self.space_id
+            || self.retired.contains(agent)
             || !self
                 .members
                 .get(agent)
-                .is_some_and(|m| &m.space_id == space && m.activity != Activity::Offline)
+                .is_some_and(|m| m.space_id == self.space_id && m.activity != Activity::Offline)
         {
             return false;
         }
-        self.reset_epoch(space) == epoch
-            || self.resets.get(space).is_some_and(|plan| {
+        self.reset_epoch == epoch
+            || self.reset.as_ref().is_some_and(|plan| {
                 plan.active()
                     && epoch.checked_add(1) == Some(plan.epoch)
                     && plan.agents.iter().any(|a| {
@@ -191,7 +189,7 @@ impl State {
     }
 
     pub(super) fn reset_sync(&self, member: &Member) -> Value {
-        let plan = &self.resets[&member.space_id];
+        let plan = self.reset.as_ref().expect("frozen space has reset plan");
         let control = if self.reset_capable.contains(&member.id) {
             plan.agents
                 .iter()
@@ -231,9 +229,13 @@ impl State {
             member.activity != Activity::Working,
             "participant became busy; use human recovery, not replacement"
         );
+        ensure!(
+            member.space_id == self.space_id,
+            "participant belongs to another space"
+        );
         let plan = self
-            .resets
-            .get_mut(&member.space_id)
+            .reset
+            .as_mut()
             .filter(|p| p.plan_id == plan_id && p.active())
             .ok_or_else(|| eyre!("unknown active reset plan"))?;
         let agent = plan
@@ -268,9 +270,13 @@ impl State {
         text: &str,
     ) -> Result<Value> {
         validate_text(text)?;
+        ensure!(
+            member.space_id == self.space_id,
+            "participant belongs to another space"
+        );
         let plan = self
-            .resets
-            .get_mut(&member.space_id)
+            .reset
+            .as_mut()
             .filter(|p| p.plan_id == plan_id && p.active())
             .ok_or_else(|| eyre!("unknown active reset plan"))?;
         // Adapter error strings are untrusted; never let a copied control
@@ -302,17 +308,18 @@ impl State {
         pane: &str,
         space: &SpaceId,
     ) -> bool {
-        self.resets.get(space).is_some_and(|plan| {
-            plan.active()
-                && plan.agents.iter().any(|a| {
-                    let approved = &a.progress.participant;
-                    &approved.agent_id == agent
-                        && approved.name == name
-                        && approved.role == role
-                        && approved.pane_id == pane
-                        && a.progress.new_agent_id.is_none()
-                })
-        })
+        space == &self.space_id
+            && self.reset.as_ref().is_some_and(|plan| {
+                plan.active()
+                    && plan.agents.iter().any(|a| {
+                        let approved = &a.progress.participant;
+                        &approved.agent_id == agent
+                            && approved.name == name
+                            && approved.role == role
+                            && approved.pane_id == pane
+                            && a.progress.new_agent_id.is_none()
+                    })
+            })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -326,13 +333,14 @@ impl State {
         receipt: &ResetReceipt,
         now: u64,
     ) -> Result<Value> {
+        self.validate_space(space)?;
         ensure!(
-            !self.retired.contains_key(agent),
+            !self.retired.contains(agent),
             "this session identity is retired; start a genuinely fresh session"
         );
         let plan = self
-            .resets
-            .get(space)
+            .reset
+            .as_ref()
             .filter(|p| p.plan_id == receipt.plan_id && p.state != ResetPhase::Abandoned)
             .ok_or_else(|| eyre!("unknown or abandoned reset plan"))?;
         let expected = plan
@@ -383,7 +391,7 @@ impl State {
             );
         }
         let old = approved.agent_id.clone();
-        self.retired.insert(old.clone(), space.clone());
+        self.retired.insert(old.clone());
         self.reset_capable.remove(&old);
         self.reset_capable.remove(agent);
         if let Some(member) = self.members.get_mut(&old) {
@@ -402,7 +410,7 @@ impl State {
                 idle_since: now,
             },
         );
-        let plan = self.resets.get_mut(space).expect("validated plan");
+        let plan = self.reset.as_mut().expect("validated plan");
         let expected = plan
             .agents
             .iter_mut()
@@ -417,15 +425,15 @@ impl State {
             .all(|a| a.progress.state == ResetAgentState::Complete)
             && plan.active()
         {
-            self.finish_reset(space);
+            self.finish_reset();
         }
         Ok(
             json!({"protocol":VERSION,"agent_id":agent,"delivery_policy":1,"inbox_notifications":1,"reset_protocol":1,"reset_receipt":true}),
         )
     }
 
-    fn finish_reset(&mut self, space: &SpaceId) {
-        let plan = self.resets.get_mut(space).expect("prepared plan");
+    fn finish_reset(&mut self) {
+        let plan = self.reset.as_mut().expect("prepared plan");
         let replacements: BTreeSet<_> = plan
             .agents
             .iter()
@@ -439,36 +447,30 @@ impl State {
         );
         let old_ids: BTreeSet<_> = self
             .members
-            .values()
-            .filter(|m| &m.space_id == space && !replacements.contains(&m.id))
-            .map(|m| m.id.clone())
+            .keys()
+            .filter(|id| !replacements.contains(*id))
+            .cloned()
             .collect();
         for id in &old_ids {
-            self.retired.insert(id.clone(), space.clone());
+            self.retired.insert(id.clone());
             self.reset_capable.remove(id);
         }
-        self.members
-            .retain(|id, member| &member.space_id != space || replacements.contains(id));
-        self.tasks.retain(|_, task| &task.space_id != space);
-        self.messages.retain(|message| &message.space_id != space);
-        self.cache.retain(|entry| {
-            entry.space.as_ref() != Some(space)
-                && !(entry.space.is_none() && old_ids.contains(&entry.sender))
-        });
-        let generation = self.automation.get(space).map_or(0, |a| a.generation);
-        self.automation.insert(
-            space.clone(),
-            Automation {
-                generation,
-                ..Automation::default()
-            },
-        );
+        self.members.retain(|id, _| replacements.contains(id));
+        self.tasks.clear();
+        self.messages.clear();
+        self.cache.clear();
+        let generation = self.automation.generation;
+        self.automation = Automation {
+            generation,
+            ..Automation::default()
+        };
     }
 
     pub fn abandon_reset(&mut self, space: &SpaceId, plan_id: &str) -> Result<()> {
+        self.validate_space(space)?;
         let plan = self
-            .resets
-            .get_mut(space)
+            .reset
+            .as_mut()
             .filter(|p| p.plan_id == plan_id && p.active())
             .ok_or_else(|| eyre!("unknown active reset plan"))?;
         plan.state = ResetPhase::Abandoned;
@@ -476,26 +478,30 @@ impl State {
         for agent in &plan.agents {
             let old = &agent.progress.participant.agent_id;
             if agent.claimed {
-                self.retired.insert(old.clone(), space.clone());
+                self.retired.insert(old.clone());
             }
             self.reset_capable.remove(old);
             if let Some(member) = self.members.get_mut(old) {
                 member.activity = Activity::Offline;
             }
         }
-        for message in self.messages.iter_mut().filter(|m| {
-            &m.space_id == space && matches!(m.delivery, Delivery::Pending | Delivery::Offered)
-        }) {
+        for message in self
+            .messages
+            .iter_mut()
+            .filter(|m| matches!(m.delivery, Delivery::Pending | Delivery::Offered))
+        {
             message.delivery = Delivery::Uncertain;
             message.pr_ack = None;
         }
-        for task in self.tasks.values_mut().filter(|t| {
-            &t.space_id == space && matches!(t.state, TaskState::Assigned | TaskState::Active)
-        }) {
+        for task in self
+            .tasks
+            .values_mut()
+            .filter(|t| matches!(t.state, TaskState::Assigned | TaskState::Active))
+        {
             task.state = TaskState::Paused;
             task.note = "Fresh start abandoned. Reconcile files/external jobs before explicit guidance; no work was replayed.".into();
         }
-        let automation = self.automation.entry(space.clone()).or_default();
+        let automation = &mut self.automation;
         automation.generation = automation
             .generation
             .checked_add(1)
@@ -507,7 +513,7 @@ impl State {
     }
 
     pub(super) fn recover_resets(&mut self) {
-        for plan in self.resets.values_mut().filter(|p| p.active()) {
+        if let Some(plan) = self.reset.as_mut().filter(|p| p.active()) {
             plan.state = ResetPhase::Incomplete;
             plan.note = RECOVERY.into();
             for agent in &mut plan.agents {
@@ -522,7 +528,7 @@ impl State {
     }
 
     pub(super) fn disconnect_reset(&mut self, id: &AgentId) {
-        for plan in self.resets.values_mut().filter(|p| p.active()) {
+        if let Some(plan) = self.reset.as_mut().filter(|p| p.active()) {
             for agent in &mut plan.agents {
                 let current = agent
                     .progress

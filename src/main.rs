@@ -16,15 +16,13 @@ mod store;
 mod tui;
 mod watchers;
 
-use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt, sync::Arc};
-
 use clap::Parser;
 use color_eyre::eyre::Result;
 
 use crate::{
     cli::{Cli, Command, InstallTarget},
     config::{Config, initialize, seed_roles},
-    paths::{Paths, private_dir},
+    paths::Paths,
 };
 
 #[tokio::main]
@@ -91,31 +89,15 @@ async fn main() -> Result<()> {
             serde_json::to_string(&herdr::Herdr::from_env()?.discovery().await?)?
         ),
         Command::Run { headless } => {
-            private_dir(&paths.state)?;
-            let log = paths.state.join("mustr.log");
-            if std::fs::metadata(&log).is_ok_and(|m| m.len() > 5 * 1024 * 1024) {
-                std::fs::rename(&log, log.with_extension("log.1"))?;
-            }
-            let file = OpenOptions::new()
-                .append(true)
-                .create(true)
-                .mode(0o600)
-                .open(&log)?;
-            paths::check_regular(&log)?;
-            tracing_subscriber::fmt()
-                .with_ansi(false)
-                .with_max_level(cli.verbosity)
-                .with_writer(Arc::new(file))
-                .try_init()
-                .map_err(|e| color_eyre::eyre::eyre!("initializing logging: {e}"))?;
-            let server = server::Server::start(herdr::Herdr::from_env()?, &paths, &config).await?;
+            let server =
+                server::Server::start(herdr::Herdr::from_env()?, &paths, &config, cli.verbosity)
+                    .await?;
             let result = if headless {
                 tracing::info!("headless mode; SIGINT/SIGTERM stops the hub, not its participants");
                 wait_for_shutdown().await
             } else {
                 tui::run(
                     server.service.clone(),
-                    server.initial_space.clone(),
                     config.ui.color && std::env::var_os("NO_COLOR").is_none(),
                 )
                 .await

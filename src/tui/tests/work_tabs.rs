@@ -37,11 +37,11 @@ fn messages_default_and_f_toggle_do_not_steal_existing_controls() {
     assert_eq!(view.work_tab, WorkTab::Messages);
     assert!(view.navigate(KeyCode::Char('f'), &snapshot));
     assert_eq!(view.work_tab, WorkTab::Tasks);
-    assert!(view.navigate(KeyCode::Tab, &snapshot));
-    assert_eq!(view.selected, Some(SpaceId::new("w2")));
+    assert!(!view.navigate(KeyCode::Tab, &snapshot));
+    assert_eq!(view.space_id, SpaceId::new("w1"));
     assert_eq!(view.work_tab, WorkTab::Tasks);
-    assert!(view.navigate(KeyCode::BackTab, &snapshot));
-    assert_eq!(view.selected, Some(SpaceId::new("w1")));
+    assert!(!view.navigate(KeyCode::BackTab, &snapshot));
+    assert_eq!(view.space_id, SpaceId::new("w1"));
     for key in ['t', 'c', 'p'] {
         assert!(!view.navigate(KeyCode::Char(key), &snapshot));
     }
@@ -79,17 +79,13 @@ fn accepted_only_counts_are_space_scoped_and_visible_in_either_tab() {
             assert!(!text.contains("2 accepted"));
         }
     }
-    view.advance(&snapshot, true);
-    let text = screen(&render(&snapshot, &view, 120, 30, false));
-    assert!(text.contains("Tasks 1"), "{text}");
-    assert!(text.contains("1 tasks · 1 accepted"), "{text}");
-    snapshot.tasks.last_mut().unwrap().state = TaskState::Review;
-    let text = screen(&render(&snapshot, &view, 120, 30, false));
-    assert!(text.contains("1 tasks · 0 accepted"), "{text}");
-    snapshot.tasks.last_mut().unwrap().state = TaskState::Cancelled;
-    view.navigate(KeyCode::Char('f'), &snapshot);
-    let text = screen(&render(&snapshot, &view, 120, 30, false));
-    assert!(text.contains("1 tasks · 0 accepted"), "{text}");
+    for state in [TaskState::Review, TaskState::Cancelled] {
+        snapshot.tasks.last_mut().unwrap().state = state;
+        assert!(!view.navigate(KeyCode::Tab, &snapshot));
+        let text = screen(&render(&snapshot, &view, 120, 30, false));
+        assert!(text.contains("Tasks 8"), "{text}");
+        assert!(text.contains("8 tasks · 1 accepted"), "{text}");
+    }
 }
 
 #[test]
@@ -273,7 +269,7 @@ fn resize_and_paused_row_height_changes_keep_selection_visible_and_ranges_truthf
 }
 
 #[test]
-fn changing_spaces_resets_both_positions_without_leaking_selected_task_identity() {
+fn metadata_changes_preserve_positions_without_retargeting_task_identity() {
     let mut snapshot = many_tasks(20);
     let mut foreign = snapshot.tasks[0].clone();
     foreign.id = TaskId::new("foreign-task");
@@ -286,28 +282,35 @@ fn changing_spaces_resets_both_positions_without_leaking_selected_task_identity(
         view.navigate(KeyCode::Down, &snapshot);
     }
     render_view(&snapshot, &mut view, 120, 18, false);
-    view.navigate(KeyCode::Tab, &snapshot);
-    assert_eq!(view.work_tab, WorkTab::Tasks);
-    assert_eq!(view.scroll, 0);
-    assert_eq!(view.tasks.offset, 0);
-    assert_eq!(view.tasks.selected, Some(TaskId::new("foreign-task")));
-    let text = screen(&render_view(&snapshot, &mut view, 120, 18, false));
-    assert_selected_visible(&snapshot, &view, &text);
-    assert!(!text.contains("Task 015"));
-    view.navigate(KeyCode::BackTab, &snapshot);
-    assert_eq!(view.tasks.selected, Some(TaskId::new("task-000")));
-    assert_eq!(view.tasks.offset, 0);
-    view.navigate(KeyCode::Down, &snapshot);
-    view.scroll = 9;
-    snapshot.spaces.remove(0);
-    view.reconcile(&snapshot);
-    assert_eq!(view.selected, Some(SpaceId::new("w2")));
-    assert_eq!(view.tasks.selected, Some(TaskId::new("foreign-task")));
-    assert_eq!(view.scroll, 0);
-    snapshot.spaces.clear();
-    view.reconcile(&snapshot);
-    assert!(view.tasks.selected.is_none());
-    assert_eq!(view.tasks.offset, 0);
+    let selected = view.tasks.selected.clone();
+    let offset = view.tasks.offset;
+    let mut renamed = snapshot.space.clone().unwrap();
+    renamed.label = "Renamed project".into();
+    for metadata in [
+        Some(renamed.clone()),
+        None,
+        Some(Space {
+            id: SpaceId::new("w2"),
+            label: "Orchard".into(),
+        }),
+        Some(renamed),
+    ] {
+        snapshot.space = metadata;
+        view.reconcile(&snapshot);
+        assert_eq!(view.space_id, SpaceId::new("w1"));
+        assert_eq!(view.work_tab, WorkTab::Tasks);
+        assert_eq!(view.scroll, 7);
+        assert_eq!(view.tasks.offset, offset);
+        assert_eq!(view.tasks.selected, selected);
+        let text = screen(&render_view(&snapshot, &mut view, 120, 18, false));
+        assert!(!text.contains("Foreign task"), "{text}");
+        if view.space(&snapshot).is_some() {
+            assert_selected_visible(&snapshot, &view, &text);
+            assert!(text.contains("Renamed project · w1"), "{text}");
+        } else {
+            assert!(text.contains("Bound space w1 is unavailable."), "{text}");
+        }
+    }
 }
 
 #[test]
@@ -396,9 +399,8 @@ fn shared_layout_is_bounded_and_counts_survive_empty_populated_short_and_narrow_
 }
 
 #[test]
-fn cycling_the_only_space_does_not_discard_work_navigation() {
-    let mut snapshot = many_tasks(20);
-    snapshot.spaces.truncate(1);
+fn inert_space_keys_do_not_discard_work_navigation() {
+    let snapshot = many_tasks(20);
     let mut view = tasks_view(&snapshot);
     view.scroll = 6;
     for _ in 0..10 {
@@ -407,8 +409,17 @@ fn cycling_the_only_space_does_not_discard_work_navigation() {
     render_view(&snapshot, &mut view, 120, 18, false);
     let selected = view.tasks.selected.clone();
     let offset = view.tasks.offset;
-    view.navigate(KeyCode::Tab, &snapshot);
-    assert_eq!(view.tasks.selected, selected);
-    assert_eq!(view.tasks.offset, offset);
-    assert_eq!(view.scroll, 6);
+    for key in [
+        KeyCode::Tab,
+        KeyCode::BackTab,
+        KeyCode::Left,
+        KeyCode::Right,
+        KeyCode::Char('h'),
+        KeyCode::Char('l'),
+    ] {
+        assert!(!view.navigate(key, &snapshot));
+        assert_eq!(view.tasks.selected, selected);
+        assert_eq!(view.tasks.offset, offset);
+        assert_eq!(view.scroll, 6);
+    }
 }

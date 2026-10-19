@@ -333,7 +333,7 @@ fn push_readiness_uses_full_queue_and_never_offers_or_leaks_content() {
             )
             .unwrap();
     }
-    let snapshot = state.snapshot(vec![], None, 1);
+    let snapshot = state.snapshot(None, None, 1);
     assert_eq!(snapshot.messages.len(), 200);
     assert_eq!(snapshot.ready[&worker], oldest);
     assert!(
@@ -348,9 +348,9 @@ fn push_readiness_uses_full_queue_and_never_offers_or_leaks_content() {
         "hints are not offers"
     );
     offer(&mut state, &worker, &config, 1);
-    assert!(!state.snapshot(vec![], None, 1).ready.contains_key(&worker));
+    assert!(!state.snapshot(None, None, 1).ready.contains_key(&worker));
     state.disconnect(&worker);
-    assert!(!state.snapshot(vec![], None, 1).ready.contains_key(&worker));
+    assert!(!state.snapshot(None, None, 1).ready.contains_key(&worker));
 }
 
 #[test]

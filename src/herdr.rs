@@ -59,7 +59,16 @@ impl Herdr {
         Ok(Self { socket, stamp, key })
     }
 
-    pub fn hub_socket(&self) -> Result<PathBuf> {
+    pub fn instance_key(&self, space: &SpaceId) -> String {
+        digest(format!("{}:{}", self.key, space.as_str()))
+    }
+
+    pub fn hub_socket(&self, space: &SpaceId) -> Result<PathBuf> {
+        Ok(runtime_dir()?.join(format!("{}.sock", self.instance_key(space))))
+    }
+
+    /// The pre-space socket is used only to detect an already-running legacy hub.
+    pub fn legacy_hub_socket(&self) -> Result<PathBuf> {
         Ok(runtime_dir()?.join(format!("{}.sock", self.key)))
     }
 
@@ -117,34 +126,80 @@ impl Herdr {
         Ok(Discovery {
             protocol: crate::protocol::VERSION,
             server_key: self.key.clone(),
-            socket: self.hub_socket()?,
+            socket: self.hub_socket(&pane.workspace_id)?,
             pane_id: pane.pane_id,
             space_id: pane.workspace_id,
         })
     }
 
-    pub async fn spaces(&self) -> Result<Vec<Space>> {
+    pub async fn space(&self, space_id: &SpaceId) -> Result<Space> {
         let result = self.request("workspace.list", json!({})).await?;
         let spaces = result
             .get("workspaces")
             .and_then(Value::as_array)
             .ok_or_else(|| eyre!("herdr returned no workspace list"))?;
-        spaces
+        let space = spaces
             .iter()
-            .map(|s| {
-                Ok(Space {
-                    id: SpaceId::new(
-                        s.get("workspace_id")
-                            .and_then(Value::as_str)
-                            .ok_or_else(|| eyre!("workspace missing ID"))?,
-                    ),
-                    label: s
-                        .get("label")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Unnamed")
-                        .to_owned(),
-                })
+            .find(|space| {
+                space.get("workspace_id").and_then(Value::as_str) == Some(space_id.as_str())
             })
-            .collect()
+            .ok_or_else(|| eyre!("herdr space {space_id} is no longer available"))?;
+        Ok(Space {
+            id: space_id.clone(),
+            label: space
+                .get("label")
+                .and_then(Value::as_str)
+                .unwrap_or("Unnamed")
+                .to_owned(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sockets_are_keyed_by_server_incarnation_and_exact_space() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("herdr.sock");
+        fs::write(&socket, b"fixture").unwrap();
+        let herdr = Herdr::new(socket).unwrap();
+        let first = SpaceId::new("w1");
+        let second = SpaceId::new("w2");
+
+        let first_key = herdr.instance_key(&first);
+        let second_key = herdr.instance_key(&second);
+        assert_ne!(first_key, second_key);
+        assert_eq!(
+            herdr
+                .hub_socket(&first)
+                .unwrap()
+                .file_stem()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            first_key.as_str()
+        );
+        assert_eq!(
+            herdr
+                .hub_socket(&second)
+                .unwrap()
+                .file_stem()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            second_key.as_str()
+        );
+        assert_eq!(
+            herdr
+                .legacy_hub_socket()
+                .unwrap()
+                .file_stem()
+                .unwrap()
+                .to_str()
+                .unwrap(),
+            herdr.key.as_str()
+        );
     }
 }

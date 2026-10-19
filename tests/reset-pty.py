@@ -133,30 +133,41 @@ def read_terminal(deadline):
 
 
 def wait_screen(request):
+    # Do not let queued pre-key output make an inert-key assertion pass before
+    # the hub has actually processed that input. Inspect the current VT screen,
+    # after a short post-input settling interval, never stale ANSI history.
+    while select.select([terminal], [], [], 0)[0]:
+        if not read_terminal(time.monotonic()):
+            break
     before = revision
-    if request.get("keys"):
-        os.write(terminal, request["keys"].encode())
+    keys = request.get("keys")
+    if keys:
+        os.write(terminal, keys.encode())
+    settled_at = time.monotonic() + (0.15 if keys else 0)
     deadline = time.monotonic() + 6
     while time.monotonic() < deadline:
         text = screen.text()
-        updated = not request.get("keys") or revision > before
-        if updated and all(part in text for part in request.get("contains", [])) and all(part not in text for part in request.get("absent", [])):
+        updated = not keys or revision > before
+        if updated and time.monotonic() >= settled_at and all(part in text for part in request.get("contains", [])) and all(part not in text for part in request.get("absent", [])):
             return text
-        if not read_terminal(deadline):
-            break
+        read_terminal(min(deadline, time.monotonic() + 0.05))
     raise TimeoutError("PTY screen condition failed:\n" + screen.text())
 
 
-def state():
-    uri = "file:" + quote(sys.argv[2], safe="/") + "?mode=ro"
+def state(database=0):
+    if not isinstance(database, int) or not 0 <= database < len(sys.argv) - 2:
+        raise ValueError("Unknown fixture database")
+    uri = "file:" + quote(sys.argv[2 + database], safe="/") + "?mode=ro"
     with sqlite3.connect(uri, uri=True, timeout=1) as connection:
         row = connection.execute("SELECT payload FROM hub WHERE id = 1").fetchone()
     payload = json.loads(row[0])
     # Never export reset tokens even from this fixture's private DB.
+    plan = payload.get("reset")
     return {
+        "space_id": payload["space_id"],
         "tasks": list(payload["tasks"].values()), "messages": payload["messages"],
         "automation": payload["automation"], "members": list(payload["members"].values()),
-        "resets": {space: {"state": plan["state"], "participants": len(plan["agents"])} for space, plan in payload.get("resets", {}).items()},
+        "reset": {"state": plan["state"], "participants": len(plan["agents"])} if plan else None,
     }
 
 
@@ -167,7 +178,7 @@ try:
             if request["op"] == "screen":
                 result = wait_screen(request)
             elif request["op"] == "state":
-                result = state()
+                result = state(request.get("database", 0))
             elif request["op"] == "quit":
                 os.write(terminal, b"q")
                 deadline = time.monotonic() + 5

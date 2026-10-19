@@ -18,20 +18,17 @@ use crate::{
 
 mod reset;
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct State {
+    space_id: SpaceId,
     pub members: BTreeMap<AgentId, Member>,
     pub tasks: BTreeMap<TaskId, Task>,
     pub messages: Vec<Message>,
-    pub automation: BTreeMap<SpaceId, Automation>,
-    #[serde(default)]
+    pub automation: Automation,
     cache: Vec<Cached>,
-    #[serde(default)]
-    resets: BTreeMap<SpaceId, reset::ResetPlan>,
-    #[serde(default)]
-    reset_epochs: BTreeMap<SpaceId, u64>,
-    #[serde(default)]
-    retired: BTreeMap<AgentId, SpaceId>,
+    reset: Option<reset::ResetPlan>,
+    reset_epoch: u64,
+    retired: BTreeSet<AgentId>,
     #[serde(skip)]
     reset_capable: BTreeSet<AgentId>,
 }
@@ -42,10 +39,51 @@ struct Cached {
     id: String,
     fingerprint: String,
     result: Value,
-    #[serde(default)]
-    space: Option<SpaceId>,
-    #[serde(default)]
     epoch: u64,
+}
+
+impl State {
+    pub fn new(space_id: SpaceId) -> Self {
+        Self {
+            space_id,
+            members: BTreeMap::new(),
+            tasks: BTreeMap::new(),
+            messages: Vec::new(),
+            automation: Automation::default(),
+            cache: Vec::new(),
+            reset: None,
+            reset_epoch: 0,
+            retired: BTreeSet::new(),
+            reset_capable: BTreeSet::new(),
+        }
+    }
+
+    pub fn space_id(&self) -> &SpaceId {
+        &self.space_id
+    }
+
+    pub fn validate_space(&self, space: &SpaceId) -> Result<()> {
+        ensure!(space == self.space_id(), "state belongs to another space");
+        ensure!(
+            self.members
+                .values()
+                .all(|member| member.space_id == self.space_id)
+                && self
+                    .tasks
+                    .values()
+                    .all(|task| task.space_id == self.space_id)
+                && self
+                    .messages
+                    .iter()
+                    .all(|message| message.space_id == self.space_id)
+                && self
+                    .reset
+                    .as_ref()
+                    .is_none_or(|plan| plan.belongs_to(&self.space_id)),
+            "state contains records for another space"
+        );
+        Ok(())
+    }
 }
 
 impl State {
@@ -69,15 +107,13 @@ impl State {
                 message.pr_ack = None;
             }
         }
-        for automation in self.automation.values_mut() {
-            automation.todo_enabled = false;
-            automation.checkin_enabled = false;
-            automation.pr_enabled = false;
-            automation.generation = automation.generation.saturating_add(1);
-        }
+        self.automation.todo_enabled = false;
+        self.automation.checkin_enabled = false;
+        self.automation.pr_enabled = false;
+        self.automation.generation = self.automation.generation.saturating_add(1);
     }
 
-    pub fn snapshot(&self, spaces: Vec<Space>, error: Option<String>, now: u64) -> Snapshot {
+    pub fn snapshot(&self, space: Option<Space>, error: Option<String>, now: u64) -> Snapshot {
         let mut members: Vec<_> = self.members.values().cloned().collect();
         members.sort_by(|a, b| {
             (a.activity == Activity::Offline)
@@ -87,7 +123,8 @@ impl State {
         let mut tasks: Vec<_> = self.tasks.values().cloned().collect();
         tasks.sort_by_key(|t| (t.state.finished(), std::cmp::Reverse(t.updated_at)));
         Snapshot {
-            spaces,
+            space_id: self.space_id.clone(),
+            space,
             members,
             tasks,
             messages: self.messages.iter().rev().take(200).cloned().collect(),
@@ -114,12 +151,8 @@ impl State {
                 })
                 .collect(),
             automation: self.automation.clone(),
-            resets: self
-                .resets
-                .iter()
-                .map(|(space, plan)| (space.clone(), plan.summary()))
-                .collect(),
-            space_epochs: self.reset_epochs.clone(),
+            reset: self.reset.as_ref().map(reset::ResetPlan::summary),
+            epoch: self.reset_epoch,
             error,
         }
     }
@@ -137,12 +170,18 @@ impl State {
         );
         // Check the fence before deduplication: cached success must never
         // authorize an old context after a reset.
-        if !matches!(request.command, Command::Join { .. }) {
+        if let Command::Join { space_id, .. } = &request.command {
+            self.validate_space(space_id)?;
+        } else {
             let sender = sender.ok_or_else(|| eyre!("register before sending commands"))?;
             let member = self
                 .members
                 .get(sender)
-                .filter(|m| m.activity != Activity::Offline && !self.retired.contains_key(sender))
+                .filter(|m| {
+                    m.activity != Activity::Offline
+                        && m.space_id == self.space_id
+                        && !self.retired.contains(sender)
+                })
                 .ok_or_else(|| eyre!("participant is disconnected or retired"))?;
             ensure!(
                 !self.reset_frozen(&member.space_id)
@@ -172,14 +211,10 @@ impl State {
         );
         if mutation
             && let Some(sender) = sender
-            && let Some(previous) = self.cache.iter().find(|c| {
-                &c.sender == sender
-                    && c.id == request.id
-                    && c.epoch == self.reset_epoch(&self.members[sender].space_id)
-                    && c.space
-                        .as_ref()
-                        .is_none_or(|space| space == &self.members[sender].space_id)
-            })
+            && let Some(previous) = self
+                .cache
+                .iter()
+                .find(|c| &c.sender == sender && c.id == request.id && c.epoch == self.reset_epoch)
         {
             ensure!(
                 previous.fingerprint == fingerprint,
@@ -194,11 +229,7 @@ impl State {
                 id: request.id.clone(),
                 fingerprint,
                 result: result.clone(),
-                space: self.members.get(sender).map(|m| m.space_id.clone()),
-                epoch: self
-                    .members
-                    .get(sender)
-                    .map_or(0, |m| self.reset_epoch(&m.space_id)),
+                epoch: self.reset_epoch,
             });
             if self.cache.len() > 1024 {
                 self.cache.remove(0);
@@ -224,6 +255,7 @@ impl State {
             reset,
         } = command
         {
+            self.validate_space(space_id)?;
             ensure!(*version == VERSION, "unsupported mustr protocol version");
             ensure!(
                 !agent_id.as_str().is_empty() && agent_id.as_str().len() <= 100,
@@ -242,7 +274,7 @@ impl State {
             }
             ensure!(sender.is_none(), "already registered");
             ensure!(
-                !self.retired.contains_key(agent_id),
+                !self.retired.contains(agent_id),
                 "this session identity is retired; start a genuinely fresh session"
             );
             ensure!(
@@ -284,20 +316,12 @@ impl State {
                     "name already in use in this space"
                 );
             }
-            if let Some(old) = self.members.get(agent_id) {
+            if self.members.contains_key(agent_id) {
                 ensure!(
-                    !self.reset_frozen(&old.space_id) || old.space_id == *space_id,
-                    "original space is frozen; old contexts cannot move out of its reset"
+                    !self.reset_frozen(space_id)
+                        || self.approved_old_join(agent_id, name, role, pane_id, space_id),
+                    "space is frozen for fresh start; use the approved replacement receipt"
                 );
-                ensure!(
-                    old.space_id == *space_id
-                        || !self.tasks.values().any(|t| !t.state.finished()
-                            && (&t.owner == agent_id || &t.requester == agent_id)),
-                    "cannot move a session with outstanding tasks; reconcile/cancel them first"
-                );
-                if old.space_id != *space_id {
-                    self.disconnect(agent_id);
-                }
             }
             self.reset_capable.remove(agent_id);
             self.members.insert(
@@ -313,7 +337,6 @@ impl State {
                     idle_since: now,
                 },
             );
-            self.automation.entry(space_id.clone()).or_default();
             return Ok(
                 json!({"protocol": VERSION, "agent_id": agent_id, "delivery_policy": 1, "inbox_notifications": 1, "reset_protocol": 1}),
             );
@@ -322,7 +345,7 @@ impl State {
         let member = self
             .members
             .get(sender)
-            .filter(|m| m.activity != Activity::Offline)
+            .filter(|m| m.activity != Activity::Offline && m.space_id == self.space_id)
             .cloned()
             .ok_or_else(|| eyre!("participant is disconnected"))?;
         match command {
@@ -383,10 +406,7 @@ impl State {
                             && m.delivery == Delivery::Pending
                             && now.saturating_sub(m.created_at) > 5
                     })
-                    && let Some(pr) = self
-                        .automation
-                        .get_mut(&member.space_id)
-                        .and_then(|a| a.pr.as_mut())
+                    && let Some(pr) = self.automation.pr.as_mut()
                 {
                     pr.next_at = now;
                 }
@@ -411,7 +431,8 @@ impl State {
                     )
                 });
                 let tasks: Vec<_> = relevant.iter().take(64).map(|t| json!({"id":t.id,"requester":t.requester,"owner":t.owner,"title":t.title,"state":t.state,"revision":t.revision,"note":t.note.chars().take(300).collect::<String>()})).collect();
-                let automation = self.automation.get(&member.space_id).map(|a| json!({
+                let a = &self.automation;
+                let automation = Some(json!({
                     "todo_enabled":a.todo_enabled,"checkin_enabled":a.checkin_enabled,"pr_enabled":a.pr_enabled,
                     "todo":a.todo.as_ref().map(|t| json!({"path":t.path,"driver":t.driver,"total":t.total,"remaining":t.remaining,"error":t.error})),
                     "pr":a.pr.as_ref().map(|p| json!({"url":p.url,"driver":p.driver,"next_at":p.next_at,"error":p.error}))
@@ -459,9 +480,12 @@ impl State {
                     "recipient already owns an unfinished task"
                 );
                 ensure!(
-                    !self.automation.get(&member.space_id).is_some_and(
-                        |a| a.todo_enabled && a.todo.as_ref().is_some_and(|t| &t.driver == to)
-                    ),
+                    !(self.automation.todo_enabled
+                        && self
+                            .automation
+                            .todo
+                            .as_ref()
+                            .is_some_and(|t| &t.driver == to)),
                     "recipient is running a TODO file; disable that mode before assigning work"
                 );
                 ensure!(
@@ -621,11 +645,7 @@ impl State {
                 }
                 Offered::for_recipient(message, sender, &member.space_id)?
                     .acknowledge()
-                    .apply(
-                        &mut self.tasks,
-                        self.automation.get_mut(&member.space_id),
-                        now,
-                    );
+                    .apply(&mut self.tasks, Some(&mut self.automation), now);
                 Ok(json!({"received":true,"note":"receipt is not execution or completion"}))
             }
             Command::Defer { message_id } => {
@@ -637,15 +657,12 @@ impl State {
                 // Modes/tasks can change while Pi is deciding whether to insert.
                 // Returning an offer must not revive superseded or disabled work.
                 let enabled = !message.kind.automatic()
-                    || self
-                        .automation
-                        .get(&member.space_id)
-                        .is_some_and(|a| match message.kind {
-                            MessageKind::Todo | MessageKind::Continue => a.todo_enabled,
-                            MessageKind::Checkin => a.checkin_enabled,
-                            MessageKind::Pr => a.pr_enabled,
-                            _ => true,
-                        });
+                    || match message.kind {
+                        MessageKind::Todo | MessageKind::Continue => self.automation.todo_enabled,
+                        MessageKind::Checkin => self.automation.checkin_enabled,
+                        MessageKind::Pr => self.automation.pr_enabled,
+                        _ => true,
+                    };
                 let superseded = message.wake
                     && message
                         .task_id
@@ -669,7 +686,7 @@ impl State {
                 ensure!(path.is_absolute(), "TODO path must be absolute");
                 let snapshot = crate::watchers::read_todo(&path)?;
                 self.set_mode(&member.space_id, Mode::Todo, false, now)?;
-                let automation = self.automation.entry(member.space_id.clone()).or_default();
+                let automation = &mut self.automation;
                 automation.todo = Some(TodoWatch {
                     path,
                     driver: sender.clone(),
@@ -697,7 +714,7 @@ impl State {
                     "PR delivery is in flight; wait for its receipt before replacing the watch"
                 );
                 self.set_mode(&member.space_id, Mode::Pr, false, now)?;
-                let automation = self.automation.entry(member.space_id.clone()).or_default();
+                let automation = &mut self.automation;
                 let same = automation
                     .pr
                     .as_ref()
@@ -732,11 +749,12 @@ impl State {
     }
 
     pub fn set_mode(&mut self, space: &SpaceId, mode: Mode, enabled: bool, now: u64) -> Result<()> {
+        self.validate_space(space)?;
         ensure!(
             !self.reset_frozen(space),
             "space is frozen for fresh start; modes are blocked"
         );
-        let automation = self.automation.entry(space.clone()).or_default();
+        let automation = &mut self.automation;
         let generation = automation
             .generation
             .checked_add(1)
@@ -802,18 +820,17 @@ impl State {
             task.state = TaskState::Paused;
             task.note = "Participant disconnected. Execution may have continued; reconcile before guidance.".into();
         }
-        for automation in self.automation.values_mut() {
-            let todo_driver = automation.todo.as_ref().is_some_and(|t| &t.driver == id);
-            let pr_driver = automation.pr.as_ref().is_some_and(|p| &p.driver == id);
-            if todo_driver {
-                automation.todo_enabled = false;
-            }
-            if pr_driver {
-                automation.pr_enabled = false;
-            }
-            if todo_driver || pr_driver {
-                automation.generation = automation.generation.saturating_add(1);
-            }
+        let automation = &mut self.automation;
+        let todo_driver = automation.todo.as_ref().is_some_and(|t| &t.driver == id);
+        let pr_driver = automation.pr.as_ref().is_some_and(|p| &p.driver == id);
+        if todo_driver {
+            automation.todo_enabled = false;
+        }
+        if pr_driver {
+            automation.pr_enabled = false;
+        }
+        if todo_driver || pr_driver {
+            automation.generation = automation.generation.saturating_add(1);
         }
     }
 
@@ -823,7 +840,7 @@ impl State {
             .get(to)
             .ok_or_else(|| eyre!("unknown recipient"))?;
         ensure!(
-            target.space_id == sender.space_id,
+            sender.space_id == self.space_id && target.space_id == self.space_id,
             "cross-space messaging is not allowed"
         );
         ensure!(
@@ -864,6 +881,7 @@ impl State {
         wake: bool,
         now: u64,
     ) -> Result<MessageId> {
+        self.validate_space(space)?;
         if self.messages.len() >= 1000 {
             if let Some(i) = self
                 .messages
@@ -936,11 +954,7 @@ impl State {
             if member.activity != Activity::Idle || self.pending_for(&task.owner) {
                 continue;
             }
-            let automation = self
-                .automation
-                .get(&task.space_id)
-                .cloned()
-                .unwrap_or_default();
+            let automation = self.automation.clone();
             let continuation = automation.todo_enabled
                 && now >= member.idle_since.max(task.updated_at) + scheduling.continuation_seconds;
             let checkin = automation.checkin_enabled && now >= task.checkin_at;
@@ -999,12 +1013,11 @@ impl State {
         now: u64,
         scheduling: &Scheduling,
     ) -> Result<()> {
+        self.validate_space(space)?;
         if self.reset_frozen(space) {
             return Ok(());
         }
-        let Some(mut automation) = self.automation.get(space).cloned() else {
-            return Ok(());
-        };
+        let mut automation = self.automation.clone();
         if !automation.todo_enabled || automation.generation != generation {
             return Ok(());
         }
@@ -1048,7 +1061,7 @@ impl State {
                 }
             }
         }
-        self.automation.insert(space.clone(), automation);
+        self.automation = automation;
         Ok(())
     }
 
@@ -1059,12 +1072,11 @@ impl State {
         result: std::result::Result<PrSnapshot, String>,
         now: u64,
     ) -> Result<()> {
+        self.validate_space(space)?;
         if self.reset_frozen(space) {
             return Ok(());
         }
-        let Some(mut automation) = self.automation.get(space).cloned() else {
-            return Ok(());
-        };
+        let mut automation = self.automation.clone();
         if !automation.pr_enabled || automation.generation != generation {
             return Ok(());
         }
@@ -1148,7 +1160,7 @@ impl State {
                 }
             }
         }
-        self.automation.insert(space.clone(), automation);
+        self.automation = automation;
         Ok(())
     }
 }

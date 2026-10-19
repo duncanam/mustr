@@ -25,14 +25,16 @@ fn join(agent: &str, name: &str, pane: &str, reset: Option<ResetReceipt>) -> Req
 
 fn fixture() -> (Actor, tempfile::TempDir, watch::Receiver<Snapshot>) {
     let directory = tempfile::tempdir().unwrap();
-    let (snapshots, receiver) = watch::channel(Snapshot::default());
+    let space_id = SpaceId::new("w1");
+    let (snapshots, receiver) = watch::channel(Snapshot::empty(space_id.clone()));
     let mut actor = Actor::new(
+        space_id,
         directory.path().join("hub.sqlite"),
         Scheduling::default(),
         snapshots,
     )
     .unwrap();
-    actor.spaces.push(Space {
+    actor.space = Some(Space {
         id: SpaceId::new("w1"),
         label: "One".into(),
     });
@@ -92,7 +94,14 @@ fn spawn(
 ) -> (Service, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(128);
     let handle = tokio::task::spawn_blocking(move || actor.run(rx));
-    (Service { tx, snapshots }, handle)
+    (
+        Service {
+            space_id: SpaceId::new("w1"),
+            tx,
+            snapshots,
+        },
+        handle,
+    )
 }
 
 async fn poll(service: &Service, connection: u64) -> Value {
@@ -142,9 +151,9 @@ fn preview_requires_existing_space_single_nonce_and_unchanged_counts_content_and
     let (mut actor, _directory, _snapshots) = fixture();
     assert!(actor.preview(SpaceId::new("missing")).is_err());
     let preview = actor.preview(SpaceId::new("w1")).unwrap();
-    actor.spaces.clear();
+    actor.space = None;
     assert!(actor.start_reset(preview).is_err());
-    actor.spaces.push(Space {
+    actor.space = Some(Space {
         id: SpaceId::new("w1"),
         label: "One".into(),
     });
@@ -185,21 +194,91 @@ fn preview_requires_existing_space_single_nonce_and_unchanged_counts_content_and
     assert!(actor.start_reset(preview).is_err());
 }
 
+#[tokio::test]
+async fn actor_rejects_foreign_control_events_and_topology_never_rebinds_identity() {
+    let (actor, _directory, snapshots) = fixture();
+    let (service, handle) = spawn(actor, snapshots);
+
+    let (reply, response) = oneshot::channel();
+    service
+        .tx
+        .send(Event::Mode {
+            space: SpaceId::new("w2"),
+            mode: Mode::Checkin,
+            enabled: true,
+            epoch: 0,
+            reply,
+        })
+        .await
+        .unwrap();
+    assert!(response.await.unwrap().is_err());
+
+    let (reply, response) = oneshot::channel();
+    service
+        .tx
+        .send(Event::ResetPreview {
+            space: SpaceId::new("w2"),
+            reply,
+        })
+        .await
+        .unwrap();
+    assert!(response.await.unwrap().is_err());
+
+    let (reply, response) = oneshot::channel();
+    service
+        .tx
+        .send(Event::ResetAbandon {
+            space: SpaceId::new("w2"),
+            plan_id: "foreign".into(),
+            reply,
+        })
+        .await
+        .unwrap();
+    assert!(response.await.unwrap().is_err());
+
+    let mut observed = service.snapshots.clone();
+    let _ = observed.borrow_and_update();
+    service
+        .tx
+        .send(Event::Space(Ok(Space {
+            id: SpaceId::new("w2"),
+            label: "Wrong space".into(),
+        })))
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), observed.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed.borrow().space_id, SpaceId::new("w1"));
+    assert!(observed.borrow().space.is_none());
+    assert!(
+        observed
+            .borrow()
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("another space")
+    );
+    service.stop().await;
+    handle.await.unwrap();
+}
+
 #[test]
 fn failed_prepare_does_not_advance_fence_publish_plan_or_consume_preview() {
     let (mut actor, directory, snapshots) = fixture();
     let preview = actor.preview(SpaceId::new("w1")).unwrap();
     let before = actor.state.clone();
-    let stored_before = Store::open(&directory.path().join("hub.sqlite"))
+    let stored_before = Store::open(&directory.path().join("hub.sqlite"), SpaceId::new("w1"))
         .unwrap()
         .load()
         .unwrap();
     actor.store.set_read_only_for_test(true);
     assert!(actor.start_reset(preview.clone()).is_err());
     assert_eq!(actor.state, before);
-    assert!(snapshots.borrow().resets.is_empty());
+    assert!(snapshots.borrow().reset.is_none());
     assert_eq!(
-        Store::open(&directory.path().join("hub.sqlite"))
+        Store::open(&directory.path().join("hub.sqlite"), SpaceId::new("w1"))
             .unwrap()
             .load()
             .unwrap(),
@@ -224,12 +303,17 @@ async fn failed_claim_is_not_published_as_success_or_consumed_in_memory() {
     assert!(!response.ok);
     let after = poll(&service, 1).await;
     assert_eq!(after["reset_control"]["state"], "pending");
-    let stored = Store::open(&directory.path().join("hub.sqlite"))
+    let stored = Store::open(&directory.path().join("hub.sqlite"), SpaceId::new("w1"))
         .unwrap()
         .load()
         .unwrap();
     assert_eq!(
-        stored.snapshot(vec![], None, now()).resets[&SpaceId::new("w1")].participants[0].state,
+        stored
+            .snapshot(None, None, now())
+            .reset
+            .unwrap()
+            .participants[0]
+            .state,
         ResetAgentState::Pending
     );
     service.stop().await;
@@ -260,12 +344,7 @@ async fn failed_abandon_preserves_freeze_history_and_live_control_binding() {
     actor.store.set_read_only_for_test(true);
     let (service, handle) = spawn(actor, snapshots);
     let ticket = receipt(&poll(&service, 1).await);
-    assert!(
-        service
-            .reset_abandon(SpaceId::new("w1"), ticket.plan_id)
-            .await
-            .is_err()
-    );
+    assert!(service.reset_abandon(ticket.plan_id).await.is_err());
     let after = poll(&service, 1).await;
     assert_eq!(after["reset_summary"]["state"], "prepared");
     assert_eq!(after["reset_control"]["state"], "pending");
@@ -294,18 +373,23 @@ async fn old_sockets_cached_requests_and_disconnect_cannot_affect_fresh_replacem
         )
         .unwrap();
     let (service, handle) = spawn(actor, snapshots);
-    let preview = service.reset_preview(SpaceId::new("w1")).await.unwrap();
+    let preview = service.reset_preview().await.unwrap();
     service.reset_start(preview).await.unwrap();
     let a = receipt(&poll(&service, 1).await);
     let b = receipt(&poll(&service, 2).await);
     assert!(claim(&service, 1, &a).await.ok);
     assert!(!claim(&service, 1, &a).await.ok);
-    let stored = Store::open(&directory.path().join("hub.sqlite"))
+    let stored = Store::open(&directory.path().join("hub.sqlite"), SpaceId::new("w1"))
         .unwrap()
         .load()
         .unwrap();
     assert_eq!(
-        stored.snapshot(vec![], None, now()).resets[&SpaceId::new("w1")].participants[0].state,
+        stored
+            .snapshot(None, None, now())
+            .reset
+            .unwrap()
+            .participants[0]
+            .state,
         ResetAgentState::Claimed
     );
     assert!(
@@ -381,12 +465,9 @@ async fn old_sockets_cached_requests_and_disconnect_cannot_affect_fresh_replacem
         response.await.unwrap().is_err(),
         "pre-reset mode action must not re-enable after completion"
     );
-    assert!(!service.snapshots.borrow().automation[&SpaceId::new("w1")].todo_enabled);
+    assert!(!service.snapshots.borrow().automation.todo_enabled);
     assert!(
-        service
-            .reset_abandon(SpaceId::new("w1"), b.plan_id)
-            .await
-            .is_err(),
+        service.reset_abandon(b.plan_id).await.is_err(),
         "completion wins; abandonment must not undo it"
     );
     service.stop().await;
@@ -413,7 +494,7 @@ async fn abandon_revokes_old_connections_but_keeps_verified_fresh_connections_an
         )
         .unwrap();
     let (service, handle) = spawn(actor, snapshots);
-    let preview = service.reset_preview(SpaceId::new("w1")).await.unwrap();
+    let preview = service.reset_preview().await.unwrap();
     service.reset_start(preview).await.unwrap();
     let a = receipt(&poll(&service, 1).await);
     let b = receipt(&poll(&service, 2).await);
@@ -425,10 +506,7 @@ async fn abandon_revokes_old_connections_but_keeps_verified_fresh_connections_an
             .unwrap()
             .ok
     );
-    service
-        .reset_abandon(SpaceId::new("w1"), b.plan_id.clone())
-        .await
-        .unwrap();
+    service.reset_abandon(b.plan_id.clone()).await.unwrap();
     assert!(
         !service
             .request(
@@ -450,7 +528,7 @@ async fn abandon_revokes_old_connections_but_keeps_verified_fresh_connections_an
     assert_eq!(fresh["tasks"].as_array().unwrap().len(), 1);
     assert_eq!(fresh["tasks"][0]["state"], "paused");
     assert_eq!(
-        service.snapshots.borrow().resets[&SpaceId::new("w1")].state,
+        service.snapshots.borrow().reset.as_ref().unwrap().state,
         ResetPhase::Abandoned
     );
     // Unclaimed old identity can explicitly rejoin; a claimed one is retired.
@@ -564,7 +642,7 @@ async fn failed_final_receipt_keeps_history_claim_and_fence_durable() {
     let control = poll(&service, 2).await;
     assert_eq!(control["reset_control"]["state"], "claimed");
     assert!(!claim(&service, 2, &b).await.ok);
-    let stored = Store::open(&directory.path().join("hub.sqlite"))
+    let stored = Store::open(&directory.path().join("hub.sqlite"), SpaceId::new("w1"))
         .unwrap()
         .load()
         .unwrap();
@@ -579,21 +657,23 @@ async fn failed_final_receipt_keeps_history_claim_and_fence_durable() {
 async fn restart_retains_partial_plan_no_claim_retry_and_human_abandon_reopens_safely() {
     let (actor, directory, snapshots) = fixture();
     let (service, handle) = spawn(actor, snapshots);
-    let preview = service.reset_preview(SpaceId::new("w1")).await.unwrap();
+    let preview = service.reset_preview().await.unwrap();
     service.reset_start(preview).await.unwrap();
     let a = receipt(&poll(&service, 1).await);
     let b = receipt(&poll(&service, 2).await);
     assert!(claim(&service, 1, &a).await.ok);
     service.stop().await;
     handle.await.unwrap();
-    let (snapshots, receiver) = watch::channel(Snapshot::default());
+    let space_id = SpaceId::new("w1");
+    let (snapshots, receiver) = watch::channel(Snapshot::empty(space_id.clone()));
     let mut actor = Actor::new(
+        space_id,
         directory.path().join("hub.sqlite"),
         Scheduling::default(),
         snapshots,
     )
     .unwrap();
-    actor.spaces.push(Space {
+    actor.space = Some(Space {
         id: SpaceId::new("w1"),
         label: "One".into(),
     });
@@ -638,10 +718,7 @@ async fn restart_retains_partial_plan_no_claim_retry_and_human_abandon_reopens_s
         !claim(&service, 11, &b).await.ok,
         "restart requires human recovery even for unclaimed blocked participants"
     );
-    service
-        .reset_abandon(SpaceId::new("w1"), a.plan_id.clone())
-        .await
-        .unwrap();
+    service.reset_abandon(a.plan_id.clone()).await.unwrap();
     assert!(
         !service
             .request(12, join("late-fresh", "architect", "w1:p1", Some(a)))

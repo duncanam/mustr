@@ -13,16 +13,26 @@ fn request(id: &str, command: Command) -> Request {
 async fn socket_join(
     service: &Service,
     herdr: &Herdr,
+    bound_space: &SpaceId,
     roles_dir: &std::path::Path,
     connection_id: u64,
     request: Request,
 ) -> Response {
     let (server_stream, client_stream) = UnixStream::pair().unwrap();
     let herdr = herdr.clone();
+    let bound_space = bound_space.clone();
     let service = service.clone();
     let roles_dir = roles_dir.to_path_buf();
     let task = tokio::spawn(async move {
-        connection(server_stream, connection_id, &herdr, &service, &roles_dir).await
+        connection(
+            server_stream,
+            connection_id,
+            &herdr,
+            &bound_space,
+            &service,
+            &roles_dir,
+        )
+        .await
     });
     let mut client = client_stream;
     client
@@ -57,6 +67,33 @@ async fn serve_one_pane_request(listener: UnixListener) {
         .unwrap();
 }
 
+#[test]
+fn legacy_lock_probe_is_non_creating_and_detects_an_existing_exclusive_lock() {
+    let directory = tempfile::tempdir().unwrap();
+    let herdr_path = directory.path().join("herdr.sock");
+    fs::write(&herdr_path, b"fixture").unwrap();
+    let herdr = Herdr::new(herdr_path).unwrap();
+    let lock_path = herdr.legacy_hub_socket().unwrap().with_extension("lock");
+
+    reject_running_legacy_hub(&herdr).unwrap();
+    assert!(
+        !lock_path.exists(),
+        "absent legacy locks must not be created"
+    );
+
+    let lock = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&lock_path)
+        .unwrap();
+    lock.try_lock().unwrap();
+    let error = reject_running_legacy_hub(&herdr).unwrap_err();
+    assert!(error.to_string().contains("legacy session-wide mustr hub"));
+    drop(lock);
+    fs::remove_file(lock_path).unwrap();
+}
+
 #[tokio::test]
 async fn invalid_reset_receipt_join_does_not_consume_valid_admission() {
     let directory = tempfile::tempdir().unwrap();
@@ -69,6 +106,7 @@ async fn invalid_reset_receipt_join_does_not_consume_valid_admission() {
     )
     .unwrap();
     let service = Service::start(
+        SpaceId::new("w1"),
         directory.path().join("hub.sqlite"),
         crate::config::Scheduling::default(),
     )
@@ -113,13 +151,13 @@ async fn invalid_reset_receipt_join_does_not_consume_valid_admission() {
         .unwrap();
     service
         .tx
-        .send(Event::Spaces(Ok(vec![Space {
+        .send(Event::Space(Ok(Space {
             id: space.clone(),
             label: "Fixture".into(),
-        }])))
+        })))
         .await
         .unwrap();
-    let preview = service.reset_preview(space.clone()).await.unwrap();
+    let preview = service.reset_preview().await.unwrap();
     service.reset_start(preview).await.unwrap();
     let reset_sync = service
         .request(
@@ -160,6 +198,7 @@ async fn invalid_reset_receipt_join_does_not_consume_valid_admission() {
     let invalid = socket_join(
         &service,
         &herdr,
+        &space,
         &roles_dir,
         2,
         request(
@@ -184,6 +223,7 @@ async fn invalid_reset_receipt_join_does_not_consume_valid_admission() {
     let retry = socket_join(
         &service,
         &herdr,
+        &space,
         &roles_dir,
         3,
         request(
@@ -194,7 +234,7 @@ async fn invalid_reset_receipt_join_does_not_consume_valid_admission() {
                 name: "worker".into(),
                 role: "valid".into(),
                 pane_id: "w1:p1".into(),
-                space_id: space,
+                space_id: space.clone(),
                 reset: Some(receipt),
             },
         ),

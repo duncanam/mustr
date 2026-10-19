@@ -46,6 +46,10 @@ impl Paths {
     pub fn roles(&self) -> PathBuf {
         self.config.join("roles")
     }
+
+    pub fn instance_state(&self, server_key: &str, instance_key: &str) -> PathBuf {
+        self.state.join(server_key).join(instance_key)
+    }
 }
 
 pub(crate) fn private_dir(path: &Path) -> Result<()> {

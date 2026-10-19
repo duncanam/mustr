@@ -1,14 +1,14 @@
 //! Unix socket host and bounded read-only observers. Owns no agent processes.
 
 use std::{
-    collections::BTreeMap,
     fs::{self, File, OpenOptions},
     os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
+use clap_verbosity_flag::{InfoLevel, Verbosity};
 use color_eyre::eyre::{Context, Result, ensure, eyre};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
@@ -30,7 +30,6 @@ use crate::{
 
 pub(crate) struct Server {
     pub service: Service,
-    pub initial_space: SpaceId,
     stop: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
     socket: PathBuf,
@@ -38,9 +37,16 @@ pub(crate) struct Server {
 }
 
 impl Server {
-    pub async fn start(herdr: Herdr, paths: &Paths, config: &Config) -> Result<Self> {
+    pub async fn start(
+        herdr: Herdr,
+        paths: &Paths,
+        config: &Config,
+        verbosity: Verbosity<InfoLevel>,
+    ) -> Result<Self> {
         let discovery = herdr.discovery().await?;
-        let socket = herdr.hub_socket()?;
+        let space_id = discovery.space_id;
+        let instance_key = herdr.instance_key(&space_id);
+        let socket = herdr.hub_socket(&space_id)?;
         let lock_path = socket.with_extension("lock");
         let lock = OpenOptions::new()
             .read(true)
@@ -51,7 +57,14 @@ impl Server {
             .open(&lock_path)?;
         check_regular(&lock_path)?;
         lock.try_lock()
-            .map_err(|_| eyre!("a mustr hub is already running for this herdr session"))?;
+            .map_err(|_| eyre!("a mustr hub is already running for this herdr space"))?;
+        reject_running_legacy_hub(&herdr)?;
+        private_dir(&paths.state)?;
+        let server_dir = paths.state.join(&herdr.key);
+        private_dir(&server_dir)?;
+        let state_dir = paths.instance_state(&herdr.key, &instance_key);
+        private_dir(&state_dir)?;
+        init_logging(&state_dir, verbosity)?;
         match fs::symlink_metadata(&socket) {
             Ok(meta) => {
                 ensure!(
@@ -63,10 +76,12 @@ impl Server {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
-        let state_dir = paths.state.join(&herdr.key);
-        private_dir(&state_dir)?;
-        let service =
-            Service::start(state_dir.join("hub.sqlite"), config.scheduling.clone()).await?;
+        let service = Service::start(
+            space_id.clone(),
+            state_dir.join("hub.sqlite"),
+            config.scheduling.clone(),
+        )
+        .await?;
         let listener = UnixListener::bind(&socket).wrap_err("binding mustr socket")?;
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
         let (stop, stopping) = watch::channel(false);
@@ -74,16 +89,16 @@ impl Server {
             tokio::spawn(accept_loop(
                 listener,
                 herdr.clone(),
+                space_id.clone(),
                 service.clone(),
                 paths.roles(),
                 stopping.clone(),
             )),
-            tokio::spawn(observe(herdr, service.clone(), stopping)),
+            tokio::spawn(observe(herdr, space_id, service.clone(), stopping)),
         ];
         tracing::info!(socket = %socket.display(), "hub started");
         Ok(Self {
             service,
-            initial_space: discovery.space_id,
             stop,
             tasks,
             socket,
@@ -103,6 +118,57 @@ impl Server {
     }
 }
 
+fn reject_running_legacy_hub(herdr: &Herdr) -> Result<()> {
+    let legacy_socket = herdr.legacy_hub_socket()?;
+    let lock_path = legacy_socket.with_extension("lock");
+    match fs::symlink_metadata(&lock_path) {
+        Ok(meta) => ensure!(
+            meta.is_file(),
+            "refusing to inspect non-regular legacy lock"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    }
+    let lock = OpenOptions::new().read(true).write(true).open(&lock_path)?;
+    check_regular(&lock_path)?;
+    match lock.try_lock_shared() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(eyre!(
+                "a legacy session-wide mustr hub is already running; stop it before starting per-space hubs"
+            ));
+        }
+        Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn init_logging(state_dir: &Path, verbosity: Verbosity<InfoLevel>) -> Result<()> {
+    let log = state_dir.join("mustr.log");
+    match fs::symlink_metadata(&log) {
+        Ok(meta) => {
+            ensure!(meta.is_file(), "refusing to use non-regular log file");
+            if meta.len() > 5 * 1024 * 1024 {
+                fs::rename(&log, log.with_extension("log.1"))?;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(&log)?;
+    check_regular(&log)?;
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(verbosity)
+        .with_writer(Arc::new(file))
+        .try_init()
+        .map_err(|error| eyre!("initializing logging: {error}"))
+}
+
 impl Drop for Server {
     fn drop(&mut self) {
         self.stop.send_replace(true);
@@ -116,6 +182,7 @@ impl Drop for Server {
 async fn accept_loop(
     listener: UnixListener,
     herdr: Herdr,
+    bound_space: SpaceId,
     service: Service,
     roles_dir: PathBuf,
     mut stop: watch::Receiver<bool>,
@@ -133,10 +200,10 @@ async fn accept_loop(
                     let Some(next) = sequence.checked_add(1) else { break; };
                     sequence = next;
                     let id = sequence;
-                    let herdr = herdr.clone(); let service = service.clone(); let roles_dir = roles_dir.clone();
+                    let herdr = herdr.clone(); let bound_space = bound_space.clone(); let service = service.clone(); let roles_dir = roles_dir.clone();
                     clients.spawn(async move {
                         let _permit = permit;
-                        if let Err(error) = connection(stream, id, &herdr, &service, &roles_dir).await { tracing::debug!(connection = id, %error, "participant disconnected"); }
+                        if let Err(error) = connection(stream, id, &herdr, &bound_space, &service, &roles_dir).await { tracing::debug!(connection = id, %error, "participant disconnected"); }
                         let _ = service.tx.send(Event::Disconnect(id)).await;
                     });
                 }
@@ -152,6 +219,7 @@ async fn connection(
     stream: UnixStream,
     id: u64,
     herdr: &Herdr,
+    bound_space: &SpaceId,
     service: &Service,
     roles_dir: &std::path::Path,
 ) -> Result<()> {
@@ -239,6 +307,7 @@ async fn connection(
         let mut checked_harness = None;
         if let Some((pane_id, space_id)) = &check {
             let validation = async {
+                ensure!(space_id == bound_space, "wrong mustr endpoint for this herdr space");
                 let pane = herdr.pane(pane_id).await?;
                 ensure!(
                     &pane.workspace_id == space_id
@@ -288,68 +357,79 @@ async fn connection(
     Ok(())
 }
 
-fn retire_jobs(
-    jobs: &mut BTreeMap<SpaceId, (u64, JoinHandle<()>)>,
-    snapshot: &Snapshot,
-    enabled: impl Fn(&Automation) -> bool,
-) {
-    jobs.retain(|space, (generation, job)| {
-        let current = snapshot
-            .automation
-            .get(space)
-            .is_some_and(|a| enabled(a) && a.generation == *generation);
-        if !current {
-            // A blocking read can outlive abort; the actor also checks generation.
-            job.abort();
-        }
-        current
-    });
+fn retire_job(job: &mut Option<(u64, JoinHandle<()>)>, generation: u64, enabled: bool) {
+    if job
+        .as_ref()
+        .is_some_and(|(running_generation, _)| !enabled || *running_generation != generation)
+        && let Some((_, job)) = job.take()
+    {
+        // A blocking read can outlive abort; the actor also checks generation.
+        job.abort();
+    }
 }
 
-async fn observe(herdr: Herdr, service: Service, mut stop: watch::Receiver<bool>) {
+async fn observe(
+    herdr: Herdr,
+    bound_space_id: SpaceId,
+    service: Service,
+    mut stop: watch::Receiver<bool>,
+) {
     let mut ticks = interval(Duration::from_secs(1));
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut topology_at = 0;
-    let mut todo_jobs: BTreeMap<SpaceId, (u64, JoinHandle<()>)> = BTreeMap::new();
-    let mut pr_jobs: BTreeMap<SpaceId, (u64, JoinHandle<()>)> = BTreeMap::new();
+    let mut todo_job: Option<(u64, JoinHandle<()>)> = None;
+    let mut pr_job: Option<(u64, JoinHandle<()>)> = None;
     loop {
         tokio::select! {
             _ = stop.changed() => break,
             _ = ticks.tick() => {
                 let time = now();
                 if time >= topology_at {
-                    let result = herdr.spaces().await.map_err(|e| e.to_string());
-                    let _ = service.tx.send(Event::Spaces(result)).await;
+                    let result = herdr.space(&bound_space_id).await
+                        .map_err(|error| error.to_string());
+                    let _ = service.tx.send(Event::Space(result)).await;
                     topology_at = time + 3;
                 }
                 let _ = service.tx.send(Event::Tick).await;
                 let snapshot = service.snapshots.borrow().clone();
-                retire_jobs(&mut todo_jobs, &snapshot, |a| a.todo_enabled);
-                retire_jobs(&mut pr_jobs, &snapshot, |a| a.pr_enabled);
-                for (space, automation) in &snapshot.automation {
-                    if automation.todo_enabled && todo_jobs.get(space).is_none_or(|(_, job)| job.is_finished())
-                        && let Some(todo) = &automation.todo {
-                        let path = todo.path.clone(); let tx = service.tx.clone(); let space_id = space.clone(); let generation = automation.generation;
-                        let task = tokio::spawn(async move {
-                            let result = tokio::task::spawn_blocking(move || watchers::read_todo(&path).map_err(|e| e.to_string())).await.unwrap_or_else(|e| Err(e.to_string()));
-                            let _ = tx.send(Event::Todo { space: space_id, generation, result }).await;
-                        });
-                        todo_jobs.insert(space.clone(), (generation, task));
-                    }
-                    if automation.pr_enabled && pr_jobs.get(space).is_none_or(|(_, job)| job.is_finished())
-                        && let Some(pr) = &automation.pr && time >= pr.next_at {
-                        let pr = pr.clone(); let tx = service.tx.clone(); let space_id = space.clone(); let generation = automation.generation;
-                        let task = tokio::spawn(async move {
-                            let result = watchers::collect_pr(&pr).await.map_err(|e| e.to_string());
-                            let _ = tx.send(Event::Pr { space: space_id, generation, result }).await;
-                        });
-                        pr_jobs.insert(space.clone(), (generation, task));
-                    }
+                let automation = &snapshot.automation;
+                retire_job(&mut todo_job, automation.generation, automation.todo_enabled);
+                retire_job(&mut pr_job, automation.generation, automation.pr_enabled);
+                if automation.todo_enabled
+                    && todo_job.as_ref().is_none_or(|(_, job)| job.is_finished())
+                    && let Some(todo) = &automation.todo {
+                    let path = todo.path.clone();
+                    let tx = service.tx.clone();
+                    let space_id = bound_space_id.clone();
+                    let generation = automation.generation;
+                    let task = tokio::spawn(async move {
+                        let result = tokio::task::spawn_blocking(move || watchers::read_todo(&path).map_err(|e| e.to_string()))
+                            .await.unwrap_or_else(|e| Err(e.to_string()));
+                        let _ = tx.send(Event::Todo { space: space_id, generation, result }).await;
+                    });
+                    todo_job = Some((generation, task));
+                }
+                if automation.pr_enabled
+                    && pr_job.as_ref().is_none_or(|(_, job)| job.is_finished())
+                    && let Some(pr) = &automation.pr
+                    && time >= pr.next_at {
+                    let pr = pr.clone();
+                    let tx = service.tx.clone();
+                    let space_id = bound_space_id.clone();
+                    let generation = automation.generation;
+                    let task = tokio::spawn(async move {
+                        let result = watchers::collect_pr(&pr).await.map_err(|e| e.to_string());
+                        let _ = tx.send(Event::Pr { space: space_id, generation, result }).await;
+                    });
+                    pr_job = Some((generation, task));
                 }
             }
         }
     }
-    for (_, (_, job)) in todo_jobs.into_iter().chain(pr_jobs) {
+    if let Some((_, job)) = todo_job {
+        job.abort();
+    }
+    if let Some((_, job)) = pr_job {
         job.abort();
     }
 }

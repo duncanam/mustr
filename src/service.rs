@@ -24,7 +24,7 @@ pub(crate) enum Event {
         reply: oneshot::Sender<Response>,
     },
     Disconnect(u64),
-    Spaces(std::result::Result<Vec<Space>, String>),
+    Space(std::result::Result<Space, String>),
     Tick,
     Mode {
         space: SpaceId,
@@ -61,26 +61,32 @@ pub(crate) enum Event {
 
 #[derive(Clone)]
 pub(crate) struct Service {
+    pub space_id: SpaceId,
     pub tx: mpsc::Sender<Event>,
     pub snapshots: watch::Receiver<Snapshot>,
 }
 
 impl Service {
-    pub async fn start(path: PathBuf, scheduling: Scheduling) -> Result<Self> {
+    pub async fn start(space_id: SpaceId, path: PathBuf, scheduling: Scheduling) -> Result<Self> {
         let (tx, rx) = mpsc::channel(128);
-        let (snapshots, snapshot_rx) = watch::channel(Snapshot::default());
+        let (snapshots, snapshot_rx) = watch::channel(Snapshot::empty(space_id.clone()));
         let (ready_tx, ready_rx) = oneshot::channel();
-        tokio::task::spawn_blocking(move || match Actor::new(path, scheduling, snapshots) {
-            Ok(mut actor) => {
-                let _ = ready_tx.send(Ok(()));
-                actor.run(rx);
-            }
-            Err(error) => {
-                let _ = ready_tx.send(Err(error.to_string()));
+        let actor_space = space_id.clone();
+        tokio::task::spawn_blocking(move || {
+            match Actor::new(actor_space, path, scheduling, snapshots) {
+                Ok(mut actor) => {
+                    actor.publish_snapshot(now());
+                    let _ = ready_tx.send(Ok(()));
+                    actor.run(rx);
+                }
+                Err(error) => {
+                    let _ = ready_tx.send(Err(error.to_string()));
+                }
             }
         });
         ready_rx.await?.map_err(|e| eyre!(e))?;
         Ok(Self {
+            space_id,
             tx,
             snapshots: snapshot_rx,
         })
@@ -98,18 +104,12 @@ impl Service {
         Ok(response.await?)
     }
 
-    pub async fn mode(&self, space: SpaceId, mode: Mode, enabled: bool) -> Result<()> {
+    pub async fn mode(&self, mode: Mode, enabled: bool) -> Result<()> {
         let (reply, response) = oneshot::channel();
-        let epoch = self
-            .snapshots
-            .borrow()
-            .space_epochs
-            .get(&space)
-            .copied()
-            .unwrap_or_default();
+        let epoch = self.snapshots.borrow().epoch;
         self.tx
             .send(Event::Mode {
-                space,
+                space: self.space_id.clone(),
                 mode,
                 enabled,
                 epoch,
@@ -119,9 +119,14 @@ impl Service {
         response.await?.map_err(|e| eyre!(e))
     }
 
-    pub async fn reset_preview(&self, space: SpaceId) -> Result<ResetPreview> {
+    pub async fn reset_preview(&self) -> Result<ResetPreview> {
         let (reply, response) = oneshot::channel();
-        self.tx.send(Event::ResetPreview { space, reply }).await?;
+        self.tx
+            .send(Event::ResetPreview {
+                space: self.space_id.clone(),
+                reply,
+            })
+            .await?;
         response.await?.map_err(|error| eyre!(error))
     }
 
@@ -131,11 +136,11 @@ impl Service {
         response.await?.map_err(|error| eyre!(error))
     }
 
-    pub async fn reset_abandon(&self, space: SpaceId, plan_id: String) -> Result<()> {
+    pub async fn reset_abandon(&self, plan_id: String) -> Result<()> {
         let (reply, response) = oneshot::channel();
         self.tx
             .send(Event::ResetAbandon {
-                space,
+                space: self.space_id.clone(),
                 plan_id,
                 reply,
             })
@@ -166,35 +171,39 @@ struct Preview {
 }
 
 struct Actor {
+    space_id: SpaceId,
     state: State,
     store: Store,
     scheduling: Scheduling,
     connections: BTreeMap<u64, Binding>,
     incarnations: BTreeMap<AgentId, u64>,
-    previews: BTreeMap<SpaceId, Preview>,
-    spaces: Vec<Space>,
+    preview: Option<Preview>,
+    space: Option<Space>,
     error: Option<String>,
     snapshots: watch::Sender<Snapshot>,
 }
 
 impl Actor {
     fn new(
+        space_id: SpaceId,
         path: PathBuf,
         scheduling: Scheduling,
         snapshots: watch::Sender<Snapshot>,
     ) -> Result<Self> {
-        let mut store = Store::open(&path)?;
+        let mut store = Store::open(&path, space_id.clone())?;
         let mut state = store.load()?;
+        state.validate_space(&space_id)?;
         state.recover();
         store.save(&state)?;
         Ok(Self {
+            space_id,
             state,
             store,
             scheduling,
             connections: BTreeMap::new(),
             incarnations: BTreeMap::new(),
-            previews: BTreeMap::new(),
-            spaces: Vec::new(),
+            preview: None,
+            space: None,
             error: None,
             snapshots,
         })
@@ -206,6 +215,14 @@ impl Actor {
             self.state = next;
         }
         Ok(())
+    }
+
+    fn publish_snapshot(&self, now: u64) {
+        self.snapshots.send_replace(self.state.snapshot(
+            self.space.clone(),
+            self.error.clone(),
+            now,
+        ));
     }
 
     fn binding_valid(&self, connection: u64, binding: &Binding) -> bool {
@@ -231,8 +248,14 @@ impl Actor {
 
     fn preview(&mut self, space: SpaceId) -> Result<ResetPreview> {
         ensure!(
-            self.spaces.iter().any(|s| s.id == space),
-            "space no longer exists; refresh before confirming"
+            space == self.space_id,
+            "control event belongs to another space"
+        );
+        ensure!(
+            self.space
+                .as_ref()
+                .is_some_and(|current| current.id == space),
+            "space is unavailable; refresh before confirming"
         );
         let mut approved = self.state.reset_preview(&space)?;
         approved.nonce = uuid::Uuid::new_v4().to_string();
@@ -249,25 +272,28 @@ impl Actor {
                 )
             })
             .collect();
-        self.previews.insert(
-            space.clone(),
-            Preview {
-                approved: approved.clone(),
-                fingerprint: self.state.reset_fingerprint(&space)?,
-                incarnations,
-            },
-        );
+        self.preview = Some(Preview {
+            approved: approved.clone(),
+            fingerprint: self.state.reset_fingerprint(&space)?,
+            incarnations,
+        });
         Ok(approved)
     }
 
     fn start_reset(&mut self, preview: ResetPreview) -> Result<()> {
         ensure!(
-            self.spaces.iter().any(|s| s.id == preview.space_id),
-            "space no longer exists; preview again"
+            preview.space_id == self.space_id,
+            "reset preview belongs to another space"
+        );
+        ensure!(
+            self.space
+                .as_ref()
+                .is_some_and(|current| current.id == preview.space_id),
+            "space is unavailable; preview again"
         );
         let approved = self
-            .previews
-            .get(&preview.space_id)
+            .preview
+            .as_ref()
             .ok_or_else(|| eyre!("preview expired; preview and confirm again"))?;
         ensure!(
             approved.approved == preview
@@ -284,7 +310,7 @@ impl Actor {
         let mut next = self.state.clone();
         next.start_reset(&preview)?;
         self.commit(next)?;
-        self.previews.remove(&preview.space_id);
+        self.preview = None;
         Ok(())
     }
 
@@ -367,12 +393,21 @@ impl Actor {
                         }
                     }
                 }
-                Event::Spaces(result) => match result {
-                    Ok(spaces) => {
-                        self.spaces = spaces;
+                Event::Space(result) => match result {
+                    Ok(space) if space.id == self.space_id => {
+                        self.space = Some(space);
                         self.error = None;
                     }
-                    Err(error) => self.error = Some(error),
+                    Ok(_) => {
+                        self.space = None;
+                        self.preview = None;
+                        self.error = Some("herdr returned metadata for another space".into());
+                    }
+                    Err(error) => {
+                        self.space = None;
+                        self.preview = None;
+                        self.error = Some(error);
+                    }
                 },
                 Event::Mode {
                     space,
@@ -383,6 +418,10 @@ impl Actor {
                 } => {
                     let mut next = self.state.clone();
                     let result = (|| {
+                        ensure!(
+                            space == self.space_id,
+                            "mode event belongs to another space"
+                        );
                         ensure!(
                             epoch == self.state.reset_epoch(&space),
                             "mode action predates reset; refresh first"
@@ -412,11 +451,13 @@ impl Actor {
                         .and_then(|()| self.commit(next))
                         .map_err(|e| e.to_string());
                     if result.is_ok() {
-                        let originals: Vec<_> = self.state.snapshot(Vec::new(), None, now).resets
-                            [&space]
-                            .participants
-                            .iter()
-                            .map(|p| p.participant.agent_id.clone())
+                        let originals: Vec<_> = self
+                            .state
+                            .snapshot(self.space.clone(), None, now)
+                            .reset
+                            .into_iter()
+                            .flat_map(|reset| reset.participants)
+                            .map(|progress| progress.participant.agent_id)
                             .collect();
                         for binding in self
                             .connections
@@ -460,11 +501,7 @@ impl Actor {
                     }
                 }
             }
-            self.snapshots.send_replace(self.state.snapshot(
-                self.spaces.clone(),
-                self.error.clone(),
-                now,
-            ));
+            self.publish_snapshot(now);
         }
     }
 }
@@ -487,8 +524,15 @@ mod tests {
     async fn no_inbox_sync_persists_cancellation_before_reply() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("hub.sqlite");
-        let (snapshots, snapshot_rx) = watch::channel(Snapshot::default());
-        let mut actor = Actor::new(path.clone(), Scheduling::default(), snapshots).unwrap();
+        let space = SpaceId::new("w1");
+        let (snapshots, snapshot_rx) = watch::channel(Snapshot::empty(space.clone()));
+        let mut actor = Actor::new(
+            space.clone(),
+            path.clone(),
+            Scheduling::default(),
+            snapshots,
+        )
+        .unwrap();
         let worker = AgentId::new("worker");
         actor.connections.insert(
             1,
@@ -531,6 +575,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         let handle = tokio::task::spawn_blocking(move || actor.run(rx));
         let service = Service {
+            space_id: SpaceId::new("w1"),
             tx,
             snapshots: snapshot_rx,
         };
@@ -550,7 +595,10 @@ mod tests {
         assert!(response.ok);
         assert!(response.result.unwrap()["inbox"].is_null());
         // Read before shutdown or any later durable operation can mask the bug.
-        let stored = Store::open(&path).unwrap().load().unwrap();
+        let stored = Store::open(&path, SpaceId::new("w1"))
+            .unwrap()
+            .load()
+            .unwrap();
         assert_eq!(stored.messages[0].delivery, Delivery::Cancelled);
         service.stop().await;
         handle.await.unwrap();
@@ -561,7 +609,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("hub.sqlite");
         let worker = AgentId::new("worker");
-        let mut state = State::default();
+        let mut state = State::new(SpaceId::new("w1"));
         for i in 0..1000 {
             state.messages.push(Message {
                 id: MessageId::new(format!("m{i}")),
@@ -578,8 +626,11 @@ mod tests {
                 pr_ack: None,
             });
         }
-        Store::open(&path).unwrap().save(&state).unwrap();
-        let service = Service::start(path.clone(), Scheduling::default())
+        Store::open(&path, SpaceId::new("w1"))
+            .unwrap()
+            .save(&state)
+            .unwrap();
+        let service = Service::start(SpaceId::new("w1"), path.clone(), Scheduling::default())
             .await
             .unwrap();
         for (connection, name) in [(1, "requester"), (2, "worker")] {
@@ -610,10 +661,16 @@ mod tests {
                 receive: false,
             },
         };
-        let before = Store::open(&path).unwrap().load().unwrap();
+        let before = Store::open(&path, SpaceId::new("w1"))
+            .unwrap()
+            .load()
+            .unwrap();
         service.request(2, sync()).await.unwrap();
         assert_eq!(
-            Store::open(&path).unwrap().load().unwrap(),
+            Store::open(&path, SpaceId::new("w1"))
+                .unwrap()
+                .load()
+                .unwrap(),
             before,
             "heartbeat must not rewrite durable state"
         );
@@ -634,7 +691,14 @@ mod tests {
         assert!(!response.ok);
         let snapshot = service.request(2, sync()).await.unwrap();
         assert_eq!(snapshot.result.unwrap()["tasks"], json!([]));
-        assert!(Store::open(&path).unwrap().load().unwrap().tasks.is_empty());
+        assert!(
+            Store::open(&path, SpaceId::new("w1"))
+                .unwrap()
+                .load()
+                .unwrap()
+                .tasks
+                .is_empty()
+        );
         service.stop().await;
     }
 }

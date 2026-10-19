@@ -21,7 +21,7 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
-    /// Start the hub and dashboard (also the default command).
+    /// Start the hub and dashboard for this herdr space (also the default command).
     Run {
         /// Run the hub without a terminal dashboard.
         #[arg(long)]

@@ -79,7 +79,10 @@ impl Dialog {
             }
             KeyCode::Char('a') if matches!(self.page, Page::Progress(_)) => {
                 if let Page::Progress(space) = &self.page
-                    && let Some(plan) = snapshot.resets.get(space)
+                    && let Some(plan) = snapshot
+                        .reset
+                        .as_ref()
+                        .filter(|plan| &plan.space_id == space)
                     && matches!(plan.state, ResetPhase::Prepared | ResetPhase::Incomplete)
                 {
                     *self = Self::new(Page::Abandon {
@@ -122,9 +125,9 @@ impl Dialog {
         match &self.page {
             Page::Confirm(preview) => {
                 let space_name = snapshot
-                    .spaces
-                    .iter()
-                    .find(|s| s.id == preview.space_id)
+                    .space
+                    .as_ref()
+                    .filter(|s| s.id == preview.space_id)
                     .map(|s| clean(&s.label))
                     .unwrap_or_else(|| clean(preview.space_id.as_str()));
                 let mut lines = vec![
@@ -169,7 +172,11 @@ impl Dialog {
                     format!("Fresh-start status: {}", clean(space.as_str())),
                     bold(),
                 )];
-                if let Some(plan) = snapshot.resets.get(space) {
+                if let Some(plan) = snapshot
+                    .reset
+                    .as_ref()
+                    .filter(|plan| &plan.space_id == space)
+                {
                     lines.push(Line::raw(format!("State: {:?}", plan.state)));
                     lines.push(Line::raw(clean(&plan.note)));
                     for progress in &plan.participants {

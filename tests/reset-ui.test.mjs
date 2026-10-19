@@ -73,24 +73,22 @@ async function forbiddenSocketOperation(socketPath, op) {
   } finally { socket.destroy(); }
 }
 
-function scoped(state, space) {
-  return {
-    tasks: state.tasks.filter(task => task.space_id === space),
-    messages: state.messages.filter(message => message.space_id === space),
-    automation: state.automation[space],
-  };
+function workload(state) {
+  return { tasks: state.tasks, messages: state.messages, automation: state.automation };
 }
 
-test("TUI reset: empty Enter/Esc preserve history; typed RESET alone clears exact hub space", {
-  timeout: 30000, skip: !["darwin", "linux"].includes(process.platform),
+test("fixed-space TUI: switch keys are inert, reset affects only this instance, metadata never retargets", {
+  timeout: 45000, skip: !["darwin", "linux"].includes(process.platform),
 }, async t => {
   const f = await fixture(t);
   f.panes.set("w2:p2", { pane_id: "w2:p2", workspace_id: "w2", agent: "pi" });
+  const otherDiscovery = await f.discover("w2:p1");
+  await f.start({ paneId: "w2:p1" });
   const project = `${f.directory}/reset-pty`; await mkdir(project);
   await writeFile(`${project}/pyproject.toml`, '[project]\nname = "mustr-reset-pty-test"\nversion = "0.0.0"\nrequires-python = ">=3.9"\ndependencies = []\n');
   const child = spawn("uv", ["run", "--project", project,
     fileURLToPath(new URL("reset-pty.py", import.meta.url)), binary,
-    `${f.env.MUSTR_STATE_DIR}/${f.discovery.server_key}/hub.sqlite`,
+    f.database(f.discovery), f.database(otherDiscovery),
   ], { env: { ...f.env, TERM: "xterm-256color" }, stdio: ["pipe", "pipe", "pipe"] });
   f.track(child);
   const exited = new Promise(resolve => {
@@ -99,13 +97,21 @@ test("TUI reset: empty Enter/Esc preserve history; typed RESET alone clears exac
   });
   const request = controller(child);
   const screen = (keys, contains = [], absent = []) => request({ op: "screen", keys, contains, absent });
-  const state = () => request({ op: "state" });
+  const state = (space = "w1") => request({ op: "state", database: space === "w1" ? 0 : 1 });
   let quit = false;
   try {
-    await screen("", ["mustr", "First", "1/2"]);
+    await screen("", ["mustr", "Space", "First · w1"], ["Spaces", "Second", "1/2"]);
+    for (const key of ["\t", "\x1b[Z", "\x1b[C", "\x1b[D", "h", "l"]) {
+      // The following help toggle acknowledges processing the preceding key,
+      // including an inert key that produces no terminal output of its own.
+      await screen(key + "?", ["First · w1", "Keyboard"], ["Second", "Spaces"]);
+      await screen("\x1b", ["First · w1", "Messages"], ["Keyboard"]);
+    }
+    await screen("f", ["First · w1", "No tasks assigned."], ["No addressed messages yet."]);
+    await screen("f", ["First · w1", "No addressed messages yet."], ["No tasks assigned."]);
     async function join(id, pane, space) {
       const client = new HubClient(); t.after(() => client.close());
-      await client.connect(f.discovery.socket, { agent_id: id, name: id, role: "implementor", pane_id: pane, space_id: space });
+      await client.connect(space === "w1" ? f.discovery.socket : otherDiscovery.socket, { agent_id: id, name: id, role: "implementor", pane_id: pane, space_id: space });
       await client.request({ op: "sync", activity: "idle", receive: false });
       return client;
     }
@@ -134,44 +140,57 @@ test("TUI reset: empty Enter/Esc preserve history; typed RESET alone clears exac
     assert.ok(tools.includes("mustr_roster"));
     assert.ok(tools.every(name => !/reset|fresh/i.test(name)), "no model-callable reset tool");
 
-    const before = await state();
-    assert.equal(before.members.filter(member => member.space_id === "w1" && member.activity !== "offline").length, 0);
-    assert.equal(scoped(before, "w1").tasks.length, 1);
-    assert.equal(scoped(before, "w1").messages.length, 2);
-    assert.equal(scoped(before, "w1").automation.todo.path, todo);
-    assert.equal(scoped(before, "w1").automation.checkin_enabled, true);
-    assert.equal(scoped(before, "w2").automation.checkin_enabled, true);
-    assert.equal(before.resets.w1, undefined);
-    const expectedTarget = scoped(before, "w1"), expectedOther = scoped(before, "w2");
+    const before = await state(), otherBefore = await state("w2");
+    assert.equal(before.space_id, "w1");
+    assert.equal(otherBefore.space_id, "w2");
+    assert.equal(before.members.filter(member => member.activity !== "offline").length, 0);
+    assert.equal(before.tasks.length, 1);
+    assert.equal(before.messages.length, 2);
+    assert.equal(before.automation.todo.path, todo);
+    assert.equal(before.automation.checkin_enabled, true);
+    assert.equal(otherBefore.automation.checkin_enabled, true);
+    assert.equal(before.reset, null);
+    const expectedTarget = workload(before), expectedOther = workload(otherBefore);
 
     const confirmation = await screen("r", ["Start fresh?", "1 tasks and 2 messages", "0 connected agents only", "NOT remotely cleared", "Type RESET, then press Enter to confirm", "Confirmation: _", "Esc or empty Enter: Cancel"]);
     assert.ok(confirmation.includes("First (w1)"));
     await screen("\r", ["Messages"], ["Start fresh?"]);
-    assert.deepEqual(scoped(await state(), "w1"), expectedTarget, "empty Enter must not clear or detach anything");
-    assert.equal((await state()).resets.w1, undefined);
+    assert.deepEqual(workload(await state()), expectedTarget, "empty Enter must not clear or detach anything");
+    assert.equal((await state()).reset, null);
 
     await screen("r", ["Start fresh?"]);
     await screen("\t\x1b[Ctcpf", ["Start fresh?", "Confirmation: TCPF", "Esc or empty Enter: Cancel"]);
     await screen("\x1b", ["Messages", "First"], ["Start fresh?"]);
-    assert.deepEqual(scoped(await state(), "w1"), expectedTarget, "Esc and modal keys must preserve history/modes/binding");
-    assert.equal((await state()).resets.w1, undefined);
+    assert.deepEqual(workload(await state()), expectedTarget, "Esc and modal keys must preserve history/modes/binding");
+    assert.equal((await state()).reset, null);
 
     await screen("r", ["Start fresh?", "First (w1)", "Read all details before confirming"]);
     await screen("RESET\r", ["Fresh-start progress", "State: Completed"]);
     const after = await state();
-    assert.deepEqual(scoped(after, "w1").tasks, []);
-    assert.deepEqual(scoped(after, "w1").messages, []);
-    const automation = scoped(after, "w1").automation;
+    assert.deepEqual(after.tasks, []);
+    assert.deepEqual(after.messages, []);
+    const automation = after.automation;
     assert.equal(automation.todo, null);
     assert.equal(automation.pr, null);
     assert.equal(automation.todo_enabled, false);
     assert.equal(automation.checkin_enabled, false);
     assert.equal(automation.pr_enabled, false);
-    assert.deepEqual(after.resets.w1, { state: "completed", participants: 0 });
-    assert.deepEqual(scoped(after, "w2"), expectedOther, "other-space task/message/TODO history is untouched");
+    assert.deepEqual(after.reset, { state: "completed", participants: 0 });
+    assert.deepEqual(workload(await state("w2")), expectedOther, "separate instance task/message/TODO history is untouched");
     assert.equal(await readFile(todo, "utf8"), todoText);
     assert.equal(await readFile(otherTodo, "utf8"), todoText);
     await screen("\x1b", ["Messages"], ["Fresh-start progress"]);
+    f.spaces.set("w1", { workspace_id: "w1", label: "Renamed" });
+    await screen("", ["Renamed · w1"], ["First · w1", "Second"]);
+    f.spaces.delete("w1");
+    f.spaces.set("w2", { workspace_id: "w2", label: "First" });
+    await screen("", ["w1 · unavailable", "Bound space w1 is unavailable.", "This dashboard never switches spaces."], ["First · w2"]);
+    for (const key of ["\t", "\x1b[Z", "\x1b[C", "\x1b[D", "h", "l"]) {
+      await screen(key + "?", ["w1 · unavailable", "Keyboard"], ["First · w2"]);
+      await screen("\x1b", ["w1 · unavailable", "Bound space w1 is unavailable."], ["Keyboard", "First · w2"]);
+    }
+    f.spaces.set("w1", { workspace_id: "w1", label: "Returned" });
+    await screen("", ["Returned · w1", "Messages"], ["unavailable", "First · w2"]);
     const exit = await request({ op: "quit" }); quit = true;
     assert.deepEqual(exit, { code: 0, entered: true, restored: true });
     assert.deepEqual(await exited, [0, null]);

@@ -70,7 +70,10 @@ fn fresh_join(
     config: &Scheduling,
 ) -> Result<Value> {
     let member = state.members.get(old).cloned().unwrap_or_else(|| {
-        let progress = state.snapshot(vec![], None, 1).resets[&SpaceId::new("w1")]
+        let progress = state
+            .snapshot(None, None, 1)
+            .reset
+            .unwrap()
             .participants
             .iter()
             .find(|p| &p.participant.agent_id == old)
@@ -112,7 +115,73 @@ fn begin(state: &mut State) {
 }
 
 #[test]
-fn scoped_completion_clears_all_history_bindings_and_cache_not_other_spaces() {
+fn direct_join_mode_and_reset_apis_reject_foreign_space_ids() {
+    let (mut state, architect, _, config) = fixture();
+    let before = state.clone();
+    assert!(
+        state
+            .apply(
+                &request(
+                    "foreign-join",
+                    Command::Join {
+                        version: VERSION,
+                        agent_id: AgentId::new("foreign"),
+                        name: "foreign".into(),
+                        role: "custom".into(),
+                        pane_id: "w2:p1".into(),
+                        space_id: SpaceId::new("w2"),
+                        reset: None,
+                    },
+                ),
+                None,
+                0,
+                &config,
+            )
+            .is_err()
+    );
+    assert_eq!(state, before);
+    assert!(
+        state
+            .set_mode(&SpaceId::new("w2"), Mode::Checkin, true, 0)
+            .is_err()
+    );
+    assert!(state.reset_preview(&SpaceId::new("w2")).is_err());
+    assert!(state.abandon_reset(&SpaceId::new("w2"), "foreign").is_err());
+
+    let mut preview = state.reset_preview(&SpaceId::new("w1")).unwrap();
+    preview.space_id = SpaceId::new("w2");
+    assert!(state.start_reset(&preview).is_err());
+    assert!(!state.reset_frozen(&SpaceId::new("w1")));
+
+    begin(&mut state);
+    let receipt = ticket(&mut state, &architect, &config);
+    let before = state.clone();
+    assert!(
+        state
+            .apply(
+                &request(
+                    "foreign-reset-join",
+                    Command::Join {
+                        version: VERSION,
+                        agent_id: AgentId::new("fresh"),
+                        name: "architect".into(),
+                        role: "custom".into(),
+                        pane_id: "w1:p1".into(),
+                        space_id: SpaceId::new("w2"),
+                        reset: Some(receipt),
+                    },
+                ),
+                None,
+                2,
+                &config,
+            )
+            .is_err()
+    );
+    assert_eq!(state, before);
+}
+
+#[test]
+fn completion_clears_single_space_history_and_retains_safe_reset_fences() {
     let (mut state, architect, worker, config) = fixture();
     let task = assign(&mut state, &architect, &worker, &config);
     let template = state.tasks[&task].clone();
@@ -144,62 +213,8 @@ fn scoped_completion_clears_all_history_bindings_and_cache_not_other_spaces() {
     offline.id = AgentId::new("offline-history");
     offline.activity = Activity::Offline;
     state.members.insert(offline.id.clone(), offline);
-    let other = AgentId::new("other");
-    state
-        .apply(
-            &request(
-                "other-join",
-                Command::Join {
-                    version: VERSION,
-                    agent_id: other.clone(),
-                    name: "other".into(),
-                    role: "custom".into(),
-                    pane_id: "w2:p1".into(),
-                    space_id: SpaceId::new("w2"),
-                    reset: None,
-                },
-            ),
-            None,
-            0,
-            &config,
-        )
-        .unwrap();
-    state
-        .apply(
-            &request(
-                "other-send",
-                Command::Send {
-                    to: other.clone(),
-                    text: "Keep this history".into(),
-                    wake: false,
-                },
-            ),
-            Some(&other),
-            0,
-            &config,
-        )
-        .unwrap();
-    state
-        .automation
-        .get_mut(&SpaceId::new("w2"))
-        .unwrap()
-        .generation = 42;
-    let other_member = state.members[&other].clone();
-    let other_messages: Vec<_> = state
-        .messages
-        .iter()
-        .filter(|m| m.space_id == SpaceId::new("w2"))
-        .cloned()
-        .collect();
-    let other_cache: Vec<_> = state
-        .cache
-        .iter()
-        .filter(|c| c.sender == other)
-        .cloned()
-        .collect();
-    let other_automation = state.automation[&SpaceId::new("w2")].clone();
     attach_pr(&mut state, &worker);
-    state.automation.get_mut(&SpaceId::new("w1")).unwrap().todo = Some(TodoWatch {
+    state.automation.todo = Some(TodoWatch {
         path: "/fixture/TODO.md".into(),
         driver: worker.clone(),
         total: 3,
@@ -214,11 +229,11 @@ fn scoped_completion_clears_all_history_bindings_and_cache_not_other_spaces() {
     assert_eq!(preview.message_count, 301);
     assert_eq!(preview.offline_count, 1);
     state.start_reset(&preview).unwrap();
-    assert_eq!(state.messages.len(), 302, "retain data until all receipts");
+    assert_eq!(state.messages.len(), 301, "retain data until all receipts");
     let a = ticket(&mut state, &architect, &config);
     let b = ticket(&mut state, &worker, &config);
-    assert!(!state.snapshot(vec![], None, 1).ready.contains_key(&worker));
-    let public = serde_json::to_string(&state.snapshot(vec![], None, 1)).unwrap();
+    assert!(!state.snapshot(None, None, 1).ready.contains_key(&worker));
+    let public = serde_json::to_string(&state.snapshot(None, None, 1)).unwrap();
     assert!(!public.contains(&a.token));
     assert!(!public.contains(&b.token));
     claim(&mut state, &architect, &a, &config).unwrap();
@@ -229,35 +244,36 @@ fn scoped_completion_clears_all_history_bindings_and_cache_not_other_spaces() {
     fresh_join(&mut state, &worker, "worker-fresh", &b, &config).unwrap();
     assert!(!state.reset_frozen(&SpaceId::new("w1")));
     assert!(state.tasks.is_empty());
-    assert_eq!(state.messages, other_messages);
-    assert_eq!(state.cache, other_cache);
-    assert_eq!(state.members[&other], other_member);
-    assert_eq!(state.automation[&SpaceId::new("w2")], other_automation);
-    let automation = &state.automation[&SpaceId::new("w1")];
-    assert!(!automation.todo_enabled && !automation.checkin_enabled && !automation.pr_enabled);
-    assert!(automation.todo.is_none() && automation.pr.is_none());
-    assert!(automation.generation > 0);
-    assert_eq!(state.members.len(), 3);
-    assert!(state.retired.contains_key(&architect));
-    assert!(state.retired.contains_key(&worker));
-    assert!(state.retired.contains_key(&AgentId::new("offline-history")));
+    assert!(state.messages.is_empty());
+    assert!(state.cache.is_empty());
+    assert!(
+        !state.automation.todo_enabled
+            && !state.automation.checkin_enabled
+            && !state.automation.pr_enabled
+    );
+    assert!(state.automation.todo.is_none() && state.automation.pr.is_none());
+    assert!(state.automation.generation > 0);
+    assert_eq!(state.members.len(), 2);
+    assert!(state.retired.contains(&architect));
+    assert!(state.retired.contains(&worker));
+    assert!(state.retired.contains(&AgentId::new("offline-history")));
     assert!(
         state
             .apply(
                 &request(
                     "assign",
                     Command::Assign {
-                        to: worker.clone(),
+                        to: AgentId::new("worker-fresh"),
                         title: "Task".into(),
                         text: "Implement and verify scope".into()
                     }
                 ),
-                Some(&architect),
+                Some(&AgentId::new("architect-fresh")),
                 2,
                 &config
             )
             .is_err(),
-        "old cached success must not bypass retirement"
+        "fresh participants are paused until they explicitly resume"
     );
     fresh_join(&mut state, &architect, "architect-fresh", &a, &config).unwrap();
     assert!(fresh_join(&mut state, &architect, "another-fresh", &a, &config).is_err());
@@ -284,25 +300,33 @@ fn confirmed_receipt_cannot_overwrite_a_moved_or_renamed_current_identity() {
     ] {
         let mut state = completed.clone();
         state.apply(&leave, Some(&fresh), 3, &config).unwrap();
-        state
-            .apply(
-                &request(
-                    "move",
-                    Command::Join {
-                        version: VERSION,
-                        agent_id: fresh.clone(),
-                        name: name.into(),
-                        role: role.into(),
-                        pane_id: pane.into(),
-                        space_id: SpaceId::new(space),
-                        reset: None,
-                    },
-                ),
-                None,
-                4,
-                &config,
-            )
-            .unwrap();
+        let before_move = state.clone();
+        let moved = state.apply(
+            &request(
+                "move",
+                Command::Join {
+                    version: VERSION,
+                    agent_id: fresh.clone(),
+                    name: name.into(),
+                    role: role.into(),
+                    pane_id: pane.into(),
+                    space_id: SpaceId::new(space),
+                    reset: None,
+                },
+            ),
+            None,
+            4,
+            &config,
+        );
+        if space == "w2" {
+            assert!(
+                moved.is_err(),
+                "a direct join cannot move into another space"
+            );
+            assert_eq!(state, before_move);
+            continue;
+        }
+        moved.unwrap();
         let before = state.clone();
         assert!(
             fresh_join(&mut state, &architect, fresh.as_str(), &a, &config).is_err(),
@@ -345,7 +369,7 @@ fn public_progress_redacts_private_tokens_even_if_adapter_copies_them_into_error
             &config,
         )
         .unwrap();
-    let public = serde_json::to_string(&state.snapshot(vec![], None, 2)).unwrap();
+    let public = serde_json::to_string(&state.snapshot(None, None, 2)).unwrap();
     assert!(!public.contains(&a.token));
     assert!(!public.contains(&b.token));
     assert!(public.contains("[private reset token]"));
@@ -374,7 +398,7 @@ fn clearing_hub_todo_binding_does_not_modify_the_attached_user_file() {
     state.disconnect(&architect);
     state.disconnect(&worker);
     begin(&mut state);
-    assert!(state.automation[&SpaceId::new("w1")].todo.is_none());
+    assert!(state.automation.todo.is_none());
     assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
 }
 
@@ -580,7 +604,7 @@ fn claim_is_persisted_single_use_and_receipts_validate_all_approved_identity_fie
     stored.recover();
     assert!(stored.reset_frozen(&SpaceId::new("w1")));
     assert_eq!(
-        stored.snapshot(vec![], None, 2).resets[&SpaceId::new("w1")].state,
+        stored.snapshot(None, None, 2).reset.unwrap().state,
         ResetPhase::Incomplete
     );
     // Reconnect old identity only to inspect/reconcile, never to get a new claim.
@@ -665,17 +689,17 @@ fn abandon_retains_data_disables_replay_and_invalidates_claims_receipts_across_r
     assert_eq!(state.messages[0].delivery, Delivery::Uncertain);
     assert_eq!(state.tasks[&task].state, TaskState::Paused);
     assert!(
-        state.automation[&SpaceId::new("w1")].pr.is_some(),
+        state.automation.pr.is_some(),
         "retain binding for reconciliation"
     );
-    assert!(!state.automation[&SpaceId::new("w1")].pr_enabled);
+    assert!(!state.automation.pr_enabled);
     assert!(state.members.contains_key(&AgentId::new("fresh")));
-    assert!(state.retired.contains_key(&worker));
+    assert!(state.retired.contains(&worker));
     assert!(fresh_join(&mut state, &worker, "late-fresh", &b, &config).is_err());
     assert!(claim(&mut state, &worker, &b, &config).is_err());
     state.recover();
     assert_eq!(
-        state.snapshot(vec![], None, 3).resets[&SpaceId::new("w1")].state,
+        state.snapshot(None, None, 3).reset.unwrap().state,
         ResetPhase::Abandoned
     );
     assert!(!state.reset_frozen(&SpaceId::new("w1")));
@@ -695,18 +719,18 @@ fn zero_connected_participants_clear_only_hub_state_and_generations_never_aba() 
     let (mut state, architect, worker, config) = fixture();
     assign(&mut state, &architect, &worker, &config);
     attach_pr(&mut state, &worker);
-    let old_generation = state.automation[&SpaceId::new("w1")].generation;
+    let old_generation = state.automation.generation;
     state.disconnect(&architect);
     state.disconnect(&worker);
     let preview = state.reset_preview(&SpaceId::new("w1")).unwrap();
     assert_eq!(preview.offline_count, 2);
     assert!(preview.participants.is_empty());
     state.start_reset(&preview).unwrap();
-    let summary = &state.snapshot(vec![], None, 1).resets[&SpaceId::new("w1")];
+    let summary = state.snapshot(None, None, 1).reset.unwrap();
     assert_eq!(summary.state, ResetPhase::Completed);
     assert!(summary.note.contains("retired, not remotely cleared"));
     assert!(state.tasks.is_empty() && state.messages.is_empty());
-    assert!(state.automation[&SpaceId::new("w1")].generation > old_generation);
+    assert!(state.automation.generation > old_generation);
     attach_pr(&mut state, &worker);
     state
         .set_mode(&SpaceId::new("w1"), Mode::Pr, true, 2)
@@ -730,11 +754,7 @@ fn zero_connected_participants_clear_only_hub_state_and_generations_never_aba() 
         )
         .unwrap();
     assert_eq!(state, before);
-    state
-        .automation
-        .get_mut(&SpaceId::new("w1"))
-        .unwrap()
-        .generation = u64::MAX;
+    state.automation.generation = u64::MAX;
     assert!(
         state
             .set_mode(&SpaceId::new("w1"), Mode::Todo, true, 3)
@@ -765,13 +785,16 @@ fn disconnect_and_reported_veto_are_incomplete_not_success_or_a_new_attempt() {
         )
         .unwrap();
     state.disconnect(&worker);
-    let snapshot = state.snapshot(vec![], None, 3);
+    let snapshot = state.snapshot(None, None, 3);
     assert_eq!(
-        snapshot.resets[&SpaceId::new("w1")].state,
+        snapshot.reset.as_ref().unwrap().state,
         ResetPhase::Incomplete
     );
     assert!(
-        snapshot.resets[&SpaceId::new("w1")]
+        snapshot
+            .reset
+            .as_ref()
+            .unwrap()
             .note
             .contains("dashboard can abandon")
     );

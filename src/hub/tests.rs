@@ -10,7 +10,7 @@ fn request(id: &str, command: Command) -> Request {
     }
 }
 fn setup() -> (State, AgentId, AgentId, Scheduling) {
-    let mut state = State::default();
+    let mut state = State::new(SpaceId::new("w1"));
     let config = Scheduling {
         checkin_seconds: 100,
         continuation_seconds: 5,
@@ -347,7 +347,7 @@ fn ownership_revision_review_and_idempotency() {
 }
 
 #[test]
-fn cross_space_and_non_owner_requests_are_rejected() {
+fn foreign_space_and_non_owner_requests_are_rejected() {
     let (mut state, architect, worker, config) = setup();
     let id = assign(&mut state, &architect, &worker, &config);
     assert!(
@@ -370,8 +370,26 @@ fn cross_space_and_non_owner_requests_are_rejected() {
     );
     state.members.get_mut(&worker).unwrap().space_id = SpaceId::new("w2");
     assert!(
-        receive(&mut state, &worker, &config, 0).is_none(),
-        "old-space messages must never enter the new space"
+        state
+            .apply(
+                &request(
+                    "foreign-heartbeat",
+                    Command::Sync {
+                        activity: Activity::Idle,
+                        receive: true,
+                    }
+                ),
+                Some(&worker),
+                0,
+                &config,
+            )
+            .is_err(),
+        "a direct state call must reject a foreign member space"
+    );
+    assert!(
+        state
+            .set_mode(&SpaceId::new("w2"), Mode::Todo, true, 0)
+            .is_err()
     );
     assert!(
         state
@@ -379,7 +397,7 @@ fn cross_space_and_non_owner_requests_are_rejected() {
                 &request(
                     "send",
                     Command::Send {
-                        to: worker,
+                        to: worker.clone(),
                         text: "hello".into(),
                         wake: true
                     }
@@ -390,6 +408,7 @@ fn cross_space_and_non_owner_requests_are_rejected() {
             )
             .is_err()
     );
+    state.members.get_mut(&worker).unwrap().space_id = SpaceId::new("w1");
 }
 
 #[test]
@@ -505,7 +524,7 @@ fn crash_recovery_never_replays_ambiguous_work() {
 }
 
 fn attach_pr(state: &mut State, worker: &AgentId) {
-    let a = state.automation.entry(SpaceId::new("w1")).or_default();
+    let a = &mut state.automation;
     a.pr_enabled = true;
     a.pr = Some(PrWatch {
         url: "https://github.com/example/repo/pull/1".into(),
@@ -550,7 +569,8 @@ fn pr_ack_is_internal_bounded_and_only_advances_on_receipt() {
     }
     state.pr_result(&space, 0, Ok(observation), 0).unwrap();
     assert!(
-        state.automation[&space]
+        state
+            .automation
             .pr
             .as_ref()
             .unwrap()
@@ -586,7 +606,8 @@ fn pr_ack_is_internal_bounded_and_only_advances_on_receipt() {
         )
         .unwrap();
     assert_eq!(
-        state.automation[&space]
+        state
+            .automation
             .pr
             .as_ref()
             .unwrap()
@@ -610,10 +631,10 @@ fn pr_errors_and_closure_cancel_pending_work_without_losing_baselines() {
     state
         .pr_result(&space, 0, Err("local branch changed".into()), 1)
         .unwrap();
-    assert!(!state.automation[&space].pr_enabled);
+    assert!(!state.automation.pr_enabled);
     assert_eq!(state.messages[0].delivery, Delivery::Cancelled);
     state.set_mode(&space, Mode::Pr, true, 2).unwrap();
-    let generation = state.automation[&space].generation;
+    let generation = state.automation.generation;
     state
         .pr_result(&space, generation - 1, Ok(pr_observation(true)), 2)
         .unwrap();
@@ -625,7 +646,7 @@ fn pr_errors_and_closure_cancel_pending_work_without_losing_baselines() {
     let mut closed = pr_observation(true);
     closed.open = false;
     state.pr_result(&space, generation, Ok(closed), 4).unwrap();
-    assert!(!state.automation[&space].pr_enabled);
+    assert!(!state.automation.pr_enabled);
     assert!(
         state
             .messages
@@ -633,7 +654,8 @@ fn pr_errors_and_closure_cancel_pending_work_without_losing_baselines() {
             .all(|m| m.delivery == Delivery::Cancelled)
     );
     assert_eq!(
-        state.automation[&space]
+        state
+            .automation
             .pr
             .as_ref()
             .unwrap()
@@ -646,20 +668,20 @@ fn pr_errors_and_closure_cancel_pending_work_without_losing_baselines() {
 }
 
 #[test]
-fn disconnect_does_not_invalidate_another_spaces_watchers() {
+fn disconnect_disables_watchers_owned_by_that_member() {
     let (mut state, _, worker, _) = setup();
-    let other = SpaceId::new("w2");
-    state.automation.insert(
-        other.clone(),
-        Automation {
-            generation: 42,
-            checkin_enabled: true,
-            ..Automation::default()
-        },
-    );
+    state.automation.checkin_enabled = true;
+    attach_pr(&mut state, &worker);
+    let generation = state.automation.generation;
     state.disconnect(&worker);
-    assert_eq!(state.automation[&other].generation, 42);
-    assert!(state.automation[&other].checkin_enabled);
+    assert!(state.automation.checkin_enabled);
+    assert!(!state.automation.pr_enabled);
+    assert!(state.automation.generation > generation);
+    assert!(
+        state
+            .set_mode(&SpaceId::new("w2"), Mode::Checkin, true, 0)
+            .is_err()
+    );
 }
 
 #[test]

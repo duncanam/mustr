@@ -20,7 +20,7 @@ if pid == 0:
 fcntl.ioctl(terminal, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
 output = b""
 ready = None
-expected_initial = os.environ.get("MUSTR_TEST_INITIAL_TAB", "").encode()
+expected_space = os.environ.get("MUSTR_TEST_SPACE_LABEL", "First · w1").encode()
 sent_quit = False
 deadline = time.monotonic() + 10
 try:
@@ -38,14 +38,14 @@ try:
             sys.stdout.buffer.write(chunk)
             sys.stdout.buffer.flush()
         if (ready is None and b"mustr" in output and b"\x1b[?25l" in output
-                and expected_initial in output):
+                and expected_space in output):
             ready = time.monotonic()
-            os.write(terminal, b"?\t\x1b[C\x1b[D\x1b[B\x1b[A")
+            os.write(terminal, b"\t\x1b[Z\x1b[C\x1b[Dhlf\x1b[B\x1b[Af?")
         if ready is not None and not sent_quit and time.monotonic() - ready > 0.2:
             os.write(terminal, b"q")
             sent_quit = True
     else:
-        raise TimeoutError(f"Test hub did not select initial tab {expected_initial!r}, render, or quit")
+        raise TimeoutError(f"Test hub did not render bound space {expected_space!r} or quit")
     _, status = os.waitpid(pid, 0)
     pid = 0
     sys.exit(os.waitstatus_to_exitcode(status))

@@ -13,7 +13,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, Cell, Padding, Paragraph, Row, Table, Tabs, Wrap},
+    widgets::{Block, BorderType, Borders, Cell, Padding, Paragraph, Row, Table, Wrap},
 };
 
 use crate::{
@@ -78,10 +78,9 @@ impl TaskBrowse {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct View {
-    selected: Option<SpaceId>,
-    initial_space: Option<SpaceId>,
+    space_id: SpaceId,
     scroll: u16,
     work_tab: WorkTab,
     tasks: TaskBrowse,
@@ -91,29 +90,34 @@ struct View {
 }
 
 impl View {
-    fn in_space(space: SpaceId) -> Self {
+    fn in_space(space_id: SpaceId) -> Self {
         Self {
-            initial_space: Some(space),
-            ..Self::default()
+            space_id,
+            scroll: 0,
+            work_tab: WorkTab::Messages,
+            tasks: TaskBrowse::default(),
+            reset_dialog: None,
+            help: false,
+            notice: String::new(),
         }
     }
 
+    fn space<'a>(&self, snapshot: &'a Snapshot) -> Option<&'a Space> {
+        snapshot
+            .space
+            .as_ref()
+            .filter(|space| space.id == self.space_id)
+    }
+
+    fn reset<'a>(&self, snapshot: &'a Snapshot) -> Option<&'a ResetSummary> {
+        snapshot
+            .reset
+            .as_ref()
+            .filter(|reset| reset.space_id == self.space_id)
+    }
+
     fn reconcile(&mut self, snapshot: &Snapshot) {
-        if !snapshot
-            .spaces
-            .iter()
-            .any(|s| Some(&s.id) == self.selected.as_ref())
-        {
-            // Keep the startup preference through the actor's initial empty
-            // snapshot, consume it on the first populated topology only.
-            self.selected = snapshot.spaces.first().map(|first| {
-                self.initial_space
-                    .take()
-                    .filter(|id| snapshot.spaces.iter().any(|s| &s.id == id))
-                    .unwrap_or_else(|| first.id.clone())
-            });
-            self.reset_scroll();
-        }
+        // Metadata can disappear or be renamed, but this identity never changes.
         self.tasks.reconcile(&self.space_tasks(snapshot));
     }
 
@@ -121,13 +125,8 @@ impl View {
         snapshot
             .tasks
             .iter()
-            .filter(|task| Some(&task.space_id) == self.selected.as_ref())
+            .filter(|task| task.space_id == self.space_id)
             .collect()
-    }
-
-    fn reset_scroll(&mut self) {
-        self.scroll = 0;
-        self.tasks = TaskBrowse::default();
     }
 
     // Some means consumed by the modal, even when it produced no action.
@@ -140,8 +139,6 @@ impl View {
 
     fn navigate(&mut self, key: KeyCode, snapshot: &Snapshot) -> bool {
         match key {
-            KeyCode::Tab | KeyCode::Right | KeyCode::Char('l') => self.advance(snapshot, true),
-            KeyCode::BackTab | KeyCode::Left | KeyCode::Char('h') => self.advance(snapshot, false),
             KeyCode::Char('f') => {
                 self.work_tab = match self.work_tab {
                     WorkTab::Messages => WorkTab::Tasks,
@@ -160,39 +157,16 @@ impl View {
         }
         true
     }
-
-    fn advance(&mut self, snapshot: &Snapshot, forward: bool) {
-        if snapshot.spaces.is_empty() {
-            return;
-        }
-        let current = snapshot
-            .spaces
-            .iter()
-            .position(|s| Some(&s.id) == self.selected.as_ref())
-            .unwrap_or(0);
-        let count = snapshot.spaces.len();
-        let index = if forward {
-            (current + 1) % count
-        } else {
-            (current + count - 1) % count
-        };
-        if self.selected.as_ref() != Some(&snapshot.spaces[index].id) {
-            self.selected = Some(snapshot.spaces[index].id.clone());
-            self.reset_scroll();
-            self.tasks.reconcile(&self.space_tasks(snapshot));
-        }
-        self.notice.clear();
-    }
 }
 
-pub(crate) async fn run(service: Service, initial_space: SpaceId, color: bool) -> Result<()> {
+pub(crate) async fn run(service: Service, color: bool) -> Result<()> {
     ensure!(
         io::stdin().is_terminal() && io::stdout().is_terminal(),
         "dashboard needs a terminal; use mustr run --headless"
     );
     // color-eyre's panic hook is installed first; Ratatui wraps it to restore terminal state.
     let mut terminal = ratatui::try_init()?;
-    let result = event_loop(&mut terminal, service, initial_space, color).await;
+    let result = event_loop(&mut terminal, service, color).await;
     let restored = ratatui::try_restore();
     result?;
     restored?;
@@ -202,12 +176,11 @@ pub(crate) async fn run(service: Service, initial_space: SpaceId, color: bool) -
 async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     service: Service,
-    initial_space: SpaceId,
     color: bool,
 ) -> Result<()> {
     let mut events = EventStream::new();
     let mut snapshots = service.snapshots.clone();
-    let mut view = View::in_space(initial_space);
+    let mut view = View::in_space(snapshots.borrow().space_id.clone());
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
@@ -234,7 +207,7 @@ async fn event_loop(
                                 });
                             },
                             reset_ui::Action::Abandon(space, plan) => {
-                                view.reset_dialog = Some(match service.reset_abandon(space.clone(), plan).await {
+                                view.reset_dialog = Some(match service.reset_abandon(plan).await {
                                     Ok(()) => reset_ui::Dialog::progress(space),
                                     Err(error) => reset_ui::Dialog::error(error.to_string()),
                                 });
@@ -244,30 +217,27 @@ async fn event_loop(
                     }
                     match key.code {
                         KeyCode::Char('r') => {
-                            if let Some(space) = view.selected.clone() {
-                                view.reset_dialog = Some(if snapshot.resets.get(&space).is_some_and(|plan| matches!(plan.state, ResetPhase::Prepared | ResetPhase::Incomplete)) {
-                                    reset_ui::Dialog::progress(space)
-                                } else {
-                                    match service.reset_preview(space).await {
-                                        Ok(preview) => reset_ui::Dialog::confirm(preview),
-                                        Err(error) => reset_ui::Dialog::error(error.to_string()),
-                                    }
-                                });
-                            }
+                            view.reset_dialog = Some(if view.reset(&snapshot).is_some_and(|plan| matches!(plan.state, ResetPhase::Prepared | ResetPhase::Incomplete)) {
+                                reset_ui::Dialog::progress(view.space_id.clone())
+                            } else {
+                                match service.reset_preview().await {
+                                    Ok(preview) if preview.space_id == view.space_id => reset_ui::Dialog::confirm(preview),
+                                    Ok(_) => reset_ui::Dialog::error("Reset preview did not match this dashboard's space.".into()),
+                                    Err(error) => reset_ui::Dialog::error(error.to_string()),
+                                }
+                            });
                         },
                         KeyCode::Char('q') => break,
                         KeyCode::Char('?') => view.help = !view.help,
                         KeyCode::Esc => view.help = false,
                         code if view.navigate(code, &snapshot) => {},
                         KeyCode::Char(key @ ('t' | 'c' | 'p')) => {
-                            if let Some(space) = &view.selected {
-                                let automation = snapshot.automation.get(space).cloned().unwrap_or_default();
-                                let (mode, enabled) = match key { 't' => (Mode::Todo, !automation.todo_enabled), 'c' => (Mode::Checkin, !automation.checkin_enabled), _ => (Mode::Pr, !automation.pr_enabled) };
-                                view.notice = match service.mode(space.clone(), mode, enabled).await {
-                                    Ok(()) => format!("{mode:?} {} for this space; already-dispatched work is not cancelled", if enabled { "on" } else { "off" }),
-                                    Err(error) => error.to_string(),
-                                };
-                            }
+                            let automation = &snapshot.automation;
+                            let (mode, enabled) = match key { 't' => (Mode::Todo, !automation.todo_enabled), 'c' => (Mode::Checkin, !automation.checkin_enabled), _ => (Mode::Pr, !automation.pr_enabled) };
+                            view.notice = match service.mode(mode, enabled).await {
+                                Ok(()) => format!("{mode:?} {} for this space; already-dispatched work is not cancelled", if enabled { "on" } else { "off" }),
+                                Err(error) => error.to_string(),
+                            };
                         }
                         _ => {},
                     }
@@ -371,21 +341,11 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, view: &mut View, color: bool) {
         return;
     }
     let area = Rect::new(area.x + 1, area.y, area.width - 2, area.height);
-    let automation = view
-        .selected
-        .as_ref()
-        .and_then(|space| snapshot.automation.get(space))
-        .cloned()
-        .unwrap_or_default();
+    let automation = &snapshot.automation;
     let mut mode_lines = if view.help {
         Vec::new()
-    } else if view.selected.is_some() {
-        automation_lines(&automation, area.width, color)
     } else {
-        vec![Line::from(vec![
-            Span::styled("herdr: ", bold()),
-            Span::raw("waiting for spaces"),
-        ])]
+        automation_lines(automation, area.width, color)
     };
     let spacious = area.height >= 20 && !view.help;
     // At the supported minimum size, retain the mode controls but sacrifice
@@ -405,16 +365,22 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, view: &mut View, color: bool) {
     frame.render_widget(Paragraph::new(mode_lines), modes);
     if view.help {
         draw_help(frame, body, color);
-    } else if let Some(space) = view.selected.clone() {
-        draw_space(frame, body, snapshot, &space, &automation, view, color);
+    } else if view.space(snapshot).is_some() {
+        let space = view.space_id.clone();
+        draw_space(frame, body, snapshot, &space, automation, view, color);
     } else {
         frame.render_widget(
             Paragraph::new(vec![
-                Line::styled("No herdr spaces yet.", bold()),
-                Line::raw(""),
-                Line::raw(
-                    "Open a herdr space, then join with /role NAME in Pi or mustr_join in Claude.",
+                Line::styled(
+                    format!(
+                        "Bound space {} is unavailable.",
+                        clean(view.space_id.as_str())
+                    ),
+                    bold(),
                 ),
+                Line::raw(""),
+                Line::raw("This dashboard never switches spaces."),
+                Line::raw("Reopen this space or launch mustr separately in another space."),
                 Line::raw(""),
                 Line::styled("No agent sessions are read or launched.", muted()),
             ])
@@ -435,88 +401,25 @@ fn draw_header(frame: &mut Frame, area: Rect, snapshot: &Snapshot, view: &View, 
         Constraint::Length(1),
     ])
     .areas(area);
-    let [name, context] = Layout::horizontal([
-        Constraint::Min(1),
-        Constraint::Length(if area.width >= 65 { 20 } else { 0 }),
-    ])
-    .areas(brand);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("mustr", accent(color).add_modifier(Modifier::BOLD)),
             Span::styled("  /  agent coordination", muted()),
         ])),
-        name,
+        brand,
     );
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("herdr: ", muted()),
-            Span::raw(format!(
-                "{} {}",
-                snapshot.spaces.len(),
-                if snapshot.spaces.len() == 1 {
-                    "space"
-                } else {
-                    "spaces"
-                }
-            )),
-        ]))
-        .right_aligned(),
-        context,
-    );
-    let selected = snapshot
-        .spaces
-        .iter()
-        .position(|s| Some(&s.id) == view.selected.as_ref());
-    let count = selected.map_or_else(String::new, |index| {
-        format!("{}/{}", index + 1, snapshot.spaces.len())
-    });
-    let [label, tabs, count_area] = Layout::horizontal([
-        Constraint::Length(9),
-        Constraint::Min(1),
-        Constraint::Length(height(count.len() + 1)),
-    ])
-    .areas(navigation);
-    frame.render_widget(Paragraph::new("Spaces").style(bold()), label);
-    frame.render_widget(
-        Paragraph::new(count).style(muted()).right_aligned(),
-        count_area,
-    );
-    if snapshot.spaces.is_empty() {
-        frame.render_widget(Paragraph::new("—").style(muted()), tabs);
-        return;
-    }
-    let titles: Vec<_> = snapshot
-        .spaces
-        .iter()
-        .map(|space| {
-            elide(
-                &format!("{} · {}", clean(&space.label), clean(space.id.as_str())),
-                tabs.width,
-            )
-        })
-        .map(Line::raw)
-        .collect();
-    // Keep the selected tab in view even when there are more spaces than columns.
-    let mut start = 0;
-    let selected = selected.unwrap_or(0);
-    while start < selected
-        && titles[start..=selected]
-            .iter()
-            .map(Line::width)
-            .sum::<usize>()
-            + (selected - start) * 7
-            > usize::from(tabs.width)
-    {
-        start += 1;
-    }
-    frame.render_widget(
-        Tabs::new(titles.into_iter().skip(start))
-            .select(selected - start)
-            .padding("", "")
-            .divider(Span::styled("   │   ", muted()))
-            .highlight_style(accent(color).add_modifier(Modifier::BOLD | Modifier::UNDERLINED)),
-        tabs,
-    );
+    let [label, identity] =
+        Layout::horizontal([Constraint::Length(7), Constraint::Min(1)]).areas(navigation);
+    frame.render_widget(Paragraph::new("Space").style(bold()), label);
+    let text = match view.space(snapshot) {
+        Some(space) => format!(
+            "{} · {}",
+            clean(&space.label),
+            clean(view.space_id.as_str())
+        ),
+        None => format!("{} · unavailable", clean(view.space_id.as_str())),
+    };
+    frame.render_widget(Paragraph::new(elide(&text, identity.width)), identity);
 }
 
 fn automation_lines(automation: &Automation, width: u16, color: bool) -> Vec<Line<'static>> {
@@ -1051,8 +954,6 @@ fn message_preview(text: &str) -> String {
 fn draw_help(frame: &mut Frame, area: Rect, color: bool) {
     let controls = vec![
         Line::styled("Keyboard", accent(color).add_modifier(Modifier::BOLD)),
-        Line::raw("Tab / → / l     next space"),
-        Line::raw("Shift-Tab / ← / h  previous space"),
         Line::raw("f               Messages / Tasks"),
         Line::raw("↑ ↓ / k j       scroll active tab"),
         Line::raw("t  TODO / continuation on/off"),
@@ -1061,6 +962,9 @@ fn draw_help(frame: &mut Frame, area: Rect, color: bool) {
         Line::raw("r  start fresh / reset status (confirmation required)"),
         Line::raw("? / Esc         close help"),
         Line::raw("q / Ctrl-C      stop hub"),
+        Line::raw(""),
+        Line::raw("One dashboard per space;"),
+        Line::raw("launch mustr in other spaces."),
     ];
     let workflow = vec![
         Line::styled(
@@ -1108,11 +1012,11 @@ fn draw_footer(frame: &mut Frame, area: Rect, snapshot: &Snapshot, view: &View, 
     let keys = if view.help {
         "? / Esc close help · q quit"
     } else if area.width < 64 {
-        "Tab space f view r reset ? q quit"
+        "f view r reset ? help q quit"
     } else if area.width < 96 {
-        "Tab space · f view · ↑↓/jk · r reset · ? help · q quit"
+        "f view · ↑↓/jk scroll · r reset · ? help · q quit"
     } else {
-        "Tab/←→/hl spaces  f Msgs/Tasks  ↑↓/jk scroll  t TODO c Check-ins p PR  r reset  ? help  q quit"
+        "f Msgs/Tasks  ↑↓/jk scroll  t TODO c Check-ins p PR  r reset  ? help  q quit"
     };
     let error = snapshot.error.as_deref().filter(|s| !s.is_empty());
     let status = if let Some(error) = error {
@@ -1120,10 +1024,16 @@ fn draw_footer(frame: &mut Frame, area: Rect, snapshot: &Snapshot, view: &View, 
             format!("! {}", clean(error)),
             tone(color, Color::Red).add_modifier(Modifier::BOLD),
         )
+    } else if view.space(snapshot).is_none() {
+        Line::styled(
+            format!(
+                "! Space {} unavailable; dashboard remains bound",
+                clean(view.space_id.as_str())
+            ),
+            tone(color, Color::Yellow).add_modifier(Modifier::BOLD),
+        )
     } else if view
-        .selected
-        .as_ref()
-        .and_then(|space| snapshot.resets.get(space))
+        .reset(snapshot)
         .is_some_and(|reset| matches!(reset.state, ResetPhase::Prepared | ResetPhase::Incomplete))
     {
         Line::styled(
@@ -1135,7 +1045,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, snapshot: &Snapshot, view: &View, 
     } else if snapshot
         .tasks
         .iter()
-        .any(|t| Some(&t.space_id) == view.selected.as_ref() && t.state == TaskState::Paused)
+        .any(|t| t.space_id == view.space_id && t.state == TaskState::Paused)
     {
         Line::styled(
             if area.width < 60 {
@@ -1172,20 +1082,17 @@ mod tests {
 
     fn empty_space() -> Snapshot {
         Snapshot {
-            spaces: vec![Space {
+            space_id: SpaceId::new("w1"),
+            space: Some(Space {
                 id: SpaceId::new("w1"),
                 label: "Orchard".into(),
-            }],
-            ..Snapshot::default()
+            }),
+            ..Snapshot::empty(SpaceId::new("w1"))
         }
     }
 
     fn populated() -> Snapshot {
         let mut snapshot = empty_space();
-        snapshot.spaces.push(Space {
-            id: SpaceId::new("w2"),
-            label: "Sandbox".into(),
-        });
         snapshot.members = vec![
             Member {
                 id: AgentId::new("ada"),
@@ -1268,39 +1175,36 @@ mod tests {
                 pr_ack: None,
             },
         ];
-        snapshot.automation.insert(
-            SpaceId::new("w1"),
-            Automation {
-                todo_enabled: true,
-                todo: Some(crate::watchers::TodoWatch {
-                    path: "TODO.md".into(),
-                    driver: AgentId::new("lin"),
-                    total: 5,
-                    remaining: 2,
-                    next: "Refine dashboard".into(),
-                    signature: String::new(),
-                    nudges: 0,
-                    next_at: 0,
-                    error: None,
-                }),
-                pr: Some(crate::watchers::PrWatch {
-                    url: "https://github.com/example/project/pull/42".into(),
-                    cwd: ".".into(),
-                    driver: AgentId::new("ada"),
-                    branch: None,
-                    head: None,
-                    baseline: None,
-                    next_at: 0,
-                    error: None,
-                }),
-                ..Automation::default()
-            },
-        );
+        snapshot.automation = Automation {
+            todo_enabled: true,
+            todo: Some(crate::watchers::TodoWatch {
+                path: "TODO.md".into(),
+                driver: AgentId::new("lin"),
+                total: 5,
+                remaining: 2,
+                next: "Refine dashboard".into(),
+                signature: String::new(),
+                nudges: 0,
+                next_at: 0,
+                error: None,
+            }),
+            pr: Some(crate::watchers::PrWatch {
+                url: "https://github.com/example/project/pull/42".into(),
+                cwd: ".".into(),
+                driver: AgentId::new("ada"),
+                branch: None,
+                head: None,
+                baseline: None,
+                next_at: 0,
+                error: None,
+            }),
+            ..Automation::default()
+        };
         snapshot
     }
 
     fn selected_view(snapshot: &Snapshot) -> View {
-        let mut view = View::default();
+        let mut view = View::in_space(snapshot.space_id.clone());
         view.reconcile(snapshot);
         view
     }
@@ -1377,19 +1281,22 @@ mod tests {
     }
 
     #[test]
-    fn no_spaces_explains_waiting_instead_of_showing_empty_tables() {
-        let snapshot = Snapshot::default();
-        let text = screen(&render(&snapshot, &View::default(), 80, 24, true));
+    fn unavailable_space_keeps_fixed_identity_and_explains_separate_launches() {
+        let snapshot = Snapshot::empty(SpaceId::new("w1"));
+        let view = selected_view(&snapshot);
+        let text = screen(&render(&snapshot, &view, 80, 24, true));
         for expected in [
-            "No herdr spaces yet.",
-            "Open a herdr space",
-            "/role NAME",
+            "w1 · unavailable",
+            "Bound space w1 is unavailable.",
+            "This dashboard never switches spaces.",
+            "launch mustr separately in another space.",
             "No agent sessions are read or launched.",
         ] {
             assert!(text.contains(expected), "missing {expected:?}:\n{text}");
         }
         assert!(!text.contains("Participants"));
         assert!(!text.contains("Tasks 0"));
+        assert!(!text.contains("Spaces"));
     }
 
     #[test]
@@ -1510,8 +1417,8 @@ mod tests {
             let text = screen(&render(&snapshot, &view, width, height, false));
             let unwrapped = text.split_whitespace().collect::<Vec<_>>().join(" ");
             for expected in [
-                "Tab / → / l",
-                "Shift-Tab / ← / h",
+                "One dashboard per space;",
+                "launch mustr in other spaces.",
                 "↑ ↓ / k j",
                 "f               Messages / Tasks",
                 "scroll active tab",
@@ -1537,11 +1444,14 @@ mod tests {
                 );
             }
             assert!(!text.contains("Refine dashboard"));
+            assert!(!text.contains("next space"));
+            assert!(!text.contains("previous space"));
+            assert!(!text.contains("Tab"));
         }
     }
 
     #[test]
-    fn only_selected_space_data_is_rendered() {
+    fn only_bound_space_data_is_rendered() {
         let mut snapshot = populated();
         let mut foreign_member = snapshot.members[0].clone();
         foreign_member.id = AgentId::new("foreign");
@@ -1559,23 +1469,20 @@ mod tests {
         let mut view = selected_view(&snapshot);
         let text = screen(&render(&snapshot, &view, 120, 30, false));
         assert!(!text.contains("FOREIGN_"));
-        view.advance(&snapshot, true);
-        let text = screen(&render(&snapshot, &view, 120, 30, false));
-        for expected in ["FOREIGN_MEMBER", "FOREIGN_MESSAGE"] {
-            assert!(text.contains(expected), "missing {expected:?}:\n{text}");
-        }
-        assert!(text.contains("1 tasks · 0 accepted"));
-        assert!(text.contains("[t] TODO: off"));
+        assert!(!view.navigate(KeyCode::Tab, &snapshot));
+        assert_eq!(view.space_id, SpaceId::new("w1"));
+        assert!(text.contains("2 tasks · 0 accepted"));
+        assert!(text.contains("[t] TODO: ON"));
         view.navigate(KeyCode::Char('f'), &snapshot);
         let text = screen(&render(&snapshot, &view, 120, 30, false));
-        assert!(text.contains("FOREIGN_TASK"), "{text}");
-        assert!(!text.contains("Refine dashboard"));
+        assert!(!text.contains("FOREIGN_"), "{text}");
+        assert!(text.contains("Refine dashboard"));
     }
 
     #[test]
     fn external_text_is_sanitized_including_identifiers_and_panes() {
         let mut snapshot = populated();
-        snapshot.spaces[0].label = "Orc\u{1b}hard\n".into();
+        snapshot.space.as_mut().unwrap().label = "Orc\u{1b}hard\n".into();
         snapshot.members[0].name = "A\u{7}da".into();
         snapshot.members[0].role = "archi\ttect".into();
         snapshot.members[0].pane_id = "w1:\u{1b}p1".into();
@@ -1610,7 +1517,7 @@ mod tests {
     #[test]
     fn watcher_errors_and_notices_remain_visible_and_sanitized() {
         let mut snapshot = populated();
-        let automation = snapshot.automation.get_mut(&SpaceId::new("w1")).unwrap();
+        let automation = &mut snapshot.automation;
         automation.todo.as_mut().unwrap().error = Some("TODO\n unavailable".into());
         automation.pr.as_mut().unwrap().error = Some("PR\u{1b} unavailable".into());
         let mut view = selected_view(&snapshot);
@@ -1657,19 +1564,24 @@ mod tests {
     }
 
     #[test]
-    fn selected_tab_stays_visible_in_a_crowded_navigation_rail() {
+    fn fixed_space_label_is_plain_and_elided_by_terminal_columns() {
         let mut snapshot = empty_space();
-        for index in 2..=12 {
-            snapshot.spaces.push(Space {
-                id: SpaceId::new(format!("w{index}")),
-                label: format!("Project {index}"),
-            });
-        }
-        let mut view = selected_view(&snapshot);
-        view.selected = Some(SpaceId::new("w12"));
-        let text = screen(&render(&snapshot, &view, 40, 24, false));
-        assert!(text.contains("Project 12 · w12"), "{text}");
-        assert!(text.contains("12/12"));
+        snapshot.space.as_mut().unwrap().label = "Orchard with a very long label and suffix".into();
+        let buffer = render(&snapshot, &selected_view(&snapshot), 40, 24, false);
+        let text = screen(&buffer);
+        let (x, y) = position(&text, "Orchard");
+        assert!(
+            !buffer[(height(x), height(y))]
+                .modifier
+                .contains(Modifier::UNDERLINED)
+        );
+        assert!(text.contains("Space  "), "{text}");
+        assert!(
+            text.contains(&elide(&snapshot.space.as_ref().unwrap().label, 31)),
+            "{text}"
+        );
+        assert!(!text.contains("Spaces"));
+        assert!(!text.contains("1/1"));
         assert_eq!(elide("工具 / Orchard", 8), "工具 / …");
         assert_eq!(elide("hello", 0), "");
     }
@@ -1700,7 +1612,11 @@ mod tests {
 
     #[test]
     fn tiny_and_short_terminals_do_not_panic_or_leak_styles() {
-        for snapshot in [Snapshot::default(), empty_space(), populated()] {
+        for snapshot in [
+            Snapshot::empty(SpaceId::new("w1")),
+            empty_space(),
+            populated(),
+        ] {
             for width in [0, 1, 10, 34, 35, 40, 60, 96, 98, 120] {
                 for height in [0, 1, 4, 11, 12, 13, 18, 24] {
                     for tab in [WorkTab::Messages, WorkTab::Tasks] {
@@ -1804,66 +1720,57 @@ mod tests {
     }
 
     #[test]
-    fn arrows_and_vim_keys_have_identical_navigation() {
-        let snapshot = Snapshot {
-            spaces: vec![
-                Space {
-                    id: SpaceId::new("w1"),
-                    label: "A".into(),
-                },
-                Space {
-                    id: SpaceId::new("w2"),
-                    label: "B".into(),
-                },
-            ],
-            ..Snapshot::default()
-        };
-        for (arrow, vim) in [
-            (KeyCode::Left, 'h'),
-            (KeyCode::Right, 'l'),
-            (KeyCode::Up, 'k'),
-            (KeyCode::Down, 'j'),
-        ] {
-            let mut a = View::default();
-            let mut b = View::default();
-            a.reconcile(&snapshot);
-            b.reconcile(&snapshot);
-            a.scroll = 3;
-            b.scroll = 3;
-            assert!(a.navigate(arrow, &snapshot));
-            assert!(b.navigate(KeyCode::Char(vim), &snapshot));
-            assert_eq!(a.selected, b.selected);
-            assert_eq!(a.scroll, b.scroll);
+    fn vertical_arrows_and_vim_keys_have_identical_navigation() {
+        let snapshot = populated();
+        for (arrow, vim) in [(KeyCode::Up, 'k'), (KeyCode::Down, 'j')] {
+            for tab in [WorkTab::Messages, WorkTab::Tasks] {
+                let mut a = selected_view(&snapshot);
+                let mut b = selected_view(&snapshot);
+                a.work_tab = tab;
+                b.work_tab = tab;
+                a.scroll = 3;
+                b.scroll = 3;
+                assert!(a.navigate(arrow, &snapshot));
+                assert!(b.navigate(KeyCode::Char(vim), &snapshot));
+                assert_eq!(a.space_id, b.space_id);
+                assert_eq!(a.tasks.selected, b.tasks.selected);
+                assert_eq!(a.scroll, b.scroll);
+            }
         }
-        let mut view = View::default();
+        let mut view = selected_view(&snapshot);
         view.navigate(KeyCode::Up, &snapshot);
         assert_eq!(view.scroll, 0);
         assert!(!view.navigate(KeyCode::Char('q'), &snapshot));
     }
 
     #[test]
-    fn selection_survives_reordering() {
-        let mut snapshot = Snapshot {
-            spaces: vec![
-                Space {
-                    id: SpaceId::new("w1"),
-                    label: "A".into(),
-                },
-                Space {
-                    id: SpaceId::new("w2"),
-                    label: "B".into(),
-                },
-            ],
-            ..Snapshot::default()
-        };
-        let mut view = View::default();
-        view.reconcile(&snapshot);
-        view.advance(&snapshot, true);
-        snapshot.spaces.reverse();
-        view.reconcile(&snapshot);
-        assert_eq!(view.selected, Some(SpaceId::new("w2")));
-        snapshot.spaces.clear();
-        view.reconcile(&snapshot);
-        assert!(view.selected.is_none());
+    fn former_space_switch_keys_are_inert_in_both_work_tabs() {
+        let snapshot = work_tabs::many_tasks(20);
+        for tab in [WorkTab::Messages, WorkTab::Tasks] {
+            let mut view = selected_view(&snapshot);
+            view.work_tab = tab;
+            view.scroll = 7;
+            for _ in 0..12 {
+                view.tasks.advance(&view.space_tasks(&snapshot), true);
+            }
+            view.tasks.offset = 8;
+            view.notice = "Keep this notice".into();
+            for key in [
+                KeyCode::Tab,
+                KeyCode::BackTab,
+                KeyCode::Left,
+                KeyCode::Right,
+                KeyCode::Char('h'),
+                KeyCode::Char('l'),
+            ] {
+                assert!(!view.navigate(key, &snapshot));
+                assert_eq!(view.space_id, SpaceId::new("w1"));
+                assert_eq!(view.work_tab, tab);
+                assert_eq!(view.scroll, 7);
+                assert_eq!(view.tasks.selected, Some(TaskId::new("task-012")));
+                assert_eq!(view.tasks.offset, 8);
+                assert_eq!(view.notice, "Keep this notice");
+            }
+        }
     }
 }

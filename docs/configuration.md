@@ -8,22 +8,28 @@ Run `mustr init` to create configuration and restore any missing shipped role fi
 |---|---|---|
 | Configuration | `~/.config/mustr` | `--config-dir`, `MUSTR_CONFIG_DIR`, then `XDG_CONFIG_HOME/mustr` |
 | Persistent state and logs | `~/.local/state/mustr` | `MUSTR_STATE_DIR`, then `XDG_STATE_HOME/mustr` |
-| Local transport | `/tmp/mustr-<uid>/<server-key>.sock` | Derived from herdr server identity |
+| Local transport | `/tmp/mustr-<uid>/<instance-key>.sock` | Derived from herdr server identity and space ID |
 | Pi adapter | `~/.pi/agent/extensions/mustr` | `mustr install pi --agent-dir /absolute/agent-directory` or `PI_CODING_AGENT_DIR` |
 | Claude MCP bundle | `<mustr-config>/claude` | `mustr install claude --directory /absolute/output-directory` |
 
 Configuration, state, and adapter-directory overrides must be absolute paths. The adapter remembers the installed binary and configuration directory; `MUSTR_BIN` and `MUSTR_CONFIG_DIR` override those. Re-run the appropriate `mustr install pi` or `mustr install claude` command after moving the executable.
 
 ```sh
-mustr                      # hub and dashboard
-mustr run --headless        # same hub, no dashboard
+mustr                      # hub and dashboard for this herdr space
+mustr run --headless        # same per-space hub, no dashboard
 mustr roles                # available role names and descriptions
 mustr roles --json         # valid resolved role prompts for the adapter
 mustr roles reviewer --json # resolve one requested graph; report its errors
 mustr -v                   # debug logging; -vv for trace, -q for warnings
 ```
 
-Logs go to `mustr.log` in the state directory, not the dashboard. A log larger than 5 MiB rotates to `mustr.log.1` at startup. Logs are not a complete transcript or a security audit trail.
+Each instance stays bound to its launching pane's live herdr space. Start another `mustr` in another space to coordinate it; a second instance in the same space is rejected. Configuration and role files are shared, but sockets, locks, saved tasks/messages, automation, and logs are isolated.
+
+An instance stores `hub.sqlite` and `mustr.log` under `<state>/<server-key>/<instance-key>/`. `server-key` identifies the live herdr server incarnation; `instance-key` hashes that identity with the exact space ID and also names the socket and lock. `mustr context` reports the caller's live space, server key, and socket path.
+
+Logs go to that instance's `mustr.log`, not the dashboard. A log larger than 5 MiB rotates to `mustr.log.1` at startup, after acquiring the instance lock. Logs are not a complete transcript or a security audit trail.
+
+Restart persistence remains enabled. The per-space layout starts with fresh history; old shared multi-space databases are left untouched and are not imported. Reconcile work and any incomplete reset before stopping an old hub, then launch one new instance per intended space.
 
 ## config.toml
 

@@ -76,7 +76,7 @@ fn reset_modal_contains_scope_and_honest_warnings_without_tokens() {
         assert!(text.contains(expected), "missing {expected}:\n{text}");
     }
     assert!(!text.contains("human-preview-only"));
-    let selected = view.selected.clone();
+    let bound_space = view.space_id.clone();
     for key in [
         KeyCode::Tab,
         KeyCode::Left,
@@ -88,7 +88,7 @@ fn reset_modal_contains_scope_and_honest_warnings_without_tokens() {
     ] {
         assert!(matches!(view.reset_key(key, &snapshot), Some(Action::None)));
     }
-    assert_eq!(view.selected, selected);
+    assert_eq!(view.space_id, bound_space);
     assert_eq!(view.work_tab, WorkTab::Messages);
     view.reset_dialog = None;
     assert!(
@@ -131,21 +131,18 @@ fn narrow_confirmation_scrolls_and_does_not_confirm_unread_warnings() {
 #[test]
 fn reset_progress_and_abandon_are_truthful_and_separately_confirmed() {
     let mut snapshot = populated();
-    snapshot.resets.insert(
-        "w1".into(),
-        ResetSummary {
-            plan_id: "plan-1".into(),
-            space_id: "w1".into(),
-            state: ResetPhase::Incomplete,
-            participants: vec![ResetProgress {
-                participant: preview().participants.remove(0),
-                state: ResetAgentState::Uncertain,
-                new_agent_id: None,
-                note: "Awaiting actual fresh session receipt".into(),
-            }],
-            note: "History retained; replacement may have occurred".into(),
-        },
-    );
+    snapshot.reset = Some(ResetSummary {
+        plan_id: "plan-1".into(),
+        space_id: "w1".into(),
+        state: ResetPhase::Incomplete,
+        participants: vec![ResetProgress {
+            participant: preview().participants.remove(0),
+            state: ResetAgentState::Uncertain,
+            new_agent_id: None,
+            note: "Awaiting actual fresh session receipt".into(),
+        }],
+        note: "History retained; replacement may have occurred".into(),
+    });
     let mut view = selected_view(&snapshot);
     let base = screen(&render_view(&snapshot, &mut view, 120, 30, false));
     assert!(base.contains("Reset incomplete"));
@@ -183,16 +180,13 @@ fn reset_progress_and_abandon_are_truthful_and_separately_confirmed() {
 #[test]
 fn shrinking_below_minimum_disables_invisible_reset_and_abandon_confirmation() {
     let mut snapshot = populated();
-    snapshot.resets.insert(
-        "w1".into(),
-        ResetSummary {
-            plan_id: "plan-1".into(),
-            space_id: "w1".into(),
-            state: ResetPhase::Incomplete,
-            participants: vec![],
-            note: "Incomplete".into(),
-        },
-    );
+    snapshot.reset = Some(ResetSummary {
+        plan_id: "plan-1".into(),
+        space_id: "w1".into(),
+        state: ResetPhase::Incomplete,
+        participants: vec![],
+        note: "Incomplete".into(),
+    });
     for abandon in [false, true] {
         let mut view = selected_view(&snapshot);
         let mut dialog = if abandon {
@@ -235,16 +229,13 @@ fn reset_errors_do_not_claim_an_attempt_had_no_effect() {
 
 fn confirmation_snapshot() -> Snapshot {
     let mut snapshot = populated();
-    snapshot.resets.insert(
-        "w1".into(),
-        ResetSummary {
-            plan_id: "plan-1".into(),
-            space_id: "w1".into(),
-            state: ResetPhase::Incomplete,
-            participants: vec![],
-            note: "History retained; inspect before manual recovery".into(),
-        },
-    );
+    snapshot.reset = Some(ResetSummary {
+        plan_id: "plan-1".into(),
+        space_id: "w1".into(),
+        state: ResetPhase::Incomplete,
+        participants: vec![],
+        note: "History retained; inspect before manual recovery".into(),
+    });
     snapshot
 }
 
@@ -362,6 +353,27 @@ fn progress_and_error_footers_only_offer_close_not_typed_confirmation() {
             ));
         }
     }
+}
+
+#[test]
+fn foreign_reset_status_is_not_displayed_or_offered_for_abandonment() {
+    let mut snapshot = confirmation_snapshot();
+    let reset = snapshot.reset.as_mut().unwrap();
+    reset.space_id = SpaceId::new("w2");
+    reset.note = "FOREIGN_RESET_STATUS".into();
+    let mut view = selected_view(&snapshot);
+    let text = screen(&render(&snapshot, &view, 120, 30, false));
+    assert!(!text.contains("Reset incomplete"), "{text}");
+    view.reset_dialog = Some(Dialog::progress(SpaceId::new("w1")));
+    let text = screen(&render_view(&snapshot, &mut view, 120, 30, false));
+    assert!(text.contains("No reset status available"), "{text}");
+    assert!(!text.contains("FOREIGN_RESET_STATUS"));
+    assert!(matches!(
+        view.reset_key(KeyCode::Char('a'), &snapshot),
+        Some(Action::None)
+    ));
+    let text = screen(&render_view(&snapshot, &mut view, 120, 30, false));
+    assert!(!text.contains("Type ABANDON"), "{text}");
 }
 
 #[test]

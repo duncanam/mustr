@@ -3,6 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { spawn, execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { fileURLToPath } from "node:url";
+import { basename, dirname, join } from "node:path";
 import { once } from "node:events";
 
 export const exec = promisify(execFile);
@@ -22,7 +23,13 @@ export async function fixture(t) {
     ["w1:p0", { pane_id: "w1:p0", workspace_id: "w1", agent: null }],
     ["w1:p1", { pane_id: "w1:p1", workspace_id: "w1", agent: "pi" }],
     ["w1:p2", { pane_id: "w1:p2", workspace_id: "w1", agent: "pi" }],
+    ["w2:p0", { pane_id: "w2:p0", workspace_id: "w2", agent: null }],
     ["w2:p1", { pane_id: "w2:p1", workspace_id: "w2", agent: "pi" }],
+    ["w2:p2", { pane_id: "w2:p2", workspace_id: "w2", agent: "pi" }],
+  ]);
+  const spaces = new Map([
+    ["w1", { workspace_id: "w1", label: "First" }],
+    ["w2", { workspace_id: "w2", label: "Second" }],
   ]);
   const connections = new Set();
   const server = net.createServer(connection => {
@@ -35,7 +42,7 @@ export async function fixture(t) {
       const request = JSON.parse(buffer.split("\n")[0]);
       let result;
       if (request.method === "pane.current") result = { pane: panes.get(request.params.caller_pane_id) };
-      else if (request.method === "workspace.list") result = { workspaces: [{ workspace_id: "w1", label: "First" }, { workspace_id: "w2", label: "Second" }] };
+      else if (request.method === "workspace.list") result = { workspaces: [...spaces.values()] };
       else { connection.end(JSON.stringify({ id: request.id, error: "unexpected method" }) + "\n"); return; }
       connection.end(JSON.stringify({ id: request.id, result }) + "\n");
     });
@@ -43,31 +50,46 @@ export async function fixture(t) {
   server.listen(socket); await once(server, "listening");
   const env = { ...process.env, HERDR_ENV: "1", HERDR_SOCKET_PATH: socket, HERDR_PANE_ID: "w1:p0", MUSTR_CONFIG_DIR: `${directory}/config`, MUSTR_STATE_DIR: `${directory}/state`, NO_COLOR: "1" };
   const children = new Set();
-  let runtimeSocket;
+  const runtimeSockets = new Set();
   t.after(async () => {
     for (const child of children) await stop(child);
     for (const connection of connections) connection.destroy();
     await new Promise(resolve => server.close(resolve));
-    if (runtimeSocket) {
+    for (const runtimeSocket of runtimeSockets) {
       await rm(runtimeSocket, { force: true });
       await rm(runtimeSocket.replace(/\.sock$/, ".lock"), { force: true });
     }
+    const legacySocket = join(dirname(discovery.socket), `${discovery.server_key}.sock`);
+    await rm(legacySocket, { force: true });
+    await rm(legacySocket.replace(/\.sock$/, ".lock"), { force: true });
     await rm(directory, { recursive: true, force: true });
   });
   await exec(binary, ["init"], { env });
   await writeFile(`${directory}/config/config.toml`, "version = 1\n[scheduling]\ncontinuation_seconds = 1\ncheckin_seconds = 5\nmax_nudges = 2\n");
-  const discovery = JSON.parse((await exec(binary, ["context"], { env })).stdout);
-  runtimeSocket = discovery.socket;
+  const discover = async (paneId = "w1:p0") => {
+    const paneEnv = { ...env, HERDR_PANE_ID: paneId };
+    const discovery = JSON.parse((await exec(binary, ["context"], { env: paneEnv })).stdout);
+    runtimeSockets.add(discovery.socket);
+    return discovery;
+  };
+  const discovery = await discover();
   return {
-    directory, env, discovery, panes,
-    async start(headless = true) {
-      const child = spawn(binary, ["-v", "run", ...(headless ? ["--headless"] : [])], { env, stdio: ["pipe", "pipe", "pipe"] });
+    directory, env, discovery, panes, spaces, discover,
+    database(identity = discovery) {
+      const instanceKey = basename(identity.socket, ".sock");
+      return `${env.MUSTR_STATE_DIR}/${identity.server_key}/${instanceKey}/hub.sqlite`;
+    },
+    async start({ paneId = "w1:p0", headless = true } = {}) {
+      const identity = await discover(paneId);
+      const paneEnv = { ...env, HERDR_PANE_ID: paneId };
+      const child = spawn(binary, ["-v", "run", ...(headless ? ["--headless"] : [])], { env: paneEnv, stdio: ["pipe", "pipe", "pipe"] });
       child.output = "";
+      child.discovery = identity;
       child.stdout.on("data", b => child.output += b); child.stderr.on("data", b => child.output += b);
       children.add(child);
       await eventually(async () => {
         if (child.exitCode !== null) throw new Error(child.output);
-        return new Promise(resolve => { const c = net.createConnection(discovery.socket); c.once("connect", () => { c.destroy(); resolve(true); }); c.once("error", () => resolve(false)); });
+        return new Promise(resolve => { const c = net.createConnection(identity.socket); c.once("connect", () => { c.destroy(); resolve(true); }); c.once("error", () => resolve(false)); });
       });
       return child;
     },

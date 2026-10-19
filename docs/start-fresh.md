@@ -2,9 +2,9 @@
 
 > This requires both the updated hub and Pi adapter. Source changes do not update installed or running components.
 
-The dashboard's `r` action opens **Start fresh** for its selected herdr space. It is a human dashboard action, not an agent tool. Merely opening the dialog does nothing.
+The dashboard's `r` action opens **Start fresh** for this instance's bound herdr space. It is a human dashboard action, not an agent tool. Merely opening the dialog does nothing.
 
-Read the space name, participant list, counts and warnings. Scroll if necessary, then type `RESET` and press Enter to confirm. Empty Enter or Escape cancels the confirmation. Space navigation and automation shortcuts do not act behind the dialog.
+Read the space name, participant list, counts and warnings. Scroll if necessary, then type `RESET` and press Enter to confirm. Empty Enter or Escape cancels the confirmation. Work-tab navigation and automation shortcuts do not act behind the dialog.
 
 ## What changes
 
@@ -34,4 +34,4 @@ After abandoning, inspect each agent, task and external job before choosing anot
 
 The reset handshake requires both updated hub and Pi adapter code. Rebuilding source alone updates neither running component. Install the new hub/adapter and reload/rejoin Pi only after reconciling current work; follow [development rollout instructions](development.md#applying-dashboard-and-adapter-changes). A hub with older adapters should reject reset as unsupported rather than falsely report that agent context was cleared.
 
-The updated hub migrates the state database to schema version 2, even if you have not used reset. Older binaries must refuse this database: they cannot honor its durable reset fences and retired identities. Back up the state directory before upgrading if you need a rollback path; do not bypass the version check or restore a backup over a running hub. A backup also restores old coordination history, not the live state of Pi sessions or external jobs.
+Each space now has its own schema-version-3 database, preserving reset fences and retired identities across restarts. Old shared multi-space history is not imported or modified. Reconcile existing tasks and any incomplete reset before switching versions; do not bypass version checks or restore state over a running hub. Saved coordination history is not proof of the live state of Pi sessions or external jobs.
