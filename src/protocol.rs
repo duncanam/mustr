@@ -63,6 +63,8 @@ pub(crate) enum Command {
         pane_id: String,
         space_id: SpaceId,
         #[serde(default)]
+        cwd: Option<std::path::PathBuf>,
+        #[serde(default)]
         reset: Option<ResetReceipt>,
     },
     /// Negotiate the single-attempt reset control protocol for this connection.
@@ -305,6 +307,10 @@ pub(crate) struct Member {
     pub role: String,
     pub pane_id: String,
     pub space_id: SpaceId,
+    /// Live checkout context for explicit dashboard PR-discovery selection.
+    /// Do not persist or expose it to peer/model snapshots; fresh Join supplies it.
+    #[serde(default, skip_serializing)]
+    pub cwd: Option<std::path::PathBuf>,
     pub activity: Activity,
     pub last_seen: u64,
     pub idle_since: u64,
@@ -426,5 +432,57 @@ impl Response {
             result: None,
             error: Some(error.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn legacy_join_and_member_payloads_default_checkout_context() {
+        let request: Request = serde_json::from_value(json!({
+            "id":"join",
+            "op":"join",
+            "version":1,
+            "agent_id":"agent",
+            "name":"worker",
+            "role":"custom",
+            "pane_id":"w1:p1",
+            "space_id":"w1"
+        }))
+        .unwrap();
+        assert!(matches!(request.command, Command::Join { cwd: None, .. }));
+
+        let member: Member = serde_json::from_value(json!({
+            "id":"agent",
+            "name":"worker",
+            "role":"custom",
+            "pane_id":"w1:p1",
+            "space_id":"w1",
+            "activity":"idle",
+            "last_seen":1,
+            "idle_since":1
+        }))
+        .unwrap();
+        assert_eq!(member.cwd, None);
+    }
+
+    #[test]
+    fn checkout_context_is_not_serialized_to_peers_or_state() {
+        let member = Member {
+            id: AgentId::new("agent"),
+            name: "worker".into(),
+            role: "custom".into(),
+            pane_id: "w1:p1".into(),
+            space_id: SpaceId::new("w1"),
+            cwd: Some("/private/checkout".into()),
+            activity: Activity::Idle,
+            last_seen: 1,
+            idle_since: 1,
+        };
+        let encoded = serde_json::to_value(member).unwrap();
+        assert!(encoded.get("cwd").is_none());
     }
 }

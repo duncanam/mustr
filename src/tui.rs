@@ -21,6 +21,7 @@ use crate::{
     service::{Service, now},
 };
 
+mod pr_ui;
 mod reset_ui;
 
 #[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
@@ -85,6 +86,7 @@ struct View {
     work_tab: WorkTab,
     tasks: TaskBrowse,
     reset_dialog: Option<reset_ui::Dialog>,
+    pr_dialog: Option<pr_ui::Dialog>,
     help: bool,
     notice: String,
 }
@@ -97,6 +99,7 @@ impl View {
             work_tab: WorkTab::Messages,
             tasks: TaskBrowse::default(),
             reset_dialog: None,
+            pr_dialog: None,
             help: false,
             notice: String::new(),
         }
@@ -135,6 +138,10 @@ impl View {
         self.reset_dialog
             .as_mut()
             .map(|dialog| dialog.key(key, snapshot))
+    }
+
+    fn pr_key(&mut self, key: KeyCode) -> Option<pr_ui::Action> {
+        self.pr_dialog.as_mut().map(|dialog| dialog.key(key))
     }
 
     fn navigate(&mut self, key: KeyCode, snapshot: &Snapshot) -> bool {
@@ -215,6 +222,24 @@ async fn event_loop(
                         }
                         continue;
                     }
+                    if let Some(action) = view.pr_key(key.code) {
+                        match action {
+                            pr_ui::Action::None => {},
+                            pr_ui::Action::Close => view.pr_dialog = None,
+                            pr_ui::Action::Select(selection) => {
+                                view.pr_dialog = None;
+                                let name = clean(&selection.name);
+                                view.notice = match service.enable_pr(*selection).await {
+                                    Ok(()) => format!("PR discovery started for {name}; pending status appears above"),
+                                    Err(error) => {
+                                        view.pr_dialog = Some(pr_ui::Dialog::error(format!("Could not enable PR discovery: {error}. Refresh status and retry only after checking the bound participant.")));
+                                        String::new()
+                                    }
+                                };
+                            },
+                        }
+                        continue;
+                    }
                     match key.code {
                         KeyCode::Char('r') => {
                             view.reset_dialog = Some(if view.reset(&snapshot).is_some_and(|plan| matches!(plan.state, ResetPhase::Prepared | ResetPhase::Incomplete)) {
@@ -231,13 +256,51 @@ async fn event_loop(
                         KeyCode::Char('?') => view.help = !view.help,
                         KeyCode::Esc => view.help = false,
                         code if view.navigate(code, &snapshot) => {},
-                        KeyCode::Char(key @ ('t' | 'c' | 'p')) => {
+                        KeyCode::Char('t' | 'c') => {
                             let automation = &snapshot.automation;
-                            let (mode, enabled) = match key { 't' => (Mode::Todo, !automation.todo_enabled), 'c' => (Mode::Checkin, !automation.checkin_enabled), _ => (Mode::Pr, !automation.pr_enabled) };
+                            let (mode, enabled) = if key.code == KeyCode::Char('t') {
+                                (Mode::Todo, !automation.todo_enabled)
+                            } else {
+                                (Mode::Checkin, !automation.checkin_enabled)
+                            };
                             view.notice = match service.mode(mode, enabled).await {
                                 Ok(()) => format!("{mode:?} {} for this space; already-dispatched work is not cancelled", if enabled { "on" } else { "off" }),
                                 Err(error) => error.to_string(),
                             };
+                        }
+                        KeyCode::Char('p') => {
+                            view.notice.clear();
+                            if snapshot.automation.pr.is_some() {
+                                let enabled = !snapshot.automation.pr_enabled;
+                                match service.mode(Mode::Pr, enabled).await {
+                                    Ok(()) => {
+                                        view.notice = format!("PR watcher {} for this space; already-dispatched work is not cancelled", if enabled { "on" } else { "off" });
+                                    }
+                                    Err(error) => {
+                                        view.notice.clear();
+                                        view.pr_dialog = Some(pr_ui::Dialog::error(format!("Could not update the PR watcher: {error}")));
+                                    }
+                                }
+                            } else {
+                                let candidates = pr_ui::eligible(&snapshot, &view.space_id);
+                                match candidates.len() {
+                                    0 => view.pr_dialog = Some(pr_ui::Dialog::error(
+                                        "No connected, unpaused participant has advertised an absolute checkout path. Join Pi with /role NAME or Claude with mustr_join from the repository checkout, then press p.".into(),
+                                    )),
+                                    1 => {
+                                        let selection = candidates.into_iter().next().expect("one candidate");
+                                        let name = clean(&selection.name);
+                                        view.notice = match service.enable_pr(selection).await {
+                                            Ok(()) => format!("PR discovery started for {name}; pending status appears above"),
+                                            Err(error) => {
+                                                view.pr_dialog = Some(pr_ui::Dialog::error(format!("Could not enable PR discovery: {error}. Refresh status and retry only after checking the bound participant.")));
+                                                String::new()
+                                            }
+                                        };
+                                    }
+                                    _ => view.pr_dialog = Some(pr_ui::Dialog::choose(candidates)),
+                                }
+                            }
                         }
                         _ => {},
                     }
@@ -330,8 +393,11 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, view: &mut View, color: bool) {
         if let Some(dialog) = &mut view.reset_dialog {
             dialog.hide();
         }
+        if let Some(dialog) = &mut view.pr_dialog {
+            dialog.hide();
+        }
         frame.render_widget(
-            Paragraph::new(if view.reset_dialog.is_some() {
+            Paragraph::new(if view.reset_dialog.is_some() || view.pr_dialog.is_some() {
                 "mustr · enlarge terminal (35×12 minimum)\nEsc closes dialog; Ctrl-C quits"
             } else {
                 "mustr · enlarge terminal (35×12 minimum)\nq quits"
@@ -392,6 +458,9 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, view: &mut View, color: bool) {
     if let Some(dialog) = &mut view.reset_dialog {
         dialog.draw(frame, snapshot);
     }
+    if let Some(dialog) = &mut view.pr_dialog {
+        dialog.draw(frame, color);
+    }
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, snapshot: &Snapshot, view: &View, color: bool) {
@@ -432,19 +501,21 @@ fn automation_lines(automation: &Automation, width: u16, color: bool) -> Vec<Lin
         Line::default()
     };
     let mut controls = 0;
+    let separator = if width < 45 { " " } else { "   │   " };
+    let separator_width = Line::raw(separator).width();
     for spans in [
         mode_spans('t', "TODO", automation.todo_enabled, color),
         mode_spans('c', "Check-in", automation.checkin_enabled, color),
         mode_spans('p', "PR", automation.pr_enabled, color),
     ] {
         let size: usize = spans.iter().map(Span::width).sum();
-        if controls > 0 && line.width() + 7 + size > usize::from(width) {
+        if controls > 0 && line.width() + separator_width + size > usize::from(width) {
             lines.push(line);
             line = Line::default();
             controls = 0;
         }
         if controls > 0 {
-            line.spans.push(Span::styled("   │   ", muted()));
+            line.spans.push(Span::styled(separator, muted()));
         }
         line.spans.extend(spans);
         controls += 1;
@@ -457,23 +528,72 @@ fn automation_lines(automation: &Automation, width: u16, color: bool) -> Vec<Lin
             Span::raw(format!("{}/{}", todo.remaining, todo.total)),
         ]);
     }
+    let mut pr_status = Vec::new();
     if let Some(pr) = &automation.pr {
-        let spans = [
-            Span::styled("PR poll: ", muted()),
-            Span::raw(format!("{}s", pr.next_at.saturating_sub(now()))),
-        ];
-        if !details.spans.is_empty() {
-            if details.width() + 7 + spans.iter().map(Span::width).sum::<usize>()
-                > usize::from(width)
-            {
-                lines.push(details);
-                details = Line::default();
-            } else {
-                details.spans.push(Span::styled("   │   ", muted()));
+        if pr.url.is_some() {
+            let spans = [
+                Span::styled("PR poll: ", muted()),
+                Span::raw(format!("{}s", pr.next_at.saturating_sub(now()))),
+            ];
+            if !details.spans.is_empty() {
+                if details.width() + 7 + spans.iter().map(Span::width).sum::<usize>()
+                    > usize::from(width)
+                {
+                    lines.push(details);
+                    details = Line::default();
+                } else {
+                    details.spans.push(Span::styled("   │   ", muted()));
+                }
             }
+            details.spans.extend(spans);
+            if let Some(url) = &pr.url {
+                pr_status.push(Line::raw(format!(
+                    "PR URL: {}",
+                    elide(&clean(url), width.saturating_sub(8))
+                )));
+            }
+            if let Some(error) = &pr.error {
+                pr_status.push(Line::styled(
+                    format!(
+                        "PR error: {}",
+                        elide(&clean(error), width.saturating_sub(10))
+                    ),
+                    tone(color, Color::Red),
+                ));
+            }
+        } else if let Some(error) = &pr.error {
+            pr_status.push(Line::styled(
+                format!(
+                    "PR discovery failed: {}",
+                    elide(&clean(error), width.saturating_sub(22))
+                ),
+                tone(color, Color::Red),
+            ));
+        } else if automation.pr_enabled {
+            pr_status.push(Line::styled(
+                "PR discovery: pending",
+                tone(color, Color::Yellow),
+            ));
+        } else {
+            pr_status.push(Line::styled("PR discovery: off", muted()));
         }
-        details.spans.extend(spans);
+        let root_label = if pr.url.is_some() {
+            "PR root: "
+        } else {
+            "PR checkout: "
+        };
+        pr_status.push(Line::styled(
+            format!(
+                "{root_label}{}",
+                elide(
+                    &clean(&pr.cwd.to_string_lossy()),
+                    width.saturating_sub(root_label.len() as u16)
+                )
+            ),
+            muted(),
+        ));
     }
+    lines.extend(pr_status);
     if !details.spans.is_empty() {
         lines.push(details);
     }
@@ -958,7 +1078,7 @@ fn draw_help(frame: &mut Frame, area: Rect, color: bool) {
         Line::raw("↑ ↓ / k j       scroll active tab"),
         Line::raw("t  TODO / continuation on/off"),
         Line::raw("c  periodic check-ins on/off"),
-        Line::raw("p  PR watcher on/off"),
+        Line::raw("p  PR watcher on/off or discover"),
         Line::raw("r  start fresh / reset status (confirmation required)"),
         Line::raw("? / Esc         close help"),
         Line::raw("q / Ctrl-C      stop hub"),
@@ -972,19 +1092,16 @@ fn draw_help(frame: &mut Frame, area: Rect, color: bool) {
             accent(color).add_modifier(Modifier::BOLD),
         ),
         Line::raw("Join: Pi /role NAME; Claude mustr_join."),
-        Line::raw("Attach from the intended Pi recipient:"),
+        Line::raw("p discovers from current checkout when no PR is attached."),
+        Line::raw("Explicit attach (Pi recipient):"),
         Line::raw("/mustr-todo [path/to/TODO.md]"),
-        Line::raw("/mustr-pr https://github.com/OWNER/REPO/pull/N"),
-        Line::raw(""),
-        Line::styled("Opt-in, space-local automation", bold()),
-        Line::raw(
-            "Modes are off after hub restart. Turning a mode off cancels undelivered prompts, not already-running work.",
-        ),
-        Line::raw(""),
+        Line::raw("/mustr-pr [PR URL]"),
+        Line::raw("https://github.com/OWNER/REPO/pull/N"),
+        Line::raw("Modes off after restart; off cancels undelivered, not running work."),
         Line::styled("Activity ≠ completion. Done ≠ accepted.", bold()),
-        Line::raw("Only accepted tasks are completed; cancelled is not completion."),
-        Line::raw("Task highlight is browse-only; no task actions."),
-        Line::raw("Stopping the hub leaves agents and external jobs running."),
+        Line::raw("Accepted tasks complete; cancelled are not."),
+        Line::raw("Task highlight is browse-only; no actions."),
+        Line::raw("Quit leaves agents/external jobs running."),
     ];
     if area.width >= 76 {
         let [keys, _, workflow_area] = Layout::horizontal([
@@ -1016,7 +1133,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, snapshot: &Snapshot, view: &View, 
     } else if area.width < 96 {
         "f view · ↑↓/jk scroll · r reset · ? help · q quit"
     } else {
-        "f Msgs/Tasks  ↑↓/jk scroll  t TODO c Check-ins p PR  r reset  ? help  q quit"
+        "f Msgs/Tasks  ↑↓/jk scroll  t TODO c Check-ins p PR on/off/discover  r reset  ? help  q quit"
     };
     let error = snapshot.error.as_deref().filter(|s| !s.is_empty());
     let status = if let Some(error) = error {
@@ -1076,6 +1193,7 @@ mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 
+    mod pr;
     mod reliability;
     mod reset;
     mod work_tabs;
@@ -1103,6 +1221,7 @@ mod tests {
                 activity: Activity::Idle,
                 last_seen: 0,
                 idle_since: 0,
+                cwd: Some(std::path::PathBuf::from("/workspace/orchard")),
             },
             Member {
                 id: AgentId::new("lin"),
@@ -1113,6 +1232,7 @@ mod tests {
                 activity: Activity::Working,
                 last_seen: 0,
                 idle_since: 0,
+                cwd: Some(std::path::PathBuf::from("/workspace/orchard")),
             },
         ];
         snapshot.tasks = vec![
@@ -1189,7 +1309,7 @@ mod tests {
                 error: None,
             }),
             pr: Some(crate::watchers::PrWatch {
-                url: "https://github.com/example/project/pull/42".into(),
+                url: Some("https://github.com/example/project/pull/42".into()),
                 cwd: ".".into(),
                 driver: AgentId::new("ada"),
                 branch: None,
@@ -1424,19 +1544,23 @@ mod tests {
                 "scroll active tab",
                 "t  TODO / continuation on/off",
                 "c  periodic check-ins on/off",
-                "p  PR watcher on/off",
+                "p  PR watcher on/off or discover",
                 "q / Ctrl-C",
                 "? / Esc",
                 "/mustr-todo [path/to/TODO.md]",
                 "/mustr-pr",
                 "https://github.com/OWNER/REPO/pull/N",
-                "Modes are off after hub restart.",
-                "undelivered prompts",
-                "not already-running work.",
+                "p discovers from current checkout",
+                "when no",
+                "PR is attached.",
+                "Modes off after restart;",
+                "not running work.",
                 "Done ≠ accepted.",
-                "Only accepted tasks are completed; cancelled is not completion.",
-                "Task highlight is browse-only; no task actions.",
-                "external jobs running.",
+                "Accepted tasks complete;",
+                "cancelled are",
+                "not.",
+                "Task highlight is browse-only; no actions.",
+                "Quit leaves agents/external jobs running.",
             ] {
                 assert!(
                     text.contains(expected) || unwrapped.contains(expected),
@@ -1535,6 +1659,7 @@ mod tests {
     #[test]
     fn overflowing_roster_and_tasks_are_explicit_and_never_overwrite_footer() {
         let mut snapshot = populated();
+        snapshot.automation.pr = None;
         for index in 0..8 {
             let mut member = snapshot.members[0].clone();
             member.id = AgentId::new(format!("agent-{index}"));

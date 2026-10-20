@@ -85,6 +85,7 @@ fn fresh_join(
             role: progress.participant.role,
             pane_id: progress.participant.pane_id,
             space_id: SpaceId::new("w1"),
+            cwd: None,
             activity: Activity::Offline,
             last_seen: 0,
             idle_since: 0,
@@ -100,6 +101,7 @@ fn fresh_join(
                 role: member.role,
                 pane_id: member.pane_id,
                 space_id: member.space_id,
+                cwd: member.cwd,
                 reset: Some(receipt.clone()),
             },
         ),
@@ -130,6 +132,7 @@ fn direct_join_mode_and_reset_apis_reject_foreign_space_ids() {
                         role: "custom".into(),
                         pane_id: "w2:p1".into(),
                         space_id: SpaceId::new("w2"),
+                        cwd: None,
                         reset: None,
                     },
                 ),
@@ -168,6 +171,7 @@ fn direct_join_mode_and_reset_apis_reject_foreign_space_ids() {
                         role: "custom".into(),
                         pane_id: "w1:p1".into(),
                         space_id: SpaceId::new("w2"),
+                        cwd: None,
                         reset: Some(receipt),
                     },
                 ),
@@ -311,6 +315,7 @@ fn confirmed_receipt_cannot_overwrite_a_moved_or_renamed_current_identity() {
                     role: role.into(),
                     pane_id: pane.into(),
                     space_id: SpaceId::new(space),
+                    cwd: None,
                     reset: None,
                 },
             ),
@@ -439,6 +444,7 @@ fn frozen_source_identities_cannot_move_away_or_reintroduce_old_context() {
                             role: "custom".into(),
                             pane_id: "w2:p1".into(),
                             space_id: SpaceId::new("w2"),
+                            cwd: None,
                             reset: None
                         }
                     ),
@@ -575,6 +581,7 @@ fn frozen_space_blocks_cached_and_ordinary_work_but_only_target_sees_its_control
                         role: "custom".into(),
                         pane_id: "w1:p3".into(),
                         space_id: SpaceId::new("w1"),
+                        cwd: None,
                         reset: None
                     }
                 ),
@@ -619,6 +626,7 @@ fn claim_is_persisted_single_use_and_receipts_validate_all_approved_identity_fie
                     role: "custom".into(),
                     pane_id: "w1:p1".into(),
                     space_id: SpaceId::new("w1"),
+                    cwd: None,
                     reset: None,
                 },
             ),
@@ -648,6 +656,7 @@ fn claim_is_persisted_single_use_and_receipts_validate_all_approved_identity_fie
                             role: role.into(),
                             pane_id: pane.into(),
                             space_id: SpaceId::new(space),
+                            cwd: None,
                             reset: Some(receipt.clone())
                         }
                     ),
@@ -668,6 +677,43 @@ fn claim_is_persisted_single_use_and_receipts_validate_all_approved_identity_fie
         stored.reset_frozen(&SpaceId::new("w1")),
         "other receipt still missing"
     );
+}
+
+#[test]
+fn confirmed_receipt_reconnect_refreshes_presence_and_checkout() {
+    let (mut state, architect, _, config) = fixture();
+    begin(&mut state);
+    let receipt = ticket(&mut state, &architect, &config);
+    claim(&mut state, &architect, &receipt, &config).unwrap();
+    fresh_join(&mut state, &architect, "fresh", &receipt, &config).unwrap();
+    let fresh = AgentId::new("fresh");
+    state.disconnect(&fresh);
+    let checkout = tempfile::tempdir().unwrap();
+    state
+        .apply(
+            &request(
+                "receipt-reconnect",
+                Command::Join {
+                    version: VERSION,
+                    agent_id: fresh.clone(),
+                    name: "architect".into(),
+                    role: "custom".into(),
+                    pane_id: "w1:p1".into(),
+                    space_id: SpaceId::new("w1"),
+                    cwd: Some(checkout.path().to_path_buf()),
+                    reset: Some(receipt),
+                },
+            ),
+            None,
+            99,
+            &config,
+        )
+        .unwrap();
+    let member = &state.members[&fresh];
+    assert_eq!(member.activity, Activity::Paused);
+    assert_eq!(member.last_seen, 99);
+    assert_eq!(member.idle_since, 99);
+    assert_eq!(member.cwd.as_deref(), Some(checkout.path()));
 }
 
 #[test]

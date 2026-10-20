@@ -191,6 +191,7 @@ mod tests {
                 role: "custom".into(),
                 pane_id: "p".into(),
                 space_id: space.clone(),
+                cwd: None,
                 activity: crate::protocol::Activity::Offline,
                 last_seen: 0,
                 idle_since: 0,
@@ -226,6 +227,47 @@ mod tests {
             .query_row("SELECT payload FROM hub WHERE id = 1", [], |row| row.get(0))
             .unwrap();
         assert_eq!(stored, payload, "failed validation must not rewrite data");
+    }
+
+    #[test]
+    fn v3_payload_without_member_cwd_and_with_string_pr_url_remains_readable() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hub.sqlite");
+        let space = SpaceId::new("w1");
+        let mut state = State::new(space.clone());
+        let agent = AgentId::new("agent");
+        state.members.insert(
+            agent.clone(),
+            crate::protocol::Member {
+                id: agent.clone(),
+                name: "worker".into(),
+                role: "custom".into(),
+                pane_id: "w1:p1".into(),
+                space_id: space.clone(),
+                cwd: None,
+                activity: crate::protocol::Activity::Offline,
+                last_seen: 1,
+                idle_since: 1,
+            },
+        );
+        state.automation.pr = Some(crate::watchers::PrWatch {
+            url: Some("https://github.com/example/repo/pull/1".into()),
+            cwd: "/checkout".into(),
+            driver: agent.clone(),
+            branch: Some("feature".into()),
+            head: Some("abc".into()),
+            baseline: None,
+            next_at: 2,
+            error: None,
+        });
+        let mut store = Store::open(&path, space.clone()).unwrap();
+        store.save(&state).unwrap();
+        let loaded = store.load().unwrap();
+        assert_eq!(loaded.members[&agent].cwd, None);
+        assert_eq!(
+            loaded.automation.pr.unwrap().url.as_deref(),
+            Some("https://github.com/example/repo/pull/1")
+        );
     }
 
     #[test]

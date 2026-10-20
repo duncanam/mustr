@@ -33,6 +33,7 @@ fn setup() -> (State, AgentId, AgentId, Scheduling) {
                         role: "custom".into(),
                         pane_id: pane.into(),
                         space_id: SpaceId::new("w1"),
+                        cwd: None,
                         reset: None,
                     },
                 ),
@@ -527,7 +528,7 @@ fn attach_pr(state: &mut State, worker: &AgentId) {
     let a = &mut state.automation;
     a.pr_enabled = true;
     a.pr = Some(PrWatch {
-        url: "https://github.com/example/repo/pull/1".into(),
+        url: Some("https://github.com/example/repo/pull/1".into()),
         cwd: "/fixture".into(),
         driver: worker.clone(),
         branch: None,
@@ -539,6 +540,8 @@ fn attach_pr(state: &mut State, worker: &AgentId) {
 }
 fn pr_observation(failure: bool) -> PrSnapshot {
     PrSnapshot {
+        url: "https://github.com/example/repo/pull/1".into(),
+        cwd: "/fixture/repo".into(),
         branch: "feature".into(),
         head: "abc".into(),
         local_head: "abc".into(),
@@ -553,6 +556,337 @@ fn pr_observation(failure: bool) -> PrSnapshot {
             BTreeMap::new()
         },
     }
+}
+
+#[test]
+fn first_pr_mode_on_binds_authenticated_sender_and_retries_same_failed_discovery() {
+    let (mut state, _, worker, config) = setup();
+    let checkout = tempfile::tempdir().unwrap();
+    state.members.get_mut(&worker).unwrap().cwd = Some(checkout.path().to_path_buf());
+    let result = state
+        .apply(
+            &request(
+                "discover-pr",
+                Command::Mode {
+                    mode: Mode::Pr,
+                    enabled: true,
+                },
+            ),
+            Some(&worker),
+            10,
+            &config,
+        )
+        .unwrap();
+    assert_eq!(result, json!({"enabled":true}));
+    assert!(state.automation.pr_enabled);
+    let watch = state.automation.pr.as_ref().unwrap();
+    assert_eq!(watch.driver, worker);
+    assert_eq!(watch.cwd, checkout.path());
+    assert_eq!(watch.url, None);
+    assert_eq!(watch.error, None);
+    assert!(watch.baseline.is_none());
+    let original_generation = state.automation.generation;
+
+    state
+        .pr_result(
+            &SpaceId::new("w1"),
+            original_generation,
+            Err("gh pr view failed; check authentication".into()),
+            11,
+        )
+        .unwrap();
+    assert!(!state.automation.pr_enabled);
+    assert_eq!(state.automation.pr.as_ref().unwrap().url, None);
+    assert!(state.automation.pr.as_ref().unwrap().error.is_some());
+    assert!(state.automation.pr.as_ref().unwrap().baseline.is_none());
+
+    state
+        .set_mode(&SpaceId::new("w1"), Mode::Pr, true, 12)
+        .unwrap();
+    let retry = state.automation.pr.as_ref().unwrap();
+    assert!(state.automation.pr_enabled);
+    assert_eq!(retry.driver, worker);
+    assert_eq!(retry.cwd, checkout.path());
+    assert_eq!(retry.url, None);
+    assert_eq!(retry.error, None);
+    assert!(state.automation.generation > original_generation);
+}
+
+#[test]
+fn automatic_pr_discovery_requires_a_live_unpaused_member_with_checkout() {
+    let (mut state, _, worker, config) = setup();
+    let before = state.clone();
+    assert!(
+        state
+            .apply(
+                &request(
+                    "missing-cwd",
+                    Command::Mode {
+                        mode: Mode::Pr,
+                        enabled: true
+                    }
+                ),
+                Some(&worker),
+                1,
+                &config,
+            )
+            .is_err()
+    );
+    assert_eq!(state, before);
+
+    let checkout = tempfile::tempdir().unwrap();
+    state.members.get_mut(&worker).unwrap().cwd = Some(checkout.path().to_path_buf());
+    state.members.get_mut(&worker).unwrap().activity = Activity::Paused;
+    let before = state.clone();
+    assert!(
+        state
+            .apply(
+                &request(
+                    "paused",
+                    Command::Mode {
+                        mode: Mode::Pr,
+                        enabled: true
+                    }
+                ),
+                Some(&worker),
+                1,
+                &config,
+            )
+            .is_err()
+    );
+    assert_eq!(state, before);
+}
+
+#[test]
+fn explicit_pr_attachment_remains_off_until_the_user_enables_it() {
+    let (mut state, _, worker, config) = setup();
+    let checkout = tempfile::tempdir().unwrap();
+    state
+        .apply(
+            &request(
+                "attach-explicit-pr",
+                Command::ConfigurePr {
+                    url: "https://github.com/example/repo/pull/1".into(),
+                    cwd: checkout.path().display().to_string(),
+                },
+            ),
+            Some(&worker),
+            10,
+            &config,
+        )
+        .unwrap();
+    let watch = state.automation.pr.as_ref().unwrap();
+    assert!(!state.automation.pr_enabled);
+    assert_eq!(
+        watch.url.as_deref(),
+        Some("https://github.com/example/repo/pull/1")
+    );
+    assert_eq!(watch.driver, worker);
+    assert_eq!(watch.cwd, checkout.path());
+    assert!(watch.baseline.is_none());
+
+    state
+        .apply(
+            &request(
+                "enable-explicit-pr",
+                Command::Mode {
+                    mode: Mode::Pr,
+                    enabled: true,
+                },
+            ),
+            Some(&worker),
+            11,
+            &config,
+        )
+        .unwrap();
+    assert!(state.automation.pr_enabled);
+    assert_eq!(
+        state.automation.pr.as_ref().unwrap().url.as_deref(),
+        Some("https://github.com/example/repo/pull/1")
+    );
+}
+
+#[test]
+fn discovered_watch_pins_url_root_only_after_complete_success_and_never_retargets() {
+    let (mut state, _, worker, _config) = setup();
+    let checkout = tempfile::tempdir().unwrap();
+    let nested = checkout.path().join("package");
+    std::fs::create_dir(&nested).unwrap();
+    state.members.get_mut(&worker).unwrap().cwd = Some(nested.clone());
+    state
+        .enable_pr_discovery(&SpaceId::new("w1"), &worker, 10)
+        .unwrap();
+    let generation = state.automation.generation;
+    assert_eq!(state.automation.pr.as_ref().unwrap().url, None);
+    assert!(state.automation.pr.as_ref().unwrap().baseline.is_none());
+
+    let mut discovered = pr_observation(false);
+    discovered.cwd = checkout.path().to_path_buf();
+    state
+        .pr_result(&SpaceId::new("w1"), generation, Ok(discovered), 11)
+        .unwrap();
+    let pinned = state.automation.pr.as_ref().unwrap();
+    assert_eq!(
+        pinned.url.as_deref(),
+        Some("https://github.com/example/repo/pull/1")
+    );
+    assert_eq!(pinned.cwd, checkout.path());
+    assert!(pinned.baseline.is_some());
+
+    let before_baseline = pinned.baseline.clone();
+    let mut changed = pr_observation(false);
+    changed.url = "https://github.com/another/repo/pull/2".into();
+    changed.cwd = checkout.path().to_path_buf();
+    state
+        .pr_result(&SpaceId::new("w1"), generation, Ok(changed), 12)
+        .unwrap();
+    let pinned = state.automation.pr.as_ref().unwrap();
+    assert!(!state.automation.pr_enabled);
+    assert_eq!(
+        pinned.url.as_deref(),
+        Some("https://github.com/example/repo/pull/1")
+    );
+    assert_eq!(pinned.baseline, before_baseline);
+    assert!(
+        pinned
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("retarget"))
+    );
+
+    // A first-setup toggle racing an already resolved attachment only toggles it;
+    // it never replaces the explicit URL with branch discovery.
+    let (mut attached, _, attached_driver, config) = setup();
+    attach_pr(&mut attached, &attached_driver);
+    attached
+        .apply(
+            &request(
+                "enable-explicit",
+                Command::Mode {
+                    mode: Mode::Pr,
+                    enabled: true,
+                },
+            ),
+            Some(&attached_driver),
+            20,
+            &config,
+        )
+        .unwrap();
+    assert_eq!(
+        attached.automation.pr.as_ref().unwrap().url.as_deref(),
+        Some("https://github.com/example/repo/pull/1")
+    );
+    let before = attached.clone();
+    assert!(
+        attached
+            .enable_pr_discovery(&SpaceId::new("w1"), &attached_driver, 21)
+            .is_err()
+    );
+    assert_eq!(
+        attached, before,
+        "a picker race cannot replace an attached PR"
+    );
+}
+
+#[test]
+fn unresolved_pr_results_are_fenced_by_off_reset_disconnect_and_reconfigure() {
+    let checkout = tempfile::tempdir().unwrap();
+
+    let (mut off, _, off_driver, _) = setup();
+    off.members.get_mut(&off_driver).unwrap().cwd = Some(checkout.path().to_path_buf());
+    off.enable_pr_discovery(&SpaceId::new("w1"), &off_driver, 1)
+        .unwrap();
+    let off_generation = off.automation.generation;
+    off.set_mode(&SpaceId::new("w1"), Mode::Pr, false, 2)
+        .unwrap();
+    let before = off.clone();
+    let mut observation = pr_observation(false);
+    observation.cwd = checkout.path().to_path_buf();
+    off.pr_result(
+        &SpaceId::new("w1"),
+        off_generation,
+        Ok(observation.clone()),
+        3,
+    )
+    .unwrap();
+    assert_eq!(off, before);
+
+    let (mut reset, reset_requester, reset_driver, reset_config) = setup();
+    reset.members.get_mut(&reset_driver).unwrap().cwd = Some(checkout.path().to_path_buf());
+    reset
+        .enable_pr_discovery(&SpaceId::new("w1"), &reset_driver, 1)
+        .unwrap();
+    let reset_generation = reset.automation.generation;
+    for agent in [&reset_requester, &reset_driver] {
+        reset
+            .apply(
+                &request("capability", Command::ResetCapability),
+                Some(agent),
+                1,
+                &reset_config,
+            )
+            .unwrap();
+    }
+    let preview = reset.reset_preview(&SpaceId::new("w1")).unwrap();
+    reset.start_reset(&preview).unwrap();
+    let before = reset.clone();
+    reset
+        .pr_result(
+            &SpaceId::new("w1"),
+            reset_generation,
+            Ok(observation.clone()),
+            3,
+        )
+        .unwrap();
+    assert_eq!(reset, before);
+
+    let (mut disconnected, _, disconnected_driver, _) = setup();
+    disconnected
+        .members
+        .get_mut(&disconnected_driver)
+        .unwrap()
+        .cwd = Some(checkout.path().to_path_buf());
+    disconnected
+        .enable_pr_discovery(&SpaceId::new("w1"), &disconnected_driver, 1)
+        .unwrap();
+    let disconnected_generation = disconnected.automation.generation;
+    disconnected.disconnect(&disconnected_driver);
+    let before = disconnected.clone();
+    disconnected
+        .pr_result(
+            &SpaceId::new("w1"),
+            disconnected_generation,
+            Ok(observation.clone()),
+            3,
+        )
+        .unwrap();
+    assert_eq!(disconnected, before);
+
+    let (mut replaced, _, replaced_driver, config) = setup();
+    replaced.members.get_mut(&replaced_driver).unwrap().cwd = Some(checkout.path().to_path_buf());
+    replaced
+        .enable_pr_discovery(&SpaceId::new("w1"), &replaced_driver, 1)
+        .unwrap();
+    let pending_generation = replaced.automation.generation;
+    replaced
+        .apply(
+            &request(
+                "explicit-reconfigure",
+                Command::ConfigurePr {
+                    url: "https://github.com/example/repo/pull/2".into(),
+                    cwd: checkout.path().display().to_string(),
+                },
+            ),
+            Some(&replaced_driver),
+            2,
+            &config,
+        )
+        .unwrap();
+    let before = replaced.clone();
+    replaced
+        .pr_result(&SpaceId::new("w1"), pending_generation, Ok(observation), 3)
+        .unwrap();
+    assert_eq!(replaced, before);
 }
 
 #[test]

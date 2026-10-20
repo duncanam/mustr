@@ -14,6 +14,7 @@ The dashboard should read as a coordination console, not three equally weighted 
 - **Terminal-native:** inherit the terminal background and foreground. Do not force a dark theme on a light terminal; avoid RGB palettes and dependencies on icon fonts.
 - **Honest state:** participant activity is not task completion; sending a message is not evidence that work finished. Presentation must preserve those distinctions.
 - **Discoverable controls:** keep keyboard hints visible and detailed help available without changing the established commands.
+- **PR setup without URL copying:** first `p` enables discovery from a sole eligible participant's checkout, or opens a recipient picker when several are eligible. Show participant name, role and checkout; never rank by role or use the hub's cwd. Escape cancels without enabling. Modal keys must not leak into reset, navigation or automation. Distinguish discovery in progress, the pinned PR and disabled errors; do not report successful watching before discovery completes.
 
 The [Ratatui showcase](https://ratatui.rs/showcase/apps/) provides useful references: oxker's compact status summaries, counted panel headings and rounded borders; joshuto's bounded columns and strong selection hierarchy. These are composition cues, not themes to copy verbatim. Alignment with herdr should remain terminal-native rather than impose a competing color scheme.
 

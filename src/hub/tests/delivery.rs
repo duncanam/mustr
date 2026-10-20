@@ -186,6 +186,7 @@ fn disconnect_requires_explicit_guidance_even_after_reconnect_with_automation_on
                     role: "custom".into(),
                     pane_id: "w1:p2".into(),
                     space_id: SpaceId::new("w1"),
+                    cwd: None,
                     reset: None,
                 },
             ),

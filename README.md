@@ -33,7 +33,7 @@ Roles can be selected before the hub starts. Agents keep their own normal conver
 |---|---|
 | `t` | Toggle TODO/task continuation |
 | `c` | Toggle periodic check-ins |
-| `p` | Toggle PR watching |
+| `p` | Toggle PR watching; discover the branch's PR on first enable |
 | `f` | Switch Messages / Tasks tab |
 | `r` | Start fresh in this space / inspect reset status (confirmation required) |
 | `↑` / `↓`, `k` / `j` | Scroll messages or browse tasks in the active tab |
@@ -41,7 +41,9 @@ Roles can be selected before the hub starts. Agents keep their own normal conver
 
 Messages and Tasks share a pane with independent scroll positions. The pane border shows total tasks and accepted completions for this space; awaiting-review and cancelled tasks are not counted as completed.
 
-Modes start **off**. From the intended Pi recipient, attach a checklist with `/mustr-todo path/to/TODO.md` or a PR with `/mustr-pr https://github.com/OWNER/REPO/pull/123`, then enable its mode. `/mustr pause`, `/mustr resume`, and `/mustr leave` control participation. Escape pauses automated delivery.
+Modes start **off**. Press `p` to start discovering the current branch's PR from a participant's checkout; if several participants are eligible, choose who should receive feedback. Watching begins after discovery and validation succeed. From Pi, `/mustr pr on` discovers for that session when no watch is attached. Discovery uses `gh` without a model and pins the resulting PR URL; errors appear in the dashboard. `/mustr-pr https://github.com/OWNER/REPO/pull/123` remains an explicit override, initially off.
+
+Attach a checklist with `/mustr-todo path/to/TODO.md`, then enable TODO mode. `/mustr pause`, `/mustr resume`, and `/mustr leave` control participation. Escape pauses automated delivery.
 
 ## Configure
 

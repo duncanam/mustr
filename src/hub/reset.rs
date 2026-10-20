@@ -330,6 +330,7 @@ impl State {
         role: &str,
         pane: &str,
         space: &SpaceId,
+        cwd: Option<&std::path::PathBuf>,
         receipt: &ResetReceipt,
         now: u64,
     ) -> Result<Value> {
@@ -396,7 +397,10 @@ impl State {
         self.reset_capable.remove(agent);
         if let Some(member) = self.members.get_mut(&old) {
             member.activity = Activity::Offline;
+            member.cwd = None;
         }
+        // A confirmed receipt may be retried after transport loss. Preserve the
+        // existing fresh-join behavior: refresh presence and checkout context.
         self.members.insert(
             agent.clone(),
             Member {
@@ -405,6 +409,7 @@ impl State {
                 role: role.into(),
                 pane_id: pane.into(),
                 space_id: space.clone(),
+                cwd: cwd.cloned(),
                 activity: Activity::Paused,
                 last_seen: now,
                 idle_since: now,

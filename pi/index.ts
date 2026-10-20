@@ -280,7 +280,7 @@ export default function mustr(pi: ExtensionAPI) {
           if (!currentSession(mine)) return;
           if (!resetIdle(commandCtx) || !sameIdentity(live, approval.identity)) throw new HubRemoteError("Fresh identity or idle state changed");
           next = new HubClient(); bindClient(next, mine);
-          const hello = await next.connect(live.socket, { agent_id: id, name: approval.control.name, role: selected.name, pane_id: live.pane_id, space_id: live.space_id, reset: { plan_id: approval.control.plan_id, token: approval.control.token } });
+          const hello = await next.connect(live.socket, { agent_id: id, name: approval.control.name, role: selected.name, pane_id: live.pane_id, space_id: live.space_id, cwd: resolve(commandCtx.cwd), reset: { plan_id: approval.control.plan_id, token: approval.control.token } });
           if (!currentSession(mine, next)) return;
           if (hello.reset_receipt !== true || hello.agent_id !== id || hello.reset_protocol !== 1) throw new HubRemoteError("Fresh-session receipt was not confirmed");
           await negotiate(next, hello, mine);
@@ -357,7 +357,7 @@ export default function mustr(pi: ExtensionAPI) {
         if (!currentSession(mine) || !role) return;
         const next = new HubClient(); bindClient(next, mine);
         const receipt = freshReceipt ? { plan_id: freshReceipt.control.plan_id, token: freshReceipt.control.token } : undefined;
-        const hello = await next.connect(live.socket, { agent_id: ctx!.sessionManager.getSessionId(), name, role: role.name, pane_id: live.pane_id, space_id: live.space_id, ...(receipt ? { reset: receipt } : {}) });
+        const hello = await next.connect(live.socket, { agent_id: ctx!.sessionManager.getSessionId(), name, role: role.name, pane_id: live.pane_id, space_id: live.space_id, cwd: resolve(ctx!.cwd), ...(receipt ? { reset: receipt } : {}) });
         if (!currentSession(mine, next)) { next.close(); return; }
         await negotiate(next, hello, mine);
         if (!currentSession(mine, next) || !next.connected) return;

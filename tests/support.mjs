@@ -51,18 +51,26 @@ export async function fixture(t) {
   const env = { ...process.env, HERDR_ENV: "1", HERDR_SOCKET_PATH: socket, HERDR_PANE_ID: "w1:p0", MUSTR_CONFIG_DIR: `${directory}/config`, MUSTR_STATE_DIR: `${directory}/state`, NO_COLOR: "1" };
   const children = new Set();
   const runtimeSockets = new Set();
+  const beforeCleanup = [];
   t.after(async () => {
-    for (const child of children) await stop(child);
+    const errors = [];
+    const attempt = async operation => {
+      try { await operation(); } catch (error) { errors.push(error); }
+    };
+    for (const cleanup of beforeCleanup.reverse()) await attempt(cleanup);
+    for (const child of children) await attempt(() => stop(child));
     for (const connection of connections) connection.destroy();
-    await new Promise(resolve => server.close(resolve));
+    await attempt(() => new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve())));
     for (const runtimeSocket of runtimeSockets) {
-      await rm(runtimeSocket, { force: true });
-      await rm(runtimeSocket.replace(/\.sock$/, ".lock"), { force: true });
+      await attempt(() => rm(runtimeSocket, { force: true }));
+      await attempt(() => rm(runtimeSocket.replace(/\.sock$/, ".lock"), { force: true }));
     }
     const legacySocket = join(dirname(discovery.socket), `${discovery.server_key}.sock`);
-    await rm(legacySocket, { force: true });
-    await rm(legacySocket.replace(/\.sock$/, ".lock"), { force: true });
-    await rm(directory, { recursive: true, force: true });
+    await attempt(() => rm(legacySocket, { force: true }));
+    await attempt(() => rm(legacySocket.replace(/\.sock$/, ".lock"), { force: true }));
+    await attempt(() => rm(directory, { recursive: true, force: true }));
+    if (errors.length === 1) throw errors[0];
+    if (errors.length > 1) throw new AggregateError(errors, "Fixture cleanup failed");
   });
   await exec(binary, ["init"], { env });
   await writeFile(`${directory}/config/config.toml`, "version = 1\n[scheduling]\ncontinuation_seconds = 1\ncheckin_seconds = 5\nmax_nudges = 2\n");
@@ -75,6 +83,7 @@ export async function fixture(t) {
   const discovery = await discover();
   return {
     directory, env, discovery, panes, spaces, discover,
+    beforeCleanup(callback) { beforeCleanup.push(callback); },
     database(identity = discovery) {
       const instanceKey = basename(identity.socket, ".sock");
       return `${env.MUSTR_STATE_DIR}/${identity.server_key}/${instanceKey}/hub.sqlite`;

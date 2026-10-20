@@ -51,6 +51,8 @@ The foreground and background always follow the terminal. Accents use its ANSI p
 
 Automation enablement is deliberately **not** an automatic-start configuration setting. TODO continuation, check-ins, and PR watching are independent, per-space switches, all off when a hub starts or recovers.
 
+PR watching does not require a URL in configuration. Dashboard `p` starts background discovery of the branch's PR from the selected participant's checkout; `/mustr pr on` uses the calling Pi's checkout when there is no attached watch. Enabling starts discovery, not immediate feedback delivery: the watcher first validates and pins the PR. `gh` must be installed and authenticated in the hub's environment. Selection and discovery errors are visible rather than falling back to another checkout or participant. `/mustr-pr URL` remains an explicit override; see [PR watching](architecture.md#pr-watching).
+
 ## Editable roles
 
 Role files are `roles/<name>.md`. A name is 1–48 lowercase ASCII letters, digits, or hyphens, starting with a letter. Plain Markdown is sufficient; optional TOML front matter supplies a description and an ordered list of component roles:
@@ -112,3 +114,5 @@ The installer takes an explicit harness: `mustr install pi` or `mustr install cl
 Disable the old pair, TODO, and PR-watch schedulers before selecting a mustr role: `/pair-disable`, `/todo-disable`, `/pr-watch off`, where installed. Remove their extension registrations if you no longer need them. mustr cannot safely infer or take over another extension's private scheduler state, and does not silently deactivate unrelated extensions. Running both scheduling systems is unsupported.
 
 Restart Pi or `/reload` after installation. New/reloaded sessions are unjoined. `mustr install pi` must be invoked explicitly; building or testing this repository never installs into a live Pi directory.
+
+Automatic PR discovery needs the updated hub and checkout-advertising adapter. After reconciling active work, update/restart the hub before reloading and explicitly rejoining updated adapters: older hubs reject the new `cwd` join field. Existing per-space version-3 records remain readable; missing checkout context defaults to unavailable until a current adapter rejoins. This does not import old shared multi-space history or re-enable automation.

@@ -2,6 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
+import net from "node:net";
+import { isAbsolute } from "node:path";
 import { fixture, eventually, pause } from "./fixture.mjs";
 
 async function initialize(mcp) {
@@ -73,6 +75,43 @@ test("join is explicit, resolves the role, and keeps ordinary activity working",
   const duplicate = await mcp.tool("mustr_join", { role: "implementor" });
   assert.equal(duplicate.isError, true);
   assert.match(duplicate.content[0].text, /Already joined/);
+});
+
+test("Claude Join advertises its absolute checkout without shell or model discovery", { timeout: 60000 }, async t => {
+  const f = await fixture(t);
+  const socketPath = `${f.directory}/join-capture.sock`;
+  let resolveJoin;
+  const seen = new Promise(resolve => { resolveJoin = resolve; });
+  const server = net.createServer(socket => {
+    let buffer = "";
+    socket.setEncoding("utf8");
+    socket.on("data", chunk => {
+      buffer += chunk;
+      while (buffer.includes("\n")) {
+        const end = buffer.indexOf("\n");
+        const request = JSON.parse(buffer.slice(0, end));
+        buffer = buffer.slice(end + 1);
+        if (request.op === "join") resolveJoin(request);
+        const result = request.op === "join"
+          ? { protocol: 1, agent_id: request.agent_id, delivery_policy: 1, inbox_notifications: 1 }
+          : request.op === "sync" ? { members: [], tasks: [], automation: {}, inbox: null } : {};
+        socket.write(`${JSON.stringify({ id: request.id, ok: true, result })}\n`);
+      }
+    });
+  });
+  server.listen(socketPath);
+  await new Promise(resolve => server.once("listening", resolve));
+  t.after(() => new Promise(resolveClose => server.close(resolveClose)));
+  const wrapper = `${f.directory}/mustr-join-capture.mjs`;
+  await writeFile(wrapper, `#!${process.execPath}\nconst args=process.argv.slice(2);\nif(args.includes("roles")) process.stdout.write(JSON.stringify([{name:"implementor",description:"fixture role",prompt:"fixture prompt"}]));\nelse if(args.includes("context")) process.stdout.write(JSON.stringify({socket:process.env.FAKE_HUB_SOCKET,server_key:"fixture",pane_id:"w1:p1",space_id:"w1"}));\nelse process.exit(2);\n`, { mode: 0o700 });
+  const { mcp } = f.startAdapter({ MUSTR_BIN: wrapper, FAKE_HUB_SOCKET: socketPath });
+  await initialize(mcp);
+  const join = resultValue(await mcp.tool("mustr_join", { role: "implementor" }));
+  assert.equal(join.joined, true);
+  const request = await seen;
+  assert.ok(isAbsolute(request.cwd));
+  assert.equal(request.cwd, process.cwd());
+  await mcp.tool("mustr_leave").then(resultValue);
 });
 
 test("wait heartbeats while idle and cancellation restores working before later heartbeats", { timeout: 60000 }, async t => {

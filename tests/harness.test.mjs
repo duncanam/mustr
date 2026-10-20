@@ -1,7 +1,29 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
+import { stat } from "node:fs/promises";
 import { HubClient } from "../pi/transport.mjs";
 import { fixture } from "./support.mjs";
+
+test("fixture cleanup stops children and removes files even when adapter teardown fails", async t => {
+  let cleanup;
+  let cleanupStarted = false;
+  const f = await fixture({ after: callback => { cleanup = callback; } });
+  t.after(async () => {
+    if (!cleanupStarted) {
+      cleanupStarted = true;
+      await cleanup();
+    }
+  });
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  f.track(child);
+  f.beforeCleanup(async () => { throw new Error("fixture teardown sentinel"); });
+
+  cleanupStarted = true;
+  await assert.rejects(cleanup(), /fixture teardown sentinel/);
+  assert.ok(child.exitCode !== null || child.signalCode !== null, "tracked subprocess is stopped after callback failure");
+  await assert.rejects(stat(f.directory), { code: "ENOENT" }, "fixture files are removed after callback failure");
+});
 
 async function join(t, f, id, pane = "w1:p2") {
   const client = new HubClient();

@@ -1,9 +1,70 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { chmod, readFile, stat, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { fixture, binary, eventually, delay, stop } from "../../tests/support.mjs";
 import { HubClient } from "../transport.mjs";
 
 import { harness } from "./adapter-harness.mjs";
+
+test("fixture drains Pi adapter discovery before removing its config directory", { timeout: 10000 }, async t => {
+  const f = await fixture(t);
+  const config = `${f.directory}/config`;
+  const started = join(config, "context-started");
+  const finished = join(config, "context-finished");
+  const previousEnv = new Map(["HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_PANE_ID", "MUSTR_CONFIG_DIR", "MUSTR_STATE_DIR", "MUSTR_BIN"]
+    .map(key => [key, process.env[key]]));
+  const identity = {
+    pane_id: "w1:p1", space_id: "w1", server_key: "fixture",
+    socket: join(f.directory, "unused.sock"),
+  };
+  const roles = [{ name: "implementor", description: "fixture", prompt: "fixture role" }];
+  const fakeBinary = join(f.directory, "fake-mustr.mjs");
+  await writeFile(fakeBinary, `#!/usr/bin/env node
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
+const args = process.argv.slice(2);
+const config = ${JSON.stringify(config)};
+if (args.includes("roles")) {
+  console.log(${JSON.stringify(JSON.stringify(roles))});
+} else if (args.includes("context")) {
+  await writeFile(join(config, "context-started"), "started");
+  await delay(150);
+  await mkdir(config, { recursive: true });
+  await writeFile(join(config, "context-finished"), "finished");
+  console.log(${JSON.stringify(JSON.stringify(identity))});
+} else {
+  process.exitCode = 2;
+}
+`);
+  await chmod(fakeBinary, 0o755);
+  Object.assign(process.env, f.env, { HERDR_PANE_ID: "w1:p1", MUSTR_BIN: fakeBinary });
+  const { default: extension } = await import(`../index.ts?fixture-cleanup=${Date.now()}`);
+  const h = harness(f.directory);
+  let sawContextStart = false;
+  let shutdownComplete = false;
+  f.beforeCleanup(async () => {
+    try {
+      await h.emit("session_shutdown");
+      if (sawContextStart) assert.equal(await readFile(finished, "utf8"), "finished");
+      shutdownComplete = true;
+    } finally {
+      for (const [key, value] of previousEnv) value === undefined ? delete process.env[key] : process.env[key] = value;
+    }
+  });
+  await extension(h.api);
+  await h.emit("session_start");
+  await h.commands.get("role").handler("implementor", h.context);
+  await eventually(async () => {
+    try { await readFile(started, "utf8"); sawContextStart = true; return true; }
+    catch { return false; }
+  });
+  t.after(async () => {
+    assert.equal(shutdownComplete, true, "adapter shutdown is awaited by fixture cleanup");
+    await assert.rejects(stat(f.directory), { code: "ENOENT" }, "fixture directory is removed after adapter teardown");
+  });
+});
 
 test("adapter: explicit join before hub, human gating, settled report, policies and topology changes", { timeout: 30000 }, async t => {
   const f = await fixture(t);
@@ -11,7 +72,7 @@ test("adapter: explicit join before hub, human gating, settled report, policies 
   process.env.MUSTR_BIN = binary; process.env.HERDR_PANE_ID = "w1:p1";
   const { default: extension } = await import(`../index.ts?fixture=${Date.now()}`);
   const h = harness(f.directory); await extension(h.api); await h.emit("session_start");
-  t.after(() => h.emit("session_shutdown"));
+  f.beforeCleanup(() => h.emit("session_shutdown"));
   assert.deepEqual(h.active(), ["read", "bash", "policy-tool"]);
   assert.equal(h.commands.has("architect"), false, "role shortcuts are not registered");
   assert.equal(h.commands.has("implementor"), false);
@@ -81,7 +142,7 @@ test("mustr_roster identifies self among same-role participants", { timeout: 150
   process.env.MUSTR_BIN = binary; process.env.HERDR_PANE_ID = "w1:p1";
   const { default: extension } = await import(`../index.ts?roster-self=${Date.now()}`);
   const h = harness(f.directory); await extension(h.api); await h.emit("session_start");
-  t.after(() => h.emit("session_shutdown"));
+  f.beforeCleanup(() => h.emit("session_shutdown"));
   await h.commands.get("role").handler("implementor local-implementor", h.context);
   await eventually(() => h.tools.get("mustr_roster").execute("ready", {}, undefined));
   const peer = new HubClient(); t.after(() => peer.close());
@@ -116,7 +177,7 @@ test("socket push delivers without a polling tick and coalesces concurrent wakeu
   t.after(() => { HubClient.prototype.request = original; });
   const { default: extension } = await import(`../index.ts?push=${Date.now()}`);
   const h = harness(f.directory); await extension(h.api); await h.emit("session_start");
-  t.after(() => h.emit("session_shutdown"));
+  f.beforeCleanup(() => h.emit("session_shutdown"));
   await h.commands.get("role").handler("implementor", h.context);
   await eventually(() => h.tools.get("mustr_roster").execute("roster", {}, undefined));
   await delay(150); // initial poll has finished; next fallback is ten seconds away
@@ -140,7 +201,7 @@ for (const gate of ["editor", "human", "busy", "dialog"]) test(`offer/input race
   process.env.MUSTR_BIN = binary; process.env.HERDR_PANE_ID = "w1:p1";
   const { default: extension } = await import(`../index.ts?race=${gate}-${Date.now()}`);
   const h = harness(f.directory); await extension(h.api); await h.emit("session_start");
-  t.after(() => h.emit("session_shutdown"));
+  f.beforeCleanup(() => h.emit("session_shutdown"));
   await h.commands.get("role").handler("implementor", h.context);
   await eventually(() => h.tools.get("mustr_roster").execute("roster", {}, undefined));
   const peer = new HubClient(); t.after(() => peer.close());
@@ -184,7 +245,7 @@ test("active human input stays working and an older user start cannot release a 
   process.env.MUSTR_BIN = binary; process.env.HERDR_PANE_ID = "w1:p1";
   const { default: extension } = await import(`../index.ts?input-generations=${Date.now()}`);
   const h = harness(f.directory); await extension(h.api); await h.emit("session_start");
-  t.after(() => h.emit("session_shutdown"));
+  f.beforeCleanup(() => h.emit("session_shutdown"));
   await h.commands.get("role").handler("implementor", h.context);
   await eventually(() => h.tools.get("mustr_roster").execute("roster", {}, undefined));
   const peer = new HubClient(); t.after(() => peer.close());
@@ -218,7 +279,7 @@ for (const order of ["human-first", "extension-first"]) test(`extension-origin u
   process.env.MUSTR_BIN = binary; process.env.HERDR_PANE_ID = "w1:p1";
   const { default: extension } = await import(`../index.ts?input-origin=${order}-${Date.now()}`);
   const h = harness(f.directory); await extension(h.api); await h.emit("session_start");
-  t.after(() => h.emit("session_shutdown"));
+  f.beforeCleanup(() => h.emit("session_shutdown"));
   await h.commands.get("role").handler("implementor", h.context);
   await eventually(() => h.tools.get("mustr_roster").execute("roster", {}, undefined));
   const peer = new HubClient(); t.after(() => peer.close());
@@ -252,7 +313,7 @@ test("same-text cross-origin start stays fenced until explicit idle recovery", {
   process.env.MUSTR_BIN = binary; process.env.HERDR_PANE_ID = "w1:p1";
   const { default: extension } = await import(`../index.ts?ambiguous-input=${Date.now()}`);
   const h = harness(f.directory); await extension(h.api); await h.emit("session_start");
-  t.after(() => h.emit("session_shutdown"));
+  f.beforeCleanup(() => h.emit("session_shutdown"));
   await h.commands.get("role").handler("implementor", h.context);
   await eventually(() => h.tools.get("mustr_roster").execute("roster", {}, undefined));
   const peer = new HubClient(); t.after(() => peer.close());
@@ -279,7 +340,7 @@ test("extension-origin input does not undo a terminal report stop", { timeout: 1
   process.env.MUSTR_BIN = binary; process.env.HERDR_PANE_ID = "w1:p1";
   const { default: extension } = await import(`../index.ts?extension-report=${Date.now()}`);
   const h = harness(f.directory); await extension(h.api); await h.emit("session_start");
-  t.after(() => h.emit("session_shutdown"));
+  f.beforeCleanup(() => h.emit("session_shutdown"));
   await h.commands.get("role").handler("implementor", h.context);
   await eventually(() => h.tools.get("mustr_roster").execute("roster", {}, undefined));
   const report = await h.tools.get("mustr_report").execute("terminal", { task_id: "task", revision: 1, kind: "done", text: "Staged only" }, undefined);
@@ -294,7 +355,7 @@ test("handled or rejected input fails closed until an explicit idle resume", { t
   process.env.MUSTR_BIN = binary; process.env.HERDR_PANE_ID = "w1:p1";
   const { default: extension } = await import(`../index.ts?handled-input=${Date.now()}`);
   const h = harness(f.directory); await extension(h.api); await h.emit("session_start");
-  t.after(() => h.emit("session_shutdown"));
+  f.beforeCleanup(() => h.emit("session_shutdown"));
   await h.commands.get("role").handler("implementor", h.context);
   await eventually(() => h.tools.get("mustr_roster").execute("roster", {}, undefined));
   const peer = new HubClient(); t.after(() => peer.close());
@@ -321,7 +382,7 @@ test("attempt marker without a message is never acknowledged or reinjected", { t
   process.env.MUSTR_BIN = binary; process.env.HERDR_PANE_ID = "w1:p1";
   const { default: extension } = await import(`../index.ts?marker=${Date.now()}`);
   const h = harness(f.directory); await extension(h.api); await h.emit("session_start");
-  t.after(() => h.emit("session_shutdown"));
+  f.beforeCleanup(() => h.emit("session_shutdown"));
   await h.commands.get("role").handler("implementor", h.context);
   await eventually(() => h.tools.get("mustr_roster").execute("roster", {}, undefined));
   const peer = new HubClient(); t.after(() => peer.close());
@@ -342,7 +403,7 @@ test("late insertion after hub restart is not acknowledged on the new connection
   process.env.MUSTR_BIN = binary; process.env.HERDR_PANE_ID = "w1:p1";
   const { default: extension } = await import(`../index.ts?restart=${Date.now()}`);
   const h = harness(f.directory); await extension(h.api); await h.emit("session_start");
-  t.after(() => h.emit("session_shutdown"));
+  f.beforeCleanup(() => h.emit("session_shutdown"));
   await h.commands.get("role").handler("implementor", h.context);
   await eventually(() => h.tools.get("mustr_roster").execute("roster", {}, undefined));
   const peer = new HubClient(); t.after(() => peer.close());
@@ -366,7 +427,7 @@ test("informational receipt does not disconnect or strand the next assignment", 
   process.env.MUSTR_BIN = binary; process.env.HERDR_PANE_ID = "w1:p1";
   const { default: extension } = await import(`../index.ts?receipt=${Date.now()}`);
   const h = harness(f.directory); await extension(h.api); await h.emit("session_start");
-  t.after(() => h.emit("session_shutdown"));
+  f.beforeCleanup(() => h.emit("session_shutdown"));
   await h.commands.get("role").handler("implementor", h.context);
   await eventually(() => h.tools.get("mustr_roster").execute("roster", {}, undefined));
   const peer = new HubClient(); t.after(() => peer.close());
@@ -386,7 +447,7 @@ test("live feedback reaches a busy agent; slow insertion keeps heartbeats and hu
   process.env.MUSTR_BIN = binary; process.env.HERDR_PANE_ID = "w1:p1";
   const { default: extension } = await import(`../index.ts?live=${Date.now()}`);
   const h = harness(f.directory); await extension(h.api); await h.emit("session_start");
-  t.after(() => h.emit("session_shutdown"));
+  f.beforeCleanup(() => h.emit("session_shutdown"));
   await h.commands.get("role").handler("implementor", h.context);
   await eventually(() => h.tools.get("mustr_roster").execute("roster", {}, undefined));
   const peer = new HubClient(); t.after(() => peer.close());

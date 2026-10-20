@@ -17,6 +17,16 @@ use crate::{
     watchers::{PrSnapshot, TodoSnapshot},
 };
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PrSelection {
+    pub epoch: u64,
+    pub agent_id: AgentId,
+    pub name: String,
+    pub role: String,
+    pub pane_id: String,
+    pub cwd: PathBuf,
+}
+
 pub(crate) enum Event {
     Request {
         connection: u64,
@@ -31,6 +41,11 @@ pub(crate) enum Event {
         mode: Mode,
         enabled: bool,
         epoch: u64,
+        reply: oneshot::Sender<std::result::Result<(), String>>,
+    },
+    EnablePr {
+        space: SpaceId,
+        selection: PrSelection,
         reply: oneshot::Sender<std::result::Result<(), String>>,
     },
     ResetPreview {
@@ -117,6 +132,19 @@ impl Service {
             })
             .await?;
         response.await?.map_err(|e| eyre!(e))
+    }
+
+    /// Enable automatic PR discovery for the exact participant selection shown to the user.
+    pub async fn enable_pr(&self, selection: PrSelection) -> Result<()> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(Event::EnablePr {
+                space: self.space_id.clone(),
+                selection,
+                reply,
+            })
+            .await?;
+        response.await?.map_err(|error| eyre!(error))
     }
 
     pub async fn reset_preview(&self) -> Result<ResetPreview> {
@@ -432,6 +460,58 @@ impl Actor {
                     .map_err(|e| e.to_string());
                     let _ = reply.send(result);
                 }
+                Event::EnablePr {
+                    space,
+                    selection,
+                    reply,
+                } => {
+                    let mut next = self.state.clone();
+                    let result = (|| {
+                        ensure!(
+                            space == self.space_id,
+                            "PR discovery event belongs to another space"
+                        );
+                        ensure!(
+                            selection.epoch == self.state.reset_epoch(&space),
+                            "PR participant selection predates reset or space change; refresh first"
+                        );
+                        ensure!(
+                            self.space
+                                .as_ref()
+                                .is_some_and(|current| current.id == space),
+                            "space is unavailable; refresh before enabling PR discovery"
+                        );
+                        let member = next
+                            .members
+                            .get(&selection.agent_id)
+                            .filter(|member| {
+                                member.name == selection.name
+                                    && member.role == selection.role
+                                    && member.pane_id == selection.pane_id
+                                    && member.cwd.as_ref() == Some(&selection.cwd)
+                                    && !matches!(
+                                        member.activity,
+                                        Activity::Offline | Activity::Paused
+                                    )
+                            })
+                            .ok_or_else(|| {
+                                eyre!(
+                                    "selected participant or checkout changed; reopen the PR picker"
+                                )
+                            })?;
+                        ensure!(
+                            member
+                                .cwd
+                                .as_ref()
+                                .is_some_and(|cwd| cwd.is_absolute() && cwd.is_dir()),
+                            "selected participant checkout is unavailable; refresh and retry"
+                        );
+                        next.enable_pr_discovery(&space, &selection.agent_id, now)
+                    })()
+                    .and_then(|()| self.commit(next))
+                    .map_err(|error| error.to_string());
+                    let _ = reply.send(result);
+                }
                 Event::ResetPreview { space, reply } => {
                     let result = self.preview(space).map_err(|e| e.to_string());
                     let _ = reply.send(result);
@@ -521,6 +601,184 @@ mod tests {
     mod reset;
 
     #[tokio::test]
+    async fn dashboard_pr_enable_binds_the_exact_selected_live_member() {
+        let directory = tempfile::tempdir().unwrap();
+        let checkout = tempfile::tempdir().unwrap();
+        let space = SpaceId::new("w1");
+        let service = Service::start(
+            space.clone(),
+            directory.path().join("hub.sqlite"),
+            Scheduling::default(),
+        )
+        .await
+        .unwrap();
+        service
+            .tx
+            .send(Event::Space(Ok(Space {
+                id: space.clone(),
+                label: "Orchard".into(),
+            })))
+            .await
+            .unwrap();
+        let agent = AgentId::new("worker");
+        let joined = service
+            .request(
+                1,
+                Request {
+                    id: "join".into(),
+                    command: Command::Join {
+                        version: 1,
+                        agent_id: agent.clone(),
+                        name: "worker".into(),
+                        role: "custom".into(),
+                        pane_id: "w1:p1".into(),
+                        space_id: space.clone(),
+                        cwd: Some(checkout.path().to_path_buf()),
+                        reset: None,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        assert!(joined.ok);
+        service
+            .request(
+                1,
+                Request {
+                    id: "idle".into(),
+                    command: Command::Sync {
+                        activity: Activity::Idle,
+                        receive: false,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let mut snapshots = service.snapshots.clone();
+        service
+            .enable_pr(PrSelection {
+                epoch: snapshots.borrow().epoch,
+                agent_id: agent.clone(),
+                name: "worker".into(),
+                role: "custom".into(),
+                pane_id: "w1:p1".into(),
+                cwd: checkout.path().to_path_buf(),
+            })
+            .await
+            .unwrap();
+        let watch = loop {
+            let snapshot = snapshots.borrow_and_update().clone();
+            if let Some(watch) = snapshot.automation.pr {
+                assert!(snapshot.automation.pr_enabled);
+                break watch;
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(1), snapshots.changed())
+                .await
+                .unwrap()
+                .unwrap();
+        };
+        assert_eq!(watch.driver, agent);
+        assert_eq!(watch.cwd, checkout.path());
+        assert_eq!(watch.url, None);
+        service.stop().await;
+    }
+
+    #[tokio::test]
+    async fn dashboard_pr_enable_rejects_same_id_rejoined_from_new_checkout() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_checkout = tempfile::tempdir().unwrap();
+        let second_checkout = tempfile::tempdir().unwrap();
+        let space = SpaceId::new("w1");
+        let service = Service::start(
+            space.clone(),
+            directory.path().join("hub.sqlite"),
+            Scheduling::default(),
+        )
+        .await
+        .unwrap();
+        service
+            .tx
+            .send(Event::Space(Ok(Space {
+                id: space.clone(),
+                label: "Orchard".into(),
+            })))
+            .await
+            .unwrap();
+        let agent = AgentId::new("worker");
+        let join = |connection: u64, cwd: &std::path::Path| Request {
+            id: format!("join-{connection}"),
+            command: Command::Join {
+                version: 1,
+                agent_id: agent.clone(),
+                name: "worker".into(),
+                role: "custom".into(),
+                pane_id: "w1:p1".into(),
+                space_id: space.clone(),
+                cwd: Some(cwd.to_path_buf()),
+                reset: None,
+            },
+        };
+        service
+            .request(1, join(1, first_checkout.path()))
+            .await
+            .unwrap();
+        service
+            .request(
+                1,
+                Request {
+                    id: "idle".into(),
+                    command: Command::Sync {
+                        activity: Activity::Idle,
+                        receive: false,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        let stale = PrSelection {
+            epoch: service.snapshots.borrow().epoch,
+            agent_id: agent.clone(),
+            name: "worker".into(),
+            role: "custom".into(),
+            pane_id: "w1:p1".into(),
+            cwd: first_checkout.path().to_path_buf(),
+        };
+        let mut stale_epoch = stale.clone();
+        stale_epoch.epoch += 1;
+        assert!(service.enable_pr(stale_epoch).await.is_err());
+        service
+            .request(
+                1,
+                Request {
+                    id: "leave".into(),
+                    command: Command::Leave,
+                },
+            )
+            .await
+            .unwrap();
+        service
+            .request(2, join(2, second_checkout.path()))
+            .await
+            .unwrap();
+        service
+            .request(
+                2,
+                Request {
+                    id: "idle-again".into(),
+                    command: Command::Sync {
+                        activity: Activity::Idle,
+                        receive: false,
+                    },
+                },
+            )
+            .await
+            .unwrap();
+        assert!(service.enable_pr(stale).await.is_err());
+        assert!(service.snapshots.borrow().automation.pr.is_none());
+        service.stop().await;
+    }
+
+    #[tokio::test]
     async fn no_inbox_sync_persists_cancellation_before_reply() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("hub.sqlite");
@@ -552,6 +810,7 @@ mod tests {
                 role: "implementor".into(),
                 pane_id: "w1:p1".into(),
                 space_id: SpaceId::new("w1"),
+                cwd: None,
                 activity: Activity::Idle,
                 last_seen: 0,
                 idle_since: 0,
@@ -646,6 +905,7 @@ mod tests {
                             role: "custom".into(),
                             pane_id: format!("p{connection}"),
                             space_id: SpaceId::new("w1"),
+                            cwd: None,
                             reset: None,
                         },
                     },

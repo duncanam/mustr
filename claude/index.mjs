@@ -272,7 +272,7 @@ async function join(args, active) {
     assertLive(active);
     const hello = await next.connect(discovered.socket, {
       agent_id: agentId, name: requestedName, role: selected.name,
-      pane_id: discovered.pane_id, space_id: discovered.space_id,
+      pane_id: discovered.pane_id, space_id: discovered.space_id, cwd: process.cwd(),
     });
     assertLive(active);
     if (hello?.protocol !== 1 || hello?.agent_id !== agentId || hello?.delivery_policy !== 1 || hello?.inbox_notifications !== 1) {

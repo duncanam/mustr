@@ -18,6 +18,7 @@ fn join(agent: &str, name: &str, pane: &str, reset: Option<ResetReceipt>) -> Req
             role: "custom".into(),
             pane_id: pane.into(),
             space_id: SpaceId::new("w1"),
+            cwd: None,
             reset,
         },
     )
@@ -246,22 +247,35 @@ async fn actor_rejects_foreign_control_events_and_topology_never_rebinds_identit
         })))
         .await
         .unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(1), observed.changed())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(observed.borrow().space_id, SpaceId::new("w1"));
-    assert!(observed.borrow().space.is_none());
+    let observed_snapshot = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let snapshot = observed.borrow_and_update().clone();
+            if snapshot.space_id == SpaceId::new("w1")
+                && snapshot.space.is_none()
+                && snapshot
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("another space"))
+            {
+                break snapshot;
+            }
+            observed.changed().await.unwrap();
+        }
+    })
+    .await;
+    service.stop().await;
+    handle.await.unwrap();
+    let observed_snapshot =
+        observed_snapshot.expect("foreign-space topology result was not published");
+    assert_eq!(observed_snapshot.space_id, SpaceId::new("w1"));
+    assert!(observed_snapshot.space.is_none());
     assert!(
-        observed
-            .borrow()
+        observed_snapshot
             .error
             .as_deref()
             .unwrap()
             .contains("another space")
     );
-    service.stop().await;
-    handle.await.unwrap();
 }
 
 #[test]

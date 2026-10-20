@@ -1,13 +1,15 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { writeFile, stat, mkdir, readFile, readdir, symlink, unlink } from "node:fs/promises";
+import { writeFile, stat, mkdir, readFile, readdir, realpath, symlink, unlink } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { basename } from "node:path";
 import { spawn } from "node:child_process";
+import net from "node:net";
 import { once } from "node:events";
 import { HubClient } from "../pi/transport.mjs";
 import { harness as piHarness } from "../pi/test/adapter-harness.mjs";
 import { fixture, binary, exec, eventually, delay, stop } from "./support.mjs";
+import { installFakePrTools } from "./fake-pr-tools.mjs";
 
 async function join(t, f, id, pane, space = "w1", role = "implementor") {
   const client = new HubClient(); t.after(() => client.close());
@@ -51,6 +53,38 @@ async function receive(client) {
   const snapshot = await sync(client, true);
   if (snapshot.inbox) await client.request({ op: "ack", message_id: snapshot.inbox.id });
   return snapshot.inbox;
+}
+
+async function joinCheckout(t, f, id, pane, cwd) {
+  const client = new HubClient(); t.after(() => client.close());
+  await client.connect(f.discovery.socket, {
+    agent_id: id, name: id, role: "implementor", pane_id: pane, space_id: "w1", cwd,
+  });
+  await client.request({ op: "sync", activity: "working", receive: false });
+  return client;
+}
+
+async function startTuiPty(t, f) {
+  const project = `${f.directory}/uv-pty`; await mkdir(project);
+  await writeFile(`${project}/pyproject.toml`, '[project]\nname = "mustr-pr-pty-test"\nversion = "0.0.0"\nrequires-python = ">=3.9"\ndependencies = []\n');
+  const child = spawn("uv", ["run", "--project", project, fileURLToPath(new URL("pty-interactive.py", import.meta.url)), binary], {
+    env: { ...f.env, TERM: "xterm-256color" }, stdio: ["pipe", "pipe", "pipe"],
+  });
+  f.track(child);
+  let output = "";
+  child.stdout.on("data", chunk => { output += chunk; });
+  child.stderr.on("data", chunk => { output += chunk; });
+  const exited = once(child, "exit");
+  await eventually(() => {
+    if (child.exitCode !== null) throw new Error(`PTY TUI exited early: ${output}`);
+    return output.includes("Automation");
+  }, 15000);
+  await eventually(() => new Promise(resolve => {
+    const socket = net.createConnection(f.discovery.socket);
+    socket.once("connect", () => { socket.destroy(); resolve(true); });
+    socket.once("error", () => resolve(false));
+  }), 10000);
+  return { child, exited, output: () => output, send: bytes => child.stdin.write(bytes) };
 }
 
 test("socket admission rejects invalid initial/reset joins and resolves shared components per agent", { timeout: 15000 }, async t => {
@@ -240,9 +274,11 @@ test("Pi and Claude adapters follow their live per-space context endpoints", { t
   const { default: piExtension } = await import(`../pi/index.ts?space-runtime=${Date.now()}`);
   const pi = piHarness(f.directory);
   await piExtension(pi.api); await pi.emit("session_start");
-  t.after(async () => {
-    await pi.emit("session_shutdown");
-    for (const [key, value] of previousEnv) value === undefined ? delete process.env[key] : process.env[key] = value;
+  f.beforeCleanup(async () => {
+    try { await pi.emit("session_shutdown"); }
+    finally {
+      for (const [key, value] of previousEnv) value === undefined ? delete process.env[key] : process.env[key] = value;
+    }
   });
   await pi.commands.get("role").handler("implementor pi-space-owner", pi.context);
   const piMembers = await eventually(async () => {
@@ -355,7 +391,8 @@ const fs = require("node:fs"), path = require("node:path");
 const input = JSON.parse(fs.readFileSync(process.env.MUSTR_TEST_GITHUB));
 const name = path.basename(process.argv[1]), args = process.argv.slice(2);
 fs.appendFileSync(process.env.MUSTR_TEST_LOG, JSON.stringify({name,args}) + "\\n");
-if (name === "git" && JSON.stringify(args) === JSON.stringify(["rev-parse","--abbrev-ref","HEAD"])) console.log(input.branch);
+if (name === "git" && JSON.stringify(args) === JSON.stringify(["rev-parse","--show-toplevel"])) console.log(process.cwd());
+else if (name === "git" && JSON.stringify(args) === JSON.stringify(["rev-parse","--abbrev-ref","HEAD"])) console.log(input.branch);
 else if (name === "git" && JSON.stringify(args) === JSON.stringify(["rev-parse","HEAD"])) console.log(input.head);
 else if (name === "gh" && args[0] === "pr" && args[1] === "view" && args[2] === input.raw.url && args[3] === "--json") console.log(JSON.stringify(input.raw));
 else if (name === "gh" && JSON.stringify(args) === JSON.stringify(["api","repos/example/repo/pulls/1/comments?per_page=100","--paginate","--slurp"])) console.log(JSON.stringify(input.pages));
@@ -382,6 +419,151 @@ else { console.error("Unexpected command"); process.exit(99); }
   const calls = (await readFile(log, "utf8")).trim().split("\n").map(line => JSON.parse(line));
   assert.ok(calls.some(c => c.args[0] === "api" && c.args.includes("--paginate")));
   assert.ok(calls.every(c => c.name === "git" ? c.args[0] === "rev-parse" : ["pr", "api"].includes(c.args[0])));
+});
+
+test("Join cwd auto-discovers once, pins the URL, and leaves actor heartbeats responsive during gh lookup", { timeout: 20000 }, async t => {
+  const f = await fixture(t);
+  const checkout = `${f.directory}/checkout-alpha`; await mkdir(checkout);
+  const url = "https://github.com/example/alpha/pull/7";
+  const data = {
+    delay_ms: 1600,
+    checkouts: {
+      [checkout]: {
+        root: checkout, branch: "feature-alpha", head: "abc123",
+        raw: { url, state: "OPEN", headRefName: "feature-alpha", headRefOid: "abc123", comments: [], reviews: [], statusCheckRollup: [] },
+        pages: [[]],
+      },
+    },
+  };
+  const tools = await installFakePrTools(f, data);
+  await f.start();
+  const driver = await joinCheckout(t, f, "alpha-driver", "w1:p1", checkout);
+  const observer = await join(t, f, "observer", "w1:p2");
+
+  const requestedAt = Date.now();
+  await driver.request({ op: "mode", mode: "pr", enabled: true });
+  assert.ok(Date.now() - requestedAt < 1000, "Mode-on does not wait for delayed gh discovery");
+  const discovery = await eventually(async () => (await tools.calls()).find(call =>
+    call.name === "gh" && call.args[0] === "pr" && call.args[1] === "view" && call.args[2] === "--json"));
+  assert.equal(discovery.args[3], "url,headRefName,state");
+  assert.equal(discovery.args.includes(url), false, "first lookup has no PR argument");
+
+  const pending = await sync(observer, false, "working");
+  assert.equal(pending.automation.pr_enabled, true);
+  assert.equal(pending.automation.pr.url, null);
+  assert.equal(pending.automation.pr.error, null);
+  assert.ok(pending.automation.pr.baseline == null, "no baseline is committed before full poll success");
+  for (let index = 0; index < 3; index++) {
+    const heartbeatAt = Date.now();
+    const snapshot = await sync(observer, false, "working");
+    assert.ok(Date.now() - heartbeatAt < 500, "unrelated actor sync remains responsive during the blocked child process");
+    assert.equal(snapshot.members.find(member => member.id === "observer").activity, "working");
+    await delay(100);
+  }
+
+  const resolved = await eventually(async () => {
+    const snapshot = await sync(observer, false, "working");
+    if (snapshot.automation.pr?.error) throw new Error(`automatic discovery failed: ${snapshot.automation.pr.error}; calls=${JSON.stringify(await tools.calls())}`);
+    return snapshot.automation.pr?.url === url ? snapshot : undefined;
+  }, 8000);
+  const checkoutRoot = await realpath(checkout);
+  const pinnedBefore = (await tools.calls()).filter(call =>
+    call.name === "gh" && call.args[0] === "pr" && call.args[1] === "view" && call.args[2] === url).length;
+  assert.ok(pinnedBefore >= 2, "initial full poll and validation use the discovered URL");
+
+  await driver.request({ op: "mode", mode: "pr", enabled: false });
+  await driver.request({ op: "mode", mode: "pr", enabled: true });
+  await eventually(async () => (await tools.calls()).filter(call =>
+    call.name === "gh" && call.args[0] === "pr" && call.args[1] === "view" && call.args[2] === url).length > pinnedBefore);
+  const calls = await tools.calls();
+  assert.equal(calls.filter(call => call.name === "gh" && call.args[0] === "pr" && call.args[1] === "view" && call.args[2] === "--json").length, 1,
+    "later polls retain the pinned PR rather than rediscovering the branch");
+  assert.ok(calls.some(call => call.name === "git" && call.args[1] === "--show-toplevel" && call.cwd === checkoutRoot));
+  assert.ok(calls.filter(call => call.name === "gh" && call.args[0] === "pr" && call.args[1] === "view" && call.args[2] !== "--json")
+    .every(call => call.args[2] === url && call.cwd === checkoutRoot));
+});
+
+test("PTY p picker cancellation closes the modal without starting discovery", { timeout: 30000, skip: !["darwin", "linux"].includes(process.platform) }, async t => {
+  const f = await fixture(t);
+  const alpha = `${f.directory}/checkout-alpha`, beta = `${f.directory}/checkout-beta`;
+  await mkdir(alpha); await mkdir(beta);
+  const url = "https://github.com/example/beta/pull/9";
+  const data = { checkouts: Object.fromEntries([alpha, beta].map((cwd, index) => [cwd, {
+    root: cwd, branch: index ? "feature-beta" : "feature-alpha", head: index ? "bbb" : "aaa",
+    raw: { url, state: "OPEN", headRefName: index ? "feature-beta" : "feature-alpha", headRefOid: index ? "bbb" : "aaa", comments: [], reviews: [], statusCheckRollup: [] }, pages: [[]],
+  }])) };
+  const tools = await installFakePrTools(f, data);
+  const tui = await startTuiPty(t, f);
+  const first = await joinCheckout(t, f, "alpha", "w1:p1", alpha);
+  await joinCheckout(t, f, "beta", "w1:p2", beta);
+  await eventually(() => tui.output().includes("alpha") && tui.output().includes("beta"), 10000)
+    .catch(error => { throw new Error(`${error}\n${tui.output()}`); });
+
+  const openedAt = tui.output().length;
+  tui.send("p");
+  await eventually(() => tui.output().slice(openedAt).includes("Select PR checkout"), 10000)
+    .catch(error => { throw new Error(`${error}\n${tui.output()}`); });
+  const picker = tui.output().slice(openedAt);
+  assert.ok(picker.includes("alpha"));
+  assert.ok(picker.includes("beta"));
+  const beforeCancel = await sync(first, false, "working");
+  assert.equal(beforeCancel.automation.pr, null);
+  tui.send("\x1b");
+  await delay(150);
+  tui.send("q");
+  const [code] = await Promise.race([tui.exited, delay(5000).then(() => { throw new Error("q was swallowed by the cancelled PR picker"); })]);
+  assert.equal(code, 0, tui.output());
+  assert.deepEqual(await tools.calls(), [], "Escape cancels without starting git/gh discovery");
+});
+
+test("PTY p picker binds the explicitly selected checkout and polls only its pinned URL", { timeout: 30000, skip: !["darwin", "linux"].includes(process.platform) }, async t => {
+  const f = await fixture(t);
+  const alpha = `${f.directory}/checkout-alpha`, beta = `${f.directory}/checkout-beta`;
+  await mkdir(alpha); await mkdir(beta);
+  const url = "https://github.com/example/beta/pull/9";
+  const data = { checkouts: Object.fromEntries([alpha, beta].map((cwd, index) => [cwd, {
+    root: cwd, branch: index ? "feature-beta" : "feature-alpha", head: index ? "bbb" : "aaa",
+    raw: { url, state: "OPEN", headRefName: index ? "feature-beta" : "feature-alpha", headRefOid: index ? "bbb" : "aaa", comments: [], reviews: [], statusCheckRollup: [] }, pages: [[]],
+  }])) };
+  const tools = await installFakePrTools(f, data);
+  const tui = await startTuiPty(t, f);
+  const alphaDriver = await joinCheckout(t, f, "alpha", "w1:p1", alpha);
+  const betaDriver = await joinCheckout(t, f, "beta", "w1:p2", beta);
+  await eventually(() => tui.output().includes("alpha") && tui.output().includes("beta"), 10000)
+    .catch(error => { throw new Error(`${error}\n${tui.output()}`); });
+
+  const openedAt = tui.output().length;
+  tui.send("p");
+  await eventually(() => tui.output().slice(openedAt).includes("Select PR checkout"), 10000)
+    .catch(error => { throw new Error(`${error}\n${tui.output()}`); });
+  const picker = tui.output().slice(openedAt);
+  assert.ok(picker.includes("alpha"));
+  assert.ok(picker.includes("beta"));
+  tui.send("\x1b[B\r");
+  const resolved = await eventually(async () => {
+    const snapshot = await sync(alphaDriver, false, "working");
+    return snapshot.automation.pr?.url === url ? snapshot : undefined;
+  }, 10000);
+  assert.equal(resolved.automation.pr.driver, "beta");
+  const betaRoot = await realpath(beta);
+  assert.equal(resolved.automation.pr.url, url);
+  const callsBefore = await tools.calls();
+  assert.ok(callsBefore.every(call => call.cwd === betaRoot), JSON.stringify(callsBefore));
+  const lookups = callsBefore.filter(call => call.name === "gh" && call.args[0] === "pr" && call.args[1] === "view" && call.args[2] === "--json");
+  assert.equal(lookups.length, 1);
+  assert.equal(lookups[0].args.includes(url), false);
+  assert.ok(callsBefore.some(call => call.name === "gh" && call.args[2] === url), "resolved poll uses the pinned URL");
+
+  const pinnedCount = callsBefore.filter(call => call.name === "gh" && call.args[0] === "pr" && call.args[1] === "view" && call.args[2] === url).length;
+  await betaDriver.request({ op: "mode", mode: "pr", enabled: false });
+  await betaDriver.request({ op: "mode", mode: "pr", enabled: true });
+  await eventually(async () => (await tools.calls()).filter(call =>
+    call.name === "gh" && call.args[0] === "pr" && call.args[1] === "view" && call.args[2] === url).length > pinnedCount);
+  const callsAfter = await tools.calls();
+  assert.equal(callsAfter.filter(call => call.name === "gh" && call.args[0] === "pr" && call.args[1] === "view" && call.args[2] === "--json").length, 1,
+    "later polls never rediscover or silently retarget");
+  tui.send("q");
+  await Promise.race([tui.exited, delay(5000).then(() => { throw new Error("PTY TUI did not quit"); })]);
 });
 
 test("TUI opens its live space, restores alternate screen and uses terminal-native colors", { timeout: 15000, skip: !["darwin", "linux"].includes(process.platform) }, async t => {

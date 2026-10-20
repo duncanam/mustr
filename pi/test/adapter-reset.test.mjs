@@ -17,6 +17,7 @@ function assertPrivate(f) {
 
 test("actual adapter commands replace factory/session/history only after one claim and validated receipt", async t => {
   const f = await resetFixture(t);
+  assert.equal(f.hub.connections[0].hello.cwd, f.f.directory, "ordinary Pi Join advertises the absolute checkout");
   f.h.entries.push({ type: "message", message: { role: "user", content: "OLD SENTINEL CONTEXT" } });
   f.hub.prepare();
   const result = await f.discover();
@@ -29,6 +30,7 @@ test("actual adapter commands replace factory/session/history only after one cla
   assert.equal(f.h.root.replacements, 1);
   assert.equal(f.hub.claims, 1);
   assert.equal(f.hub.receiptAttempts.length, 1);
+  assert.equal(f.hub.receiptAttempts[0].cwd, f.f.directory, "fresh-reset Join advertises the new checkout");
   assert.equal(f.hub.capabilities, 2, "old and fresh connections negotiate independently");
   assert.ok(fresh.active().includes("policy-tool"));
   const promptResult = await fresh.prompt("BASE POLICY: protected paths");
@@ -233,7 +235,7 @@ test("forged restore nonce and untrusted role envelope cannot activate role/tool
   const f = await resetFixture(t);
   const fresh = harness(f.f.directory, { sessionId: "unjoined-fresh" });
   await extension(fresh.api); await fresh.emit("session_start", { reason: "new" });
-  t.after(() => fresh.emit("session_shutdown", { reason: "quit" }));
+  f.f.beforeCleanup(() => fresh.emit("session_shutdown", { reason: "quit" }));
   await fresh.commands.get("mustr-reset-restore").handler("invented peer token", fresh.context);
   assert.equal(f.hub.receiptAttempts.length, 0);
   f.hub.prepare(); f.hub.claimed = true;
