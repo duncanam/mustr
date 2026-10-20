@@ -307,6 +307,9 @@ pub(crate) struct Member {
     pub role: String,
     pub pane_id: String,
     pub space_id: SpaceId,
+    /// Server-validated role metadata for the currently admitted manager.
+    #[serde(default)]
+    pub manager: bool,
     /// Live checkout context for explicit dashboard PR-discovery selection.
     /// Do not persist or expose it to peer/model snapshots; fresh Join supplies it.
     #[serde(default, skip_serializing)]
@@ -357,14 +360,31 @@ pub(crate) enum Mode {
     Pr,
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Automation {
     pub todo_enabled: bool,
     pub checkin_enabled: bool,
+    /// Next eligible per-space manager checkpoint; cleared on disable/recovery.
+    #[serde(default)]
+    pub manager_checkin_at: Option<u64>,
     pub pr_enabled: bool,
     pub generation: u64,
     pub todo: Option<crate::watchers::TodoWatch>,
     pub pr: Option<crate::watchers::PrWatch>,
+}
+
+impl Default for Automation {
+    fn default() -> Self {
+        Self {
+            todo_enabled: false,
+            checkin_enabled: true,
+            manager_checkin_at: None,
+            pr_enabled: false,
+            generation: 0,
+            todo: None,
+            pr: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -415,6 +435,10 @@ pub(crate) struct Response {
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Present only when live identity could not be checked and the request was
+    /// definitely rejected before actor execution. Not a command retry policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
 }
 impl Response {
     pub fn success(id: String, result: Value) -> Self {
@@ -423,6 +447,7 @@ impl Response {
             ok: true,
             result: Some(result),
             error: None,
+            error_code: None,
         }
     }
     pub fn failure(id: String, error: impl ToString) -> Self {
@@ -431,6 +456,14 @@ impl Response {
             ok: false,
             result: None,
             error: Some(error.to_string()),
+            error_code: None,
+        }
+    }
+
+    pub fn identity_unavailable(id: String, error: impl ToString) -> Self {
+        Self {
+            error_code: Some("identity_unavailable".into()),
+            ..Self::failure(id, error)
         }
     }
 }
@@ -439,6 +472,35 @@ impl Response {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn identity_unavailable_is_an_optional_preexecution_error_code() {
+        let legacy: Response =
+            serde_json::from_value(json!({"id":"old", "ok":false, "error":"rejected"})).unwrap();
+        assert!(legacy.error_code.is_none());
+        for response in [
+            Response::success("ok".into(), json!({})),
+            Response::failure("no".into(), "rejected"),
+        ] {
+            assert!(
+                serde_json::to_value(response)
+                    .unwrap()
+                    .get("error_code")
+                    .is_none()
+            );
+        }
+        let response = Response::identity_unavailable("retry-topology".into(), "herdr timed out");
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["error_code"], "identity_unavailable");
+        assert!(!response.ok);
+        assert!(response.result.is_none());
+        assert_eq!(
+            serde_json::from_value::<Response>(value)
+                .unwrap()
+                .error_code,
+            response.error_code
+        );
+    }
 
     #[test]
     fn legacy_join_and_member_payloads_default_checkout_context() {
@@ -467,6 +529,27 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(member.cwd, None);
+        assert!(!member.manager, "legacy member records are not managers");
+        let automation = Automation::default();
+        assert!(automation.checkin_enabled);
+        assert!(!automation.todo_enabled);
+        assert!(!automation.pr_enabled);
+    }
+
+    #[test]
+    fn public_join_cannot_claim_manager_metadata() {
+        let request: Result<Request, _> = serde_json::from_value(json!({
+            "id":"join",
+            "op":"join",
+            "version":1,
+            "agent_id":"agent",
+            "name":"worker",
+            "role":"custom",
+            "pane_id":"w1:p1",
+            "space_id":"w1",
+            "manager":true
+        }));
+        assert!(request.is_err(), "Join denies unrecognized client metadata");
     }
 
     #[test]
@@ -477,6 +560,7 @@ mod tests {
             role: "custom".into(),
             pane_id: "w1:p1".into(),
             space_id: SpaceId::new("w1"),
+            manager: true,
             cwd: Some("/private/checkout".into()),
             activity: Activity::Idle,
             last_seen: 1,
@@ -484,5 +568,9 @@ mod tests {
         };
         let encoded = serde_json::to_value(member).unwrap();
         assert!(encoded.get("cwd").is_none());
+        assert_eq!(
+            encoded["manager"], true,
+            "manager presence is surfaced to the UI"
+        );
     }
 }

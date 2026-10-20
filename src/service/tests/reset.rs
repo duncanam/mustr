@@ -39,15 +39,19 @@ fn fixture() -> (Actor, tempfile::TempDir, watch::Receiver<Snapshot>) {
         id: SpaceId::new("w1"),
         label: "One".into(),
     });
-    for (connection, agent, pane) in [(1, "architect", "w1:p1"), (2, "worker", "w1:p2")] {
+    for (connection, agent, pane, manager) in [
+        (1, "architect", "w1:p1", true),
+        (2, "worker", "w1:p2", false),
+    ] {
         let agent_id = AgentId::new(agent);
         actor
             .state
-            .apply(
+            .apply_validated_join(
                 &join(agent, agent, pane, None),
                 None,
                 now(),
                 &actor.scheduling,
+                manager,
             )
             .unwrap();
         actor
@@ -85,6 +89,11 @@ fn fixture() -> (Actor, tempfile::TempDir, watch::Receiver<Snapshot>) {
         );
         actor.incarnations.insert(agent_id, connection);
     }
+    // Service tests use an explicitly quiet baseline; watchdog tests opt in.
+    actor
+        .state
+        .set_mode(&SpaceId::new("w1"), Mode::Checkin, false, now())
+        .unwrap();
     actor.store.save(&actor.state).unwrap();
     (actor, directory, receiver)
 }

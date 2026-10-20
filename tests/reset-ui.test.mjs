@@ -124,7 +124,9 @@ test("fixed-space TUI: switch keys are inert, reset affects only this instance, 
       await a.request({ op: "assign", to: `${prefix}-worker`, title: `${prefix} task history`, text: "Fixture data, not real work." });
       await a.request({ op: "send", to: `${prefix}-worker`, text: `${prefix} addressed history`, wake: false });
       await a.request({ op: "configure_todo", path });
-      await a.request({ op: "mode", mode: "checkin", enabled: true });
+      // Fresh check-ins are on, waiting for a manager. Keep these ordinary roles
+      // so no watchdog message changes the reset fixture's exact history count.
+      assert.equal((await a.request({ op: "sync", activity: "idle", receive: false })).automation.checkin_enabled, true);
       await a.request({ op: "leave" }); await b.request({ op: "leave" });
       a.close(); b.close();
     }

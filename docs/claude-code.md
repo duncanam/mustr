@@ -59,7 +59,7 @@ Wait results are offers, not receipts. Claude must call `mustr_ack` with the off
 
 ## Limits and recovery
 
-- No background wake, streaming steering, channel notifications, hooks, or automatic polling of the inbox. Messages remain queued until Claude explicitly waits. Transport heartbeats do not invoke a model.
+- No background wake, streaming steering, channel notifications, hooks, or automatic polling of the inbox. Messages remain queued until Claude explicitly waits. Transport heartbeats do not invoke a model. A Claude participant may select a manager role, but default-on manager check-ins still require explicit waits; the flag does not give Claude Pi-style unattended wake.
 - No visibility into editor drafts, human input, ordinary tools, or Claude's settled state. A terminal `done`, `blocked`, or `waiting` report is a **declared status**, published immediately; unlike Pi, the adapter cannot terminate the model run or prove that tools have settled. Stop work when reporting, and independently verify the result before accepting it.
 - Pause/resumption follows user direction in the conversation. MCP cannot independently authenticate whether the human requested a tool invocation. Pausing mustr does not pause Claude's ordinary tools.
 - No automatic reconnect, mutation retry, or ambiguous-message replay. Inspect the roster, files, and external jobs before explicitly rejoining; an unfinished task paused by disconnect still requires requester guidance or cancellation.

@@ -45,17 +45,17 @@ max_nudges = 3
 color = true
 ```
 
-Unknown keys and unsupported versions fail with an error. Check-in intervals are 5–86400 seconds, continuation grace is 1–3600 seconds, and nudge limits are 1–20. Restart the hub after editing settings. PR polling is fixed at ten minutes in protocol v1, with an additional freshness check before delivering queued feedback.
+Unknown keys and unsupported versions fail with an error. Manager check-in intervals are 5–86400 seconds, continuation grace is 1–3600 seconds, and nudge limits are 1–20. `max_nudges` bounds TODO/task continuation, not the periodic manager watchdog. Restart the hub after editing settings. PR polling is fixed at ten minutes in protocol v1, with an additional freshness check before delivering queued feedback.
 
 The foreground and background always follow the terminal. Accents use its ANSI palette. Set `color = false` or `NO_COLOR=1` for monochrome; emphasis and reverse-video selection remain.
 
-Automation enablement is deliberately **not** an automatic-start configuration setting. TODO continuation, check-ins, and PR watching are independent, per-space switches, all off when a hub starts or recovers.
+TODO continuation, manager check-ins, and PR watching are independent per-space switches. Check-ins default **on** for a fresh space and wait for a manager to join; the saved per-space choice is preserved across restart, including an explicit off setting. Existing saved off settings are not silently changed by an upgrade. TODO and PR watching remain off on startup/recovery. A human-confirmed reset leaves automation off.
 
 PR watching does not require a URL in configuration. Dashboard `p` starts background discovery of the branch's PR from the selected participant's checkout; `/mustr pr on` uses the calling Pi's checkout when there is no attached watch. Enabling starts discovery, not immediate feedback delivery: the watcher first validates and pins the PR. `gh` must be installed and authenticated in the hub's environment. Selection and discovery errors are visible rather than falling back to another checkout or participant. `/mustr-pr URL` remains an explicit override; see [PR watching](architecture.md#pr-watching).
 
 ## Editable roles
 
-Role files are `roles/<name>.md`. A name is 1–48 lowercase ASCII letters, digits, or hyphens, starting with a letter. Plain Markdown is sufficient; optional TOML front matter supplies a description and an ordered list of component roles:
+Role files are `roles/<name>.md`. A name is 1–48 lowercase ASCII letters, digits, or hyphens, starting with a letter. Plain Markdown is sufficient; optional TOML front matter supplies a description, an ordered list of component roles, and a boolean `manager` flag (default `false`):
 
 ```markdown
 +++
@@ -82,7 +82,19 @@ There are no role-name shortcut commands. `/role` lists roles; `/role NAME [PART
 
 Those commands belong in **separate Pi sessions**, not one session. Claude Code uses the `mustr_join` MCP tool instead; see [Claude Code](claude-code.md). Names identify participants in the dashboard; tools address IDs from the current roster (Pi session IDs or Claude adapter-process IDs).
 
-The shipped architect, implementor, reviewer, and researcher roles all compose `base`, the shared coordination/safety instructions. `base` is normally a component rather than a standalone role, but selecting it is allowed. All roles can be components; there are no privileged positions or fixed hierarchy. Any role can request work; the requester owns guidance and acceptance for that task.
+The shipped architect, implementor, reviewer, and researcher roles all compose `base`, the shared coordination/safety instructions. `base` is normally a component rather than a standalone role, but selecting it is allowed. All roles can be components; any role can request work, and the requester still owns guidance and acceptance for that task.
+
+### One manager per space
+
+Set `manager = true` in the selected role's front matter to make that participant the recipient of periodic check-ins. The shipped architect has this flag; role names themselves confer no priority. The flag is root-only, like the description: composing an architect or another manager role does **not** inherit manager status. A custom coordinating role must declare it explicitly. `mustr roles NAME --json` reports the resolved flag.
+
+The hub validates the flag from its own role files, not a client claim, and admits at most one connected manager per space. A paused manager still holds that slot; a disconnected manager does not. A new, explicitly joined manager role may fill a vacant slot; there is no election, fallback to a worker, or transfer of existing task ownership. Manager status is not permission to guide, accept or cancel another requester's tasks.
+
+Default-on check-ins wait for an admitted manager. Dashboard `c` or `/mustr checkin off` opts out; enable again with `/mustr checkin on`. An explicit enable with no manager produces an error rather than selecting someone else. While enabled, the watchdog waits for an idle, unpaused manager and coalesces reminders. It also runs when there are no tasks: the hub cannot infer completion of a goal held in the manager's conversation. Turn it off explicitly when monitoring is no longer wanted; that choice survives restart. Reset leaves it off. Pi supports automatic wake; a Claude manager still needs explicit `mustr_wait` calls.
+
+Existing role files are never rewritten. After updating the hub, add `manager = true` to the intended existing role's front matter and reselect that role after reconciling active work. Do not delete configuration or history to acquire manager status.
+
+### Composing roles
 
 For example, a custom role can combine implementation and review capabilities:
 

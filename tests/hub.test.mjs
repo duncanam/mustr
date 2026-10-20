@@ -187,19 +187,23 @@ test("per-space hubs isolate endpoints, locks, durable state, restart and shutdo
 
   const secondHub = await f.start({ paneId: "w2:p0" });
   assert.notEqual(firstHub.discovery.socket, secondHub.discovery.socket);
-  const firstRequester = await join(t, f, "first-requester", "w1:p1");
+  const firstRequester = await join(t, f, "first-requester", "w1:p1", "w1", "architect");
   const firstWorker = await join(t, f, "first-worker", "w1:p2");
   const secondRequester = await join(t, f, "second-requester", "w2:p1", "w2");
   const secondWorker = await join(t, f, "second-worker", "w2:p2", "w2");
 
   const firstTask = await firstRequester.request({ op: "assign", to: "first-worker", title: "w1 task", text: "Persist only in w1." });
   const secondTask = await secondRequester.request({ op: "assign", to: "second-worker", title: "w2 task", text: "Persist only in w2." });
+  assert.equal((await sync(secondRequester)).automation.checkin_enabled, true, "fresh spaces default check-ins on even without a manager");
   await firstRequester.request({ op: "mode", mode: "checkin", enabled: true });
+  await secondRequester.request({ op: "mode", mode: "checkin", enabled: false });
   await secondRequester.request({ op: "mode", mode: "todo", enabled: true });
   const firstState = await sync(firstRequester);
   const secondState = await sync(secondRequester);
   assert.equal(firstState.members.length, 2);
+  assert.equal(firstState.members.find(member => member.id === "first-requester").manager, true);
   assert.equal(secondState.members.length, 2);
+  assert.equal(secondState.members.some(member => member.manager), false);
   assert.deepEqual(firstState.tasks.map(task => task.id), [firstTask.task_id]);
   assert.deepEqual(secondState.tasks.map(task => task.id), [secondTask.task_id]);
   assert.equal(firstState.automation.checkin_enabled, true);
@@ -224,11 +228,15 @@ test("per-space hubs isolate endpoints, locks, durable state, restart and shutdo
   const recovered = await sync(returningWorker);
   assert.equal(recovered.tasks[0].id, firstTask.task_id);
   assert.equal(recovered.tasks[0].state, "paused", "restart retains history but fences active work");
-  assert.equal(recovered.automation.checkin_enabled, false, "restart disables automation");
+  assert.equal(recovered.automation.checkin_enabled, true, "restart preserves saved check-in choice");
+  assert.equal(recovered.automation.todo_enabled, false);
+  assert.equal(recovered.automation.pr_enabled, false);
+  assert.equal(recovered.members.some(member => member.manager), false, "restart waits for a verified manager rejoin, not an ordinary worker");
   const stillIndependent = await sync(secondWorker);
   assert.equal(stillIndependent.tasks[0].id, secondTask.task_id);
   assert.equal(stillIndependent.tasks[0].state, "assigned");
   assert.equal(stillIndependent.automation.todo_enabled, true);
+  assert.equal(stillIndependent.automation.checkin_enabled, false, "one space's check-in choice does not affect another");
 
   await stop(firstHub);
   await eventually(() => !returningWorker.connected);

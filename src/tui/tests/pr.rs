@@ -198,6 +198,7 @@ fn narrow_short_picker_keeps_the_final_long_member_visible_and_selectable() {
                 format!("Member {index} with a long name")
             },
             role: "long-role-name".into(),
+            manager: false,
             pane_id: format!("w1:p{index}-with-a-long-pane-identifier"),
             space_id: SpaceId::new("w1"),
             activity: Activity::Idle,

@@ -1,6 +1,6 @@
 <p align="center"><img src="assets/mustr-logo.jpg" alt="mustr" width="640"></p>
 
-A terminal-native coordination hub for Pi and Claude Code agents in herdr. Run one mustr instance in a tab of each space you want to coordinate; agents join with editable roles and exchange addressed messages. The hub handles task ownership and opt-in scheduling—not model reasoning.
+A terminal-native coordination hub for Pi and Claude Code agents in herdr. Run one mustr instance in a tab of each space you want to coordinate; agents join with editable roles and exchange addressed messages. The hub handles task ownership and user-controlled scheduling—not model reasoning.
 
 ## Install
 
@@ -32,7 +32,7 @@ Roles can be selected before the hub starts. Agents keep their own normal conver
 | Dashboard key | Action |
 |---|---|
 | `t` | Toggle TODO/task continuation |
-| `c` | Toggle periodic check-ins |
+| `c` | Toggle periodic manager check-ins |
 | `p` | Toggle PR watching; discover the branch's PR on first enable |
 | `f` | Switch Messages / Tasks tab |
 | `r` | Start fresh in this space / inspect reset status (confirmation required) |
@@ -41,9 +41,11 @@ Roles can be selected before the hub starts. Agents keep their own normal conver
 
 Messages and Tasks share a pane with independent scroll positions. The pane border shows total tasks and accepted completions for this space; awaiting-review and cancelled tasks are not counted as completed.
 
-Modes start **off**. Press `p` to start discovering the current branch's PR from a participant's checkout; if several participants are eligible, choose who should receive feedback. Watching begins after discovery and validation succeed. From Pi, `/mustr pr on` discovers for that session when no watch is attached. Discovery uses `gh` without a model and pins the resulting PR URL; errors appear in the dashboard. `/mustr-pr https://github.com/OWNER/REPO/pull/123` remains an explicit override, initially off.
+Manager check-ins default **on** for a fresh space; an explicitly saved off setting stays off. TODO and PR watching start **off**. Press `p` to start discovering the current branch's PR from a participant's checkout; if several participants are eligible, choose who should receive feedback. Watching begins after discovery and validation succeed. From Pi, `/mustr pr on` discovers for that session when no watch is attached. Discovery uses `gh` without a model and pins the resulting PR URL; errors appear in the dashboard. `/mustr-pr https://github.com/OWNER/REPO/pull/123` remains an explicit override, initially off.
 
-Attach a checklist with `/mustr-todo path/to/TODO.md`, then enable TODO mode. `/mustr pause`, `/mustr resume`, and `/mustr leave` control participation. Escape pauses automated delivery.
+For unattended coordination, join one role with `manager = true`; default-on check-ins wait for that manager to become available. `c` or `/mustr checkin off` opts out; `/mustr checkin on` re-enables it. The shipped architect is a manager; existing role files need that flag added explicitly because upgrades never overwrite them. Only one manager can be joined per space. Check-ins periodically ask it to reconcile the current goal, outstanding reviews, blockers and waiting work—not merely collect worker status. They remain enabled until explicitly turned off and do not grant additional task ownership.
+
+Attach a checklist with `/mustr-todo path/to/TODO.md`, then enable TODO mode. `/mustr pause` is an explicit hold released by `/mustr resume`. After an interruption or genuine human-decision hold, an accepted human follow-up also resumes participation. Successful native Pi retries do not leave mustr paused. Final failed retries have a [host cancellation ambiguity](docs/architecture.md#participation-and-human-control), so unattended recovery is not guaranteed for every error. `/mustr leave` ends participation without stopping external jobs.
 
 ## Configure
 

@@ -139,9 +139,26 @@ impl State {
             .generation
             .checked_add(1)
             .ok_or_else(|| eyre!("watcher generation exhausted"))?;
+        // A confirmed fresh start ends the live manager admission. A manager
+        // can only claim the slot again through a validated replacement Join.
+        for member in self.members.values_mut() {
+            member.manager = false;
+        }
         automation.todo_enabled = false;
         automation.checkin_enabled = false;
+        automation.manager_checkin_at = None;
         automation.pr_enabled = false;
+        for message in self
+            .messages
+            .iter_mut()
+            .filter(|message| message.space_id == *space && message.kind == MessageKind::Checkin)
+        {
+            if message.delivery == Delivery::Pending {
+                message.delivery = Delivery::Cancelled;
+            } else if message.delivery == Delivery::Offered {
+                message.delivery = Delivery::Uncertain;
+            }
+        }
         self.reset_epoch = epoch;
         self.reset = Some(ResetPlan {
             plan_id: Uuid::new_v4().to_string(),
@@ -333,6 +350,7 @@ impl State {
         cwd: Option<&std::path::PathBuf>,
         receipt: &ResetReceipt,
         now: u64,
+        role_manager: bool,
     ) -> Result<Value> {
         self.validate_space(space)?;
         ensure!(
@@ -350,6 +368,14 @@ impl State {
             .find(|a| a.token == receipt.token)
             .ok_or_else(|| eyre!("invalid participant reset token"))?;
         let approved = &expected.progress.participant;
+        if role_manager {
+            ensure!(
+                self.members.values().all(|member| {
+                    !member.manager || &member.id == agent || member.id == approved.agent_id
+                }),
+                "another manager is already admitted in this space"
+            );
+        }
         ensure!(
             expected.claimed,
             "reset token must be claimed before replacement"
@@ -397,6 +423,7 @@ impl State {
         self.reset_capable.remove(agent);
         if let Some(member) = self.members.get_mut(&old) {
             member.activity = Activity::Offline;
+            member.manager = false;
             member.cwd = None;
         }
         // A confirmed receipt may be retried after transport loss. Preserve the
@@ -409,6 +436,7 @@ impl State {
                 role: role.into(),
                 pane_id: pane.into(),
                 space_id: space.clone(),
+                manager: role_manager,
                 cwd: cwd.cloned(),
                 activity: Activity::Paused,
                 last_seen: now,
@@ -467,6 +495,8 @@ impl State {
         let generation = self.automation.generation;
         self.automation = Automation {
             generation,
+            checkin_enabled: false,
+            manager_checkin_at: None,
             ..Automation::default()
         };
     }
@@ -480,6 +510,9 @@ impl State {
             .ok_or_else(|| eyre!("unknown active reset plan"))?;
         plan.state = ResetPhase::Abandoned;
         plan.note = "Reset abandoned without clearing hub history or bindings. Claimed old identities are retired; use manual /new then /role and reconcile retained tasks. Modes remain off, deliveries uncertain, no work was replayed. Already-issued replacements may still finish but their receipts are rejected; do not retry them.".into();
+        for member in self.members.values_mut() {
+            member.manager = false;
+        }
         for agent in &plan.agents {
             let old = &agent.progress.participant.agent_id;
             if agent.claimed {
@@ -488,6 +521,7 @@ impl State {
             self.reset_capable.remove(old);
             if let Some(member) = self.members.get_mut(old) {
                 member.activity = Activity::Offline;
+                member.manager = false;
             }
         }
         for message in self
@@ -513,6 +547,7 @@ impl State {
             .ok_or_else(|| eyre!("watcher generation exhausted"))?;
         automation.todo_enabled = false;
         automation.checkin_enabled = false;
+        automation.manager_checkin_at = None;
         automation.pr_enabled = false;
         Ok(())
     }

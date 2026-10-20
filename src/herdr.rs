@@ -1,6 +1,6 @@
 //! Read-only herdr socket client. Never reads terminal output or session files.
 
-use std::{env, fs, os::unix::fs::MetadataExt, path::PathBuf, time::Duration};
+use std::{env, fmt, fs, io, os::unix::fs::MetadataExt, path::PathBuf, time::Duration};
 
 use color_eyre::eyre::{Context, Result, ensure, eyre};
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,41 @@ pub(crate) struct Herdr {
     socket: PathBuf,
     stamp: (u64, u64, i64, i64),
     pub key: String,
+}
+
+/// A failed read-only topology lookup, not evidence that an admitted identity
+/// changed. Never use this type for malformed data or disproven server identity.
+#[derive(Debug)]
+pub(crate) struct HerdrUnavailable(io::Error);
+
+impl fmt::Display for HerdrUnavailable {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "herdr temporarily unavailable: {}", self.0)
+    }
+}
+
+impl std::error::Error for HerdrUnavailable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+fn transport_error(error: io::Error) -> color_eyre::Report {
+    if matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut
+            | io::ErrorKind::Interrupted
+            | io::ErrorKind::WouldBlock
+            | io::ErrorKind::ConnectionRefused
+            | io::ErrorKind::ConnectionReset
+            | io::ErrorKind::ConnectionAborted
+            | io::ErrorKind::BrokenPipe
+            | io::ErrorKind::UnexpectedEof
+    ) {
+        HerdrUnavailable(error).into()
+    } else {
+        error.into()
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -83,13 +118,24 @@ impl Herdr {
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
         self.check_instance()?;
-        timeout(Duration::from_secs(3), async {
-            let mut stream = UnixStream::connect(&self.socket).await?;
+        let response = timeout(Duration::from_secs(3), async {
+            let mut stream = UnixStream::connect(&self.socket)
+                .await
+                .map_err(transport_error)?;
             let request = json!({"id": "mustr", "method": method, "params": params});
-            stream.write_all(format!("{request}\n").as_bytes()).await?;
+            stream
+                .write_all(format!("{request}\n").as_bytes())
+                .await
+                .map_err(transport_error)?;
             let mut reader = BufReader::new(stream).take(2 * 1024 * 1024 + 1);
             let mut line = String::new();
-            reader.read_line(&mut line).await?;
+            reader.read_line(&mut line).await.map_err(transport_error)?;
+            if line.is_empty() {
+                return Err(transport_error(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "herdr closed before replying",
+                )));
+            }
             ensure!(
                 line.len() <= 2 * 1024 * 1024 && line.ends_with('\n'),
                 "invalid or oversized herdr response"
@@ -103,8 +149,12 @@ impl Herdr {
                 .cloned()
                 .ok_or_else(|| eyre!("herdr response has no result"))
         })
-        .await
-        .wrap_err("herdr request timed out")?
+        .await;
+        // A timeout or even a valid old response must not hide replacement or
+        // disappearance while the lookup was in flight. Never cache attestation.
+        self.check_instance()?;
+        response
+            .map_err(|error| HerdrUnavailable(io::Error::new(io::ErrorKind::TimedOut, error)))?
     }
 
     pub async fn pane(&self, caller: &str) -> Result<Pane> {
@@ -158,6 +208,34 @@ impl Herdr {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_transient_transport_errors_are_typed_as_unavailable() {
+        for kind in [
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::UnexpectedEof,
+        ] {
+            let error = transport_error(io::Error::from(kind));
+            assert!(error.downcast_ref::<HerdrUnavailable>().is_some());
+            assert!(
+                std::error::Error::source(error.downcast_ref::<HerdrUnavailable>().unwrap())
+                    .is_some()
+            );
+        }
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::InvalidData,
+        ] {
+            assert!(
+                transport_error(io::Error::from(kind))
+                    .downcast_ref::<HerdrUnavailable>()
+                    .is_none()
+            );
+        }
+    }
 
     #[test]
     fn sockets_are_keyed_by_server_incarnation_and_exact_space() {

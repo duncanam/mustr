@@ -118,6 +118,8 @@ test("adapter: explicit join before hub, human gating, settled report, policies 
   await peer.request({ op: "send", to: "pi-session", text: "Do not interrupt the pause", wake: true });
   await delay(1200); assert.equal(h.messages.length, 2);
   await h.commands.get("mustr").handler("resume", h.context);
+  await h.emit("input", { source: "interactive", text: "Accepted human authorization after report" });
+  await h.emit("message_start", { message: { role: "user", content: [{ type: "text", text: "Accepted human authorization after report" }] } });
   await eventually(() => h.messages.length === 3);
   await h.settle();
   f.panes.set("w1:p1", { pane_id: "w1:p1", workspace_id: "w2", agent: "pi" });

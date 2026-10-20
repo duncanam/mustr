@@ -20,7 +20,7 @@ use tokio::{
 
 use crate::{
     config::Config,
-    herdr::Herdr,
+    herdr::{Herdr, HerdrUnavailable},
     paths::{Paths, check_regular, private_dir},
     protocol::*,
     roles,
@@ -284,20 +284,25 @@ async fn connection(
                 break;
             }
         };
-        if let Command::Join { role, .. } = &request.command {
+        let role_manager = if let Command::Join { role, .. } = &request.command {
             let roles_dir = roles_dir.to_path_buf();
             let role = role.clone();
             let validation = tokio::task::spawn_blocking(move || roles::resolve(&roles_dir, &role))
                 .await
                 .map_err(|error| eyre!("role validation worker failed: {error}"))?;
-            if let Err(error) = validation {
-                let response = Response::failure(request.id, error);
-                write
-                    .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
-                    .await?;
-                break;
+            match validation {
+                Ok(resolved) => Some(resolved.manager),
+                Err(error) => {
+                    let response = Response::failure(request.id, error);
+                    write
+                        .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
+                        .await?;
+                    break;
+                }
             }
-        }
+        } else {
+            None
+        };
         let check = match &request.command {
             Command::Join {
                 pane_id, space_id, ..
@@ -322,10 +327,27 @@ async fn connection(
             match validation {
                 Ok(agent) => checked_harness = agent,
                 Err(error) => {
-                    let response = Response::failure(request.id, error);
-                    write
-                        .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
-                        .await?;
+                    // Only an already-authenticated connection can survive an
+                    // unavailable lookup. No actor request (including sync or
+                    // ACK) has executed; every later command validates afresh.
+                    let unavailable = identity.is_some()
+                        && !matches!(request.command, Command::Join { .. })
+                        && error.downcast_ref::<HerdrUnavailable>().is_some();
+                    let response = if unavailable {
+                        Response::identity_unavailable(request.id, error)
+                    } else {
+                        Response::failure(request.id, error)
+                    };
+                    timeout(
+                        Duration::from_secs(5),
+                        write.write_all(
+                            format!("{}\n", serde_json::to_string(&response)?).as_bytes(),
+                        ),
+                    )
+                    .await??;
+                    if unavailable {
+                        continue;
+                    }
                     break;
                 }
             }
@@ -336,7 +358,10 @@ async fn connection(
         };
         let subscribing = matches!(request.command, Command::Subscribe);
         let leaving = matches!(request.command, Command::Leave);
-        let response = service.request(id, request).await?;
+        let response = match role_manager {
+            Some(manager) => service.join(id, request, manager).await?,
+            None => service.request(id, request).await?,
+        };
         if response.ok {
             if let Some(agent) = joining {
                 identity = check;

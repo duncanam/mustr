@@ -82,6 +82,14 @@ impl State {
                     .is_none_or(|plan| plan.belongs_to(&self.space_id)),
             "state contains records for another space"
         );
+        ensure!(
+            self.members
+                .values()
+                .filter(|member| member.manager)
+                .count()
+                <= 1,
+            "state contains multiple admitted managers"
+        );
         Ok(())
     }
 }
@@ -92,6 +100,7 @@ impl State {
         self.recover_resets();
         for member in self.members.values_mut() {
             member.activity = Activity::Offline;
+            member.manager = false;
             member.cwd = None;
         }
         for task in self
@@ -109,7 +118,8 @@ impl State {
             }
         }
         self.automation.todo_enabled = false;
-        self.automation.checkin_enabled = false;
+        // Check-in mode is default-on, but preserve an explicit persisted off.
+        self.automation.manager_checkin_at = None;
         self.automation.pr_enabled = false;
         self.automation.generation = self.automation.generation.saturating_add(1);
     }
@@ -164,6 +174,33 @@ impl State {
         sender: Option<&AgentId>,
         now: u64,
         scheduling: &Scheduling,
+    ) -> Result<Value> {
+        self.apply_with_role_manager(request, sender, now, scheduling, false)
+    }
+
+    /// Apply a Join after the server resolved the selected root role.
+    pub fn apply_validated_join(
+        &mut self,
+        request: &Request,
+        sender: Option<&AgentId>,
+        now: u64,
+        scheduling: &Scheduling,
+        manager: bool,
+    ) -> Result<Value> {
+        ensure!(
+            matches!(&request.command, Command::Join { .. }),
+            "validated role metadata is only valid for Join"
+        );
+        self.apply_with_role_manager(request, sender, now, scheduling, manager)
+    }
+
+    fn apply_with_role_manager(
+        &mut self,
+        request: &Request,
+        sender: Option<&AgentId>,
+        now: u64,
+        scheduling: &Scheduling,
+        role_manager: bool,
     ) -> Result<Value> {
         ensure!(
             !request.id.is_empty() && request.id.len() <= 100,
@@ -223,7 +260,7 @@ impl State {
             );
             return Ok(previous.result.clone());
         }
-        let result = self.execute(&request.command, sender, now, scheduling)?;
+        let result = self.execute(&request.command, sender, now, scheduling, role_manager)?;
         if mutation && let Some(sender) = sender {
             self.cache.push(Cached {
                 sender: sender.clone(),
@@ -245,6 +282,7 @@ impl State {
         sender: Option<&AgentId>,
         now: u64,
         scheduling: &Scheduling,
+        role_manager: bool,
     ) -> Result<Value> {
         if let Command::Join {
             version,
@@ -287,6 +325,7 @@ impl State {
                     cwd.as_ref(),
                     receipt,
                     now,
+                    role_manager,
                 );
             }
             ensure!(sender.is_none(), "already registered");
@@ -315,6 +354,14 @@ impl State {
                 self.members.len() < 256 || self.members.contains_key(agent_id),
                 "participant capacity reached"
             );
+            if role_manager {
+                ensure!(
+                    self.members
+                        .values()
+                        .all(|member| !member.manager || &member.id == agent_id),
+                    "another manager is already admitted in this space"
+                );
+            }
             for member in self
                 .members
                 .values()
@@ -341,6 +388,12 @@ impl State {
                 );
             }
             self.reset_capable.remove(agent_id);
+            if role_manager
+                && self.automation.checkin_enabled
+                && self.automation.manager_checkin_at.is_none()
+            {
+                self.automation.manager_checkin_at = Some(now);
+            }
             self.members.insert(
                 agent_id.clone(),
                 Member {
@@ -349,6 +402,7 @@ impl State {
                     role: role.clone(),
                     pane_id: pane_id.clone(),
                     space_id: space_id.clone(),
+                    manager: role_manager,
                     cwd: cwd.clone(),
                     activity: Activity::Paused,
                     last_seen: now,
@@ -775,6 +829,16 @@ impl State {
             !self.reset_frozen(space),
             "space is frozen for fresh start; modes are blocked"
         );
+        if matches!(mode, Mode::Checkin) && enabled {
+            ensure!(
+                self.members.values().any(|member| {
+                    member.space_id == *space
+                        && member.manager
+                        && member.activity != Activity::Offline
+                }),
+                "no manager role is admitted; explicitly join a role with manager = true first"
+            );
+        }
         let automation = &mut self.automation;
         let generation = automation
             .generation
@@ -788,7 +852,10 @@ impl State {
                 }
                 automation.todo_enabled = enabled;
             }
-            Mode::Checkin => automation.checkin_enabled = enabled,
+            Mode::Checkin => {
+                automation.checkin_enabled = enabled;
+                automation.manager_checkin_at = enabled.then_some(now);
+            }
             Mode::Pr => {
                 ensure!(
                     !enabled || automation.pr.is_some(),
@@ -835,7 +902,7 @@ impl State {
                 message.pr_ack = None;
             }
         }
-        if enabled {
+        if enabled && !matches!(mode, Mode::Checkin) {
             for task in self.tasks.values_mut().filter(|t| &t.space_id == space) {
                 task.nudges = 0;
                 task.updated_at = now;
@@ -896,6 +963,7 @@ impl State {
         self.disconnect_reset(id);
         if let Some(member) = self.members.get_mut(id) {
             member.activity = Activity::Offline;
+            member.manager = false;
             member.cwd = None;
         }
         for message in &mut self.messages {
@@ -1046,11 +1114,9 @@ impl State {
             if member.activity != Activity::Idle || self.pending_for(&task.owner) {
                 continue;
             }
-            let automation = self.automation.clone();
-            let continuation = automation.todo_enabled
+            let continuation = self.automation.todo_enabled
                 && now >= member.idle_since.max(task.updated_at) + scheduling.continuation_seconds;
-            let checkin = automation.checkin_enabled && now >= task.checkin_at;
-            if !continuation && !checkin {
+            if !continuation {
                 continue;
             }
             if task.nudges >= scheduling.max_nudges {
@@ -1069,30 +1135,51 @@ impl State {
             } else {
                 task.nudges += 1;
                 task.updated_at = now;
-                let (kind, text) = if checkin {
-                    task.checkin_at = now + scheduling.checkin_seconds;
-                    (
-                        MessageKind::Checkin,
-                        "Report concise status for this task: actual progress, evidence, remaining work, and blockers. Do not restart external jobs or duplicate work merely because this reminder arrived.",
-                    )
-                } else {
-                    (
-                        MessageKind::Continue,
-                        "Continue only this assigned task, or report blocked/waiting/done as appropriate. Respect human direction and normal policies. This reminder is not evidence of completion.",
-                    )
-                };
                 self.queue(
                     &task.space_id,
                     None,
                     &task.owner,
                     Some(&task),
-                    kind,
-                    text.into(),
+                    MessageKind::Continue,
+                    "Continue only this assigned task, or report blocked/waiting/done as appropriate. Respect human direction and normal policies. This reminder is not evidence of completion.".into(),
                     true,
                     now,
                 )?;
             }
             self.tasks.insert(task.id.clone(), task);
+        }
+
+        // Manager check-ins are per-space and independent of task count/state.
+        // A due tick coalesces while the manager is busy or has wake work, then
+        // sends one idle-only prompt and starts the next interval.
+        if self.automation.checkin_enabled
+            && !self.reset_frozen(&self.space_id)
+            && self
+                .automation
+                .manager_checkin_at
+                .is_some_and(|deadline| now >= deadline)
+            && let Some(manager) = self.members.values().find(|member| {
+                member.space_id == self.space_id
+                    && member.manager
+                    && member.activity == Activity::Idle
+            })
+        {
+            let manager_id = manager.id.clone();
+            if !self.pending_for(&manager_id) {
+                let space = self.space_id.clone();
+                self.queue(
+                    &space,
+                    None,
+                    &manager_id,
+                    None,
+                    MessageKind::Checkin,
+                    "Manager checkpoint: reconcile your approved role goal and inspect the current same-space roster, including unfinished Assigned, Active, Blocked, Waiting, Review, and Paused tasks. Check tasks_truncated; do not claim exhaustive review if the roster is truncated. Use Guide/Accept/Cancel only for tasks you requested. Receipt is not execution or completion; do not resubmit uncertain work or invent scope. If a genuine human decision is needed, remain responsive and report that dependency. The human controls this periodic mode with c or /mustr checkin on|off.".into(),
+                    true,
+                    now,
+                )?;
+                self.automation.manager_checkin_at =
+                    Some(now.saturating_add(scheduling.checkin_seconds));
+            }
         }
         Ok(())
     }

@@ -18,12 +18,12 @@ fn setup() -> (State, AgentId, AgentId, Scheduling) {
     };
     let architect = AgentId::new("architect-id");
     let worker = AgentId::new("worker-id");
-    for (id, name, pane) in [
-        (&architect, "architect", "w1:p1"),
-        (&worker, "worker", "w1:p2"),
+    for (id, name, pane, manager) in [
+        (&architect, "architect", "w1:p1", true),
+        (&worker, "worker", "w1:p2", false),
     ] {
         state
-            .apply(
+            .apply_validated_join(
                 &request(
                     name,
                     Command::Join {
@@ -40,6 +40,7 @@ fn setup() -> (State, AgentId, AgentId, Scheduling) {
                 None,
                 0,
                 &config,
+                manager,
             )
             .unwrap();
         state
@@ -57,6 +58,10 @@ fn setup() -> (State, AgentId, AgentId, Scheduling) {
             )
             .unwrap();
     }
+    // Most state tests assume automation is explicitly off. Set the persisted
+    // user choice directly so PR-generation fixtures remain at generation zero.
+    state.automation.checkin_enabled = false;
+    state.automation.manager_checkin_at = None;
     (state, architect, worker, config)
 }
 fn assign(state: &mut State, architect: &AgentId, worker: &AgentId, config: &Scheduling) -> TaskId {
@@ -436,16 +441,22 @@ fn scheduling_requires_opt_in_and_bounds_nudges() {
 }
 
 #[test]
-fn periodic_checkins_are_independent_and_pause_cancels_queued_prompts() {
-    let (mut state, architect, worker, mut config) = setup();
+fn periodic_manager_checkins_are_global_and_pause_cancels_queued_prompts() {
+    let (mut state, manager, worker, mut config) = setup();
     config.checkin_seconds = 5;
-    assign(&mut state, &architect, &worker, &config);
+    assign(&mut state, &manager, &worker, &config);
     receive(&mut state, &worker, &config, 0);
     state
         .set_mode(&SpaceId::new("w1"), Mode::Checkin, true, 0)
         .unwrap();
-    state.tick(5, &config).unwrap();
-    assert_eq!(state.messages.last().unwrap().kind, MessageKind::Checkin);
+    state.tick(0, &config).unwrap();
+    let checkin = state.messages.last().unwrap();
+    assert_eq!(checkin.kind, MessageKind::Checkin);
+    assert_eq!(checkin.to, manager);
+    assert_eq!(checkin.from, None);
+    assert_eq!(checkin.task_id, None);
+    assert_eq!(checkin.revision, None);
+    assert!(checkin.wake);
     state
         .apply(
             &request(
@@ -455,7 +466,7 @@ fn periodic_checkins_are_independent_and_pause_cancels_queued_prompts() {
                     receive: false,
                 },
             ),
-            Some(&worker),
+            Some(&manager),
             5,
             &config,
         )
@@ -466,18 +477,132 @@ fn periodic_checkins_are_independent_and_pause_cancels_queued_prompts() {
 }
 
 #[test]
-fn non_active_tasks_never_receive_continuation_or_checkins() {
+fn manager_checkin_waits_for_availability_coalesces_and_never_falls_back() {
+    let (mut state, manager, _, mut config) = setup();
+    config.checkin_seconds = 5;
+    let space = SpaceId::new("w1");
+    state.set_mode(&space, Mode::Checkin, true, 0).unwrap();
+    for (request_id, activity, at) in [
+        ("working", Activity::Working, 0),
+        ("paused", Activity::Paused, 1),
+    ] {
+        state
+            .apply(
+                &request(
+                    request_id,
+                    Command::Sync {
+                        activity,
+                        receive: false,
+                    },
+                ),
+                Some(&manager),
+                at,
+                &config,
+            )
+            .unwrap();
+        state.tick(at, &config).unwrap();
+        assert!(state.messages.is_empty(), "no prompt while {activity:?}");
+    }
+    state
+        .apply(
+            &request(
+                "idle",
+                Command::Sync {
+                    activity: Activity::Idle,
+                    receive: false,
+                },
+            ),
+            Some(&manager),
+            2,
+            &config,
+        )
+        .unwrap();
+    state.tick(2, &config).unwrap();
+    assert_eq!(state.messages.len(), 1);
+    let old_id = state.messages[0].id.clone();
+    state
+        .apply(
+            &request(
+                "still-idle",
+                Command::Sync {
+                    activity: Activity::Idle,
+                    receive: false,
+                },
+            ),
+            Some(&manager),
+            7,
+            &config,
+        )
+        .unwrap();
+    state.tick(7, &config).unwrap();
+    assert_eq!(state.messages.len(), 1, "pending checkpoint coalesces");
+
+    state.disconnect(&manager);
+    assert!(!state.members[&manager].manager);
+    state.tick(8, &config).unwrap();
+    assert_eq!(
+        state.messages.len(),
+        1,
+        "no other idle participant receives it"
+    );
+    assert_eq!(state.messages[0].delivery, Delivery::Uncertain);
+
+    let replacement = AgentId::new("explicit-manager-replacement");
+    state
+        .apply_validated_join(
+            &request(
+                "replacement-join",
+                Command::Join {
+                    version: VERSION,
+                    agent_id: replacement.clone(),
+                    name: "coordinator".into(),
+                    role: "different-manager-role".into(),
+                    pane_id: "w1:p3".into(),
+                    space_id: space,
+                    cwd: None,
+                    reset: None,
+                },
+            ),
+            None,
+            9,
+            &config,
+            true,
+        )
+        .unwrap();
+    state
+        .apply(
+            &request(
+                "replacement-idle",
+                Command::Sync {
+                    activity: Activity::Idle,
+                    receive: false,
+                },
+            ),
+            Some(&replacement),
+            9,
+            &config,
+        )
+        .unwrap();
+    state.tick(9, &config).unwrap();
+    assert_eq!(state.messages.len(), 2);
+    assert_eq!(state.messages[0].id, old_id);
+    assert_eq!(state.messages[0].delivery, Delivery::Uncertain);
+    assert_eq!(state.messages[1].to, replacement);
+    assert_ne!(state.messages[1].id, state.messages[0].id);
+}
+
+#[test]
+fn manager_checkin_is_independent_of_task_state_and_does_not_nudge_tasks() {
     let (mut state, architect, worker, config) = setup();
     let id = assign(&mut state, &architect, &worker, &config);
     state.messages.clear();
     state
-        .set_mode(&SpaceId::new("w1"), Mode::Todo, true, 0)
-        .unwrap();
-    state
         .set_mode(&SpaceId::new("w1"), Mode::Checkin, true, 0)
         .unwrap();
+    let task_before = state.tasks[&id].clone();
     for status in [
         TaskState::Assigned,
+        TaskState::Active,
         TaskState::Blocked,
         TaskState::Waiting,
         TaskState::Review,
@@ -486,13 +611,471 @@ fn non_active_tasks_never_receive_continuation_or_checkins() {
         TaskState::Cancelled,
     ] {
         state.tasks.get_mut(&id).unwrap().state = status;
-        state.tasks.get_mut(&id).unwrap().checkin_at = 0;
         state.tick(10, &config).unwrap();
-        assert!(
-            state.messages.is_empty(),
-            "unexpected reminder for {status:?}"
+        assert_eq!(
+            state.messages.len(),
+            1,
+            "coalesced checkpoint for {status:?}"
         );
+        assert_eq!(state.messages[0].to, architect);
+        assert_eq!(state.messages[0].task_id, None);
+        assert!(state.messages[0].text.contains("tasks_truncated"));
+        let roster = state
+            .apply(
+                &request(
+                    "manager-roster",
+                    Command::Sync {
+                        activity: Activity::Idle,
+                        receive: false,
+                    },
+                ),
+                Some(&architect),
+                10,
+                &config,
+            )
+            .unwrap();
+        assert_eq!(
+            roster["tasks"][0]["state"],
+            serde_json::to_value(status).unwrap()
+        );
+        assert_eq!(state.tasks[&id].nudges, task_before.nudges);
+        assert_eq!(state.tasks[&id].updated_at, task_before.updated_at);
     }
+}
+
+#[test]
+fn manager_slot_is_unique_live_and_reconnect_requires_verified_role_metadata() {
+    let (mut state, manager, _, config) = setup();
+    assert!(state.members[&manager].manager);
+
+    let second = AgentId::new("second-manager");
+    let before = state.clone();
+    assert!(
+        state
+            .apply_validated_join(
+                &request(
+                    "second-manager-join",
+                    Command::Join {
+                        version: VERSION,
+                        agent_id: second.clone(),
+                        name: "second-manager".into(),
+                        role: "custom".into(),
+                        pane_id: "w1:p3".into(),
+                        space_id: SpaceId::new("w1"),
+                        cwd: None,
+                        reset: None,
+                    },
+                ),
+                None,
+                1,
+                &config,
+                true,
+            )
+            .is_err()
+    );
+    assert_eq!(state, before, "duplicate manager Join must be atomic");
+
+    state.disconnect(&manager);
+    assert!(!state.members[&manager].manager);
+    assert!(
+        state
+            .set_mode(&SpaceId::new("w1"), Mode::Checkin, true, 2)
+            .is_err()
+    );
+    state
+        .apply(
+            &request(
+                "unverified-manager-rejoin",
+                Command::Join {
+                    version: VERSION,
+                    agent_id: manager.clone(),
+                    name: "architect".into(),
+                    role: "architect".into(),
+                    pane_id: "w1:p1".into(),
+                    space_id: SpaceId::new("w1"),
+                    cwd: None,
+                    reset: None,
+                },
+            ),
+            None,
+            2,
+            &config,
+        )
+        .unwrap();
+    assert!(
+        !state.members[&manager].manager,
+        "role text is not authority"
+    );
+    assert!(
+        state
+            .set_mode(&SpaceId::new("w1"), Mode::Checkin, true, 2)
+            .is_err()
+    );
+    state.disconnect(&manager);
+
+    state
+        .apply_validated_join(
+            &request(
+                "manager-rejoin",
+                Command::Join {
+                    version: VERSION,
+                    agent_id: manager.clone(),
+                    name: "architect".into(),
+                    role: "custom".into(),
+                    pane_id: "w1:p1".into(),
+                    space_id: SpaceId::new("w1"),
+                    cwd: None,
+                    reset: None,
+                },
+            ),
+            None,
+            3,
+            &config,
+            true,
+        )
+        .unwrap();
+    assert!(state.members[&manager].manager);
+    state.recover();
+    assert!(!state.members[&manager].manager);
+    assert!(!state.automation.checkin_enabled);
+    assert_eq!(state.automation.manager_checkin_at, None);
+}
+
+#[test]
+fn manager_checkin_requires_admission_and_runs_with_no_tasks() {
+    let config = Scheduling::default();
+    let space = SpaceId::new("w1");
+    let mut state = State::new(space.clone());
+    assert!(state.automation.checkin_enabled);
+    assert!(state.set_mode(&space, Mode::Checkin, true, 10).is_err());
+    assert!(
+        state.automation.checkin_enabled,
+        "no manager is a waiting state, not an implicit disable"
+    );
+    assert_eq!(state.automation.manager_checkin_at, None);
+
+    let manager = AgentId::new("arbitrary-role-agent");
+    state
+        .apply_validated_join(
+            &request(
+                "manager-join",
+                Command::Join {
+                    version: VERSION,
+                    agent_id: manager.clone(),
+                    name: "coordinator".into(),
+                    role: "coordinator".into(),
+                    pane_id: "w1:p1".into(),
+                    space_id: space.clone(),
+                    cwd: None,
+                    reset: None,
+                },
+            ),
+            None,
+            10,
+            &config,
+            true,
+        )
+        .unwrap();
+    state
+        .apply(
+            &request(
+                "idle",
+                Command::Sync {
+                    activity: Activity::Idle,
+                    receive: false,
+                },
+            ),
+            Some(&manager),
+            10,
+            &config,
+        )
+        .unwrap();
+    state.set_mode(&space, Mode::Checkin, true, 10).unwrap();
+    assert_eq!(state.automation.manager_checkin_at, Some(10));
+    state.tick(10, &config).unwrap();
+    assert_eq!(state.tasks.len(), 0);
+    assert_eq!(state.messages.len(), 1);
+    assert_eq!(state.messages[0].to, manager);
+    assert_eq!(state.messages[0].kind, MessageKind::Checkin);
+    assert_eq!(state.messages[0].task_id, None);
+    assert_eq!(state.messages[0].revision, None);
+    assert!(state.messages[0].wake);
+    assert_eq!(
+        state.automation.manager_checkin_at,
+        Some(10 + config.checkin_seconds)
+    );
+
+    state.set_mode(&space, Mode::Checkin, false, 11).unwrap();
+    assert_eq!(state.messages[0].delivery, Delivery::Cancelled);
+    assert_eq!(state.automation.manager_checkin_at, None);
+    state.tick(10 + config.checkin_seconds, &config).unwrap();
+    assert_eq!(
+        state.messages.len(),
+        1,
+        "mode off fences the stale deadline"
+    );
+}
+
+#[test]
+fn done_report_wakes_requester_and_remains_reviewable_with_all_modes_off() {
+    for accept in [false, true] {
+        let (mut state, requester, owner, config) = setup();
+        let task = assign(&mut state, &requester, &owner, &config);
+        receive(&mut state, &owner, &config, 1);
+        assert!(!state.automation.todo_enabled);
+        assert!(!state.automation.checkin_enabled);
+        assert!(!state.automation.pr_enabled);
+
+        state
+            .apply(
+                &request(
+                    "done",
+                    Command::Report {
+                        task_id: task.clone(),
+                        revision: 1,
+                        kind: ReportKind::Done,
+                        text: "Verified output and tests.".into(),
+                    },
+                ),
+                Some(&owner),
+                2,
+                &config,
+            )
+            .unwrap();
+        let queued = state.messages.last().unwrap();
+        assert_eq!(queued.kind, MessageKind::Done);
+        assert!(queued.wake);
+        assert_eq!(queued.to, requester);
+        assert_eq!(queued.task_id.as_ref(), Some(&task));
+        assert_eq!(queued.revision, Some(1));
+        assert_eq!(state.tasks[&task].state, TaskState::Review);
+
+        let delivered = receive(&mut state, &requester, &config, 3).unwrap();
+        assert_eq!(delivered.kind, MessageKind::Done);
+        assert_eq!(
+            state
+                .messages
+                .iter()
+                .find(|message| message.id == delivered.id)
+                .unwrap()
+                .delivery,
+            Delivery::Received
+        );
+        assert_eq!(state.tasks[&task].state, TaskState::Review);
+        let command = if accept {
+            Command::Accept {
+                task_id: task.clone(),
+                revision: 1,
+                text: "Independently reviewed and accepted.".into(),
+            }
+        } else {
+            Command::Guide {
+                task_id: task.clone(),
+                revision: 1,
+                text: "Reconcile one remaining issue, then report again.".into(),
+            }
+        };
+        state
+            .apply(
+                &request("requester-action", command),
+                Some(&requester),
+                4,
+                &config,
+            )
+            .unwrap();
+        assert_eq!(
+            state.tasks[&task].state,
+            if accept {
+                TaskState::Accepted
+            } else {
+                TaskState::Assigned
+            }
+        );
+        if !accept {
+            assert_eq!(state.tasks[&task].revision, 2);
+        }
+    }
+}
+
+#[test]
+fn manager_role_does_not_override_requester_only_task_authority() {
+    let (mut state, manager, worker, config) = setup();
+    let requester = AgentId::new("other-requester");
+    state
+        .apply_validated_join(
+            &request(
+                "other-requester-join",
+                Command::Join {
+                    version: VERSION,
+                    agent_id: requester.clone(),
+                    name: "other-requester".into(),
+                    role: "custom".into(),
+                    pane_id: "w1:p3".into(),
+                    space_id: SpaceId::new("w1"),
+                    cwd: None,
+                    reset: None,
+                },
+            ),
+            None,
+            1,
+            &config,
+            false,
+        )
+        .unwrap();
+    state
+        .apply(
+            &request(
+                "requester-idle",
+                Command::Sync {
+                    activity: Activity::Idle,
+                    receive: false,
+                },
+            ),
+            Some(&requester),
+            1,
+            &config,
+        )
+        .unwrap();
+    let task = assign(&mut state, &requester, &worker, &config);
+    state.tasks.get_mut(&task).unwrap().state = TaskState::Review;
+    let before = state.tasks[&task].clone();
+
+    for action in [
+        Command::Guide {
+            task_id: task.clone(),
+            revision: before.revision,
+            text: "Manager cannot guide another requester task.".into(),
+        },
+        Command::Accept {
+            task_id: task.clone(),
+            revision: before.revision,
+            text: "Manager cannot accept another requester task.".into(),
+        },
+        Command::Cancel {
+            task_id: task.clone(),
+            revision: before.revision,
+            text: "Manager cannot cancel another requester task.".into(),
+        },
+    ] {
+        assert!(
+            state
+                .apply(
+                    &request("manager-action", action),
+                    Some(&manager),
+                    2,
+                    &config
+                )
+                .is_err()
+        );
+        assert_eq!(state.tasks[&task], before);
+    }
+    assert!(state.members[&manager].manager);
+}
+
+#[test]
+fn recovery_preserves_checkin_choice_but_rejoins_never_replay_old_checkpoints() {
+    let config = Scheduling::default();
+    let space = SpaceId::new("w1");
+    let manager = AgentId::new("manager-session");
+    let mut state = State::new(space.clone());
+    assert!(state.automation.checkin_enabled);
+    state.tick(0, &config).unwrap();
+    assert!(
+        state.messages.is_empty(),
+        "default-on waits without a manager"
+    );
+    state
+        .apply_validated_join(
+            &request(
+                "manager-join",
+                Command::Join {
+                    version: VERSION,
+                    agent_id: manager.clone(),
+                    name: "coordinator".into(),
+                    role: "custom".into(),
+                    pane_id: "w1:p1".into(),
+                    space_id: space.clone(),
+                    cwd: None,
+                    reset: None,
+                },
+            ),
+            None,
+            1,
+            &config,
+            true,
+        )
+        .unwrap();
+    state
+        .apply(
+            &request(
+                "idle",
+                Command::Sync {
+                    activity: Activity::Idle,
+                    receive: false,
+                },
+            ),
+            Some(&manager),
+            1,
+            &config,
+        )
+        .unwrap();
+    state.tick(1, &config).unwrap();
+    let old_id = state.messages[0].id.clone();
+    assert_eq!(state.messages[0].kind, MessageKind::Checkin);
+    state.recover();
+    assert!(state.automation.checkin_enabled);
+    assert_eq!(state.automation.manager_checkin_at, None);
+    assert!(state.members.values().all(|member| !member.manager));
+    assert_eq!(state.messages[0].delivery, Delivery::Uncertain);
+
+    state
+        .apply_validated_join(
+            &request(
+                "manager-rejoin",
+                Command::Join {
+                    version: VERSION,
+                    agent_id: manager.clone(),
+                    name: "coordinator".into(),
+                    role: "custom".into(),
+                    pane_id: "w1:p1".into(),
+                    space_id: space.clone(),
+                    cwd: None,
+                    reset: None,
+                },
+            ),
+            None,
+            2,
+            &config,
+            true,
+        )
+        .unwrap();
+    state
+        .apply(
+            &request(
+                "rejoin-idle",
+                Command::Sync {
+                    activity: Activity::Idle,
+                    receive: false,
+                },
+            ),
+            Some(&manager),
+            2,
+            &config,
+        )
+        .unwrap();
+    state.tick(2, &config).unwrap();
+    assert_eq!(state.messages.len(), 2);
+    assert_eq!(state.messages[0].id, old_id);
+    assert_eq!(state.messages[0].delivery, Delivery::Uncertain);
+    assert_ne!(state.messages[0].id, state.messages[1].id);
+    assert_eq!(state.messages[1].delivery, Delivery::Pending);
+
+    let mut explicitly_off = State::new(space.clone());
+    explicitly_off
+        .set_mode(&space, Mode::Checkin, false, 3)
+        .unwrap();
+    explicitly_off.recover();
+    assert!(!explicitly_off.automation.checkin_enabled);
 }
 
 #[test]

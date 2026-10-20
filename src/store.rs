@@ -191,6 +191,7 @@ mod tests {
                 role: "custom".into(),
                 pane_id: "p".into(),
                 space_id: space.clone(),
+                manager: false,
                 cwd: None,
                 activity: crate::protocol::Activity::Offline,
                 last_seen: 0,
@@ -235,6 +236,9 @@ mod tests {
         let path = directory.path().join("hub.sqlite");
         let space = SpaceId::new("w1");
         let mut state = State::new(space.clone());
+        // A legacy database's stored false is an explicit user choice and is
+        // not upgraded to the new fresh-state default.
+        state.automation.checkin_enabled = false;
         let agent = AgentId::new("agent");
         state.members.insert(
             agent.clone(),
@@ -244,6 +248,7 @@ mod tests {
                 role: "custom".into(),
                 pane_id: "w1:p1".into(),
                 space_id: space.clone(),
+                manager: false,
                 cwd: None,
                 activity: crate::protocol::Activity::Offline,
                 last_seen: 1,
@@ -262,7 +267,26 @@ mod tests {
         });
         let mut store = Store::open(&path, space.clone()).unwrap();
         store.save(&state).unwrap();
+        let mut legacy = serde_json::to_value(&state).unwrap();
+        legacy["members"]["agent"]
+            .as_object_mut()
+            .unwrap()
+            .remove("manager");
+        legacy["automation"]
+            .as_object_mut()
+            .unwrap()
+            .remove("manager_checkin_at");
+        store
+            .connection
+            .execute(
+                "UPDATE hub SET payload = ?1 WHERE id = 1",
+                [serde_json::to_string(&legacy).unwrap()],
+            )
+            .unwrap();
         let loaded = store.load().unwrap();
+        assert!(!loaded.members[&agent].manager);
+        assert_eq!(loaded.automation.manager_checkin_at, None);
+        assert!(!loaded.automation.checkin_enabled);
         assert_eq!(loaded.members[&agent].cwd, None);
         assert_eq!(
             loaded.automation.pr.unwrap().url.as_deref(),

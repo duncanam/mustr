@@ -31,6 +31,8 @@ pub(crate) enum Event {
     Request {
         connection: u64,
         request: Request,
+        /// Server-resolved role metadata; never decoded from the public Join.
+        role_manager: Option<bool>,
         reply: oneshot::Sender<Response>,
     },
     Disconnect(u64),
@@ -108,11 +110,32 @@ impl Service {
     }
 
     pub async fn request(&self, connection: u64, request: Request) -> Result<Response> {
+        self.request_with_role(connection, request, None).await
+    }
+
+    /// Submit a Join with the manager flag resolved by the server from the
+    /// selected root role. This metadata never appears in the public protocol.
+    pub async fn join(&self, connection: u64, request: Request, manager: bool) -> Result<Response> {
+        ensure!(
+            matches!(&request.command, Command::Join { .. }),
+            "validated role metadata is only valid for Join"
+        );
+        self.request_with_role(connection, request, Some(manager))
+            .await
+    }
+
+    async fn request_with_role(
+        &self,
+        connection: u64,
+        request: Request,
+        role_manager: Option<bool>,
+    ) -> Result<Response> {
         let (reply, response) = oneshot::channel();
         self.tx
             .send(Event::Request {
                 connection,
                 request,
+                role_manager,
                 reply,
             })
             .await?;
@@ -349,13 +372,21 @@ impl Actor {
                 Event::Request {
                     connection,
                     request,
+                    role_manager,
                     reply,
                 } => {
                     let mut next = self.state.clone();
                     let result = self
                         .sender(connection)
-                        .and_then(|sender| {
-                            next.apply(&request, sender.as_ref(), now, &self.scheduling)
+                        .and_then(|sender| match role_manager {
+                            Some(manager) => next.apply_validated_join(
+                                &request,
+                                sender.as_ref(),
+                                now,
+                                &self.scheduling,
+                                manager,
+                            ),
+                            None => next.apply(&request, sender.as_ref(), now, &self.scheduling),
                         })
                         .and_then(|value| {
                             if matches!(request.command, Command::Sync { .. })
@@ -810,6 +841,7 @@ mod tests {
                 role: "implementor".into(),
                 pane_id: "w1:p1".into(),
                 space_id: SpaceId::new("w1"),
+                manager: false,
                 cwd: None,
                 activity: Activity::Idle,
                 last_seen: 0,

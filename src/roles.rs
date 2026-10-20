@@ -29,6 +29,7 @@ pub(crate) const DEFAULTS: &[(&str, &str)] = &[
 struct Header {
     description: String,
     compose: Vec<String>,
+    manager: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -36,6 +37,8 @@ pub(crate) struct Role {
     pub name: String,
     pub description: String,
     pub prompt: String,
+    #[serde(default)]
+    pub manager: bool,
 }
 
 pub(crate) fn valid_name(name: &str) -> bool {
@@ -60,6 +63,7 @@ pub(crate) fn resolve(directory: &Path, name: &str) -> Result<Role> {
             .description
             .expect("successfully visited root role"),
         prompt: resolution.expanded,
+        manager: resolution.manager,
     })
 }
 
@@ -116,6 +120,7 @@ pub(crate) fn load(directory: &Path) -> Result<Vec<Role>> {
 struct Resolution<'a> {
     directory: &'a Path,
     description: Option<String>,
+    manager: bool,
     active: Vec<String>,
     discovered: BTreeSet<String>,
     visited: BTreeSet<String>,
@@ -127,6 +132,7 @@ impl<'a> Resolution<'a> {
         Self {
             directory,
             description: None,
+            manager: false,
             active: Vec::new(),
             discovered: BTreeSet::new(),
             visited: BTreeSet::new(),
@@ -222,6 +228,9 @@ impl<'a> Resolution<'a> {
         })?;
         if self.active.len() == 1 {
             self.description = Some(header.description.clone());
+            // Manager is admission metadata from the selected role only. A
+            // composed component may contribute prompt text, never authority.
+            self.manager = header.manager;
         }
 
         let mut direct = BTreeMap::<&str, usize>::new();
@@ -532,6 +541,36 @@ mod tests {
                 "missing {name} responsibility"
             );
         }
+    }
+
+    #[test]
+    fn manager_metadata_is_defaulted_root_only_and_type_checked() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("component.md"),
+            "+++\nmanager = true\n+++\nComponent.",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("ordinary-root.md"),
+            "+++\ncompose = [\"component\"]\n+++\nRoot.",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("manager-root.md"),
+            "+++\nmanager = true\ncompose = [\"component\"]\n+++\nRoot.",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("invalid-manager.md"),
+            "+++\nmanager = \"yes\"\n+++\nRoot.",
+        )
+        .unwrap();
+
+        assert!(resolve(dir.path(), "component").unwrap().manager);
+        assert!(!resolve(dir.path(), "ordinary-root").unwrap().manager);
+        assert!(resolve(dir.path(), "manager-root").unwrap().manager);
+        assert!(resolve(dir.path(), "invalid-manager").is_err());
     }
 
     #[test]

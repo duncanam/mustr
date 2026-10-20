@@ -69,6 +69,17 @@ fn fresh_join(
     receipt: &ResetReceipt,
     config: &Scheduling,
 ) -> Result<Value> {
+    fresh_join_with_manager(state, old, new, receipt, config, false)
+}
+
+fn fresh_join_with_manager(
+    state: &mut State,
+    old: &AgentId,
+    new: &str,
+    receipt: &ResetReceipt,
+    config: &Scheduling,
+    manager: bool,
+) -> Result<Value> {
     let member = state.members.get(old).cloned().unwrap_or_else(|| {
         let progress = state
             .snapshot(None, None, 1)
@@ -85,13 +96,14 @@ fn fresh_join(
             role: progress.participant.role,
             pane_id: progress.participant.pane_id,
             space_id: SpaceId::new("w1"),
+            manager: false,
             cwd: None,
             activity: Activity::Offline,
             last_seen: 0,
             idle_since: 0,
         }
     });
-    state.apply(
+    state.apply_validated_join(
         &request(
             "fresh",
             Command::Join {
@@ -108,6 +120,7 @@ fn fresh_join(
         None,
         2,
         config,
+        manager,
     )
 }
 
@@ -185,6 +198,31 @@ fn direct_join_mode_and_reset_apis_reject_foreign_space_ids() {
 }
 
 #[test]
+fn reset_cancels_pending_manager_checkpoint_and_releases_live_slot() {
+    let (mut state, architect, _, config) = fixture();
+    state
+        .set_mode(&SpaceId::new("w1"), Mode::Checkin, true, 5)
+        .unwrap();
+    state.tick(5, &config).unwrap();
+    assert_eq!(state.messages.len(), 1);
+    assert_eq!(state.messages[0].kind, MessageKind::Checkin);
+    assert_eq!(state.messages[0].to, architect);
+    assert_eq!(state.messages[0].delivery, Delivery::Pending);
+
+    begin(&mut state);
+    assert!(!state.automation.checkin_enabled);
+    assert_eq!(state.automation.manager_checkin_at, None);
+    assert!(!state.members.values().any(|member| member.manager));
+    assert_eq!(state.messages[0].delivery, Delivery::Cancelled);
+    state.tick(5000, &config).unwrap();
+    assert_eq!(
+        state.messages.len(),
+        1,
+        "frozen reset cannot regenerate checkpoint"
+    );
+}
+
+#[test]
 fn completion_clears_single_space_history_and_retains_safe_reset_fences() {
     let (mut state, architect, worker, config) = fixture();
     let task = assign(&mut state, &architect, &worker, &config);
@@ -218,6 +256,9 @@ fn completion_clears_single_space_history_and_retains_safe_reset_fences() {
     offline.activity = Activity::Offline;
     state.members.insert(offline.id.clone(), offline);
     attach_pr(&mut state, &worker);
+    state
+        .set_mode(&SpaceId::new("w1"), Mode::Checkin, true, 0)
+        .unwrap();
     state.automation.todo = Some(TodoWatch {
         path: "/fixture/TODO.md".into(),
         driver: worker.clone(),
@@ -233,6 +274,9 @@ fn completion_clears_single_space_history_and_retains_safe_reset_fences() {
     assert_eq!(preview.message_count, 301);
     assert_eq!(preview.offline_count, 1);
     state.start_reset(&preview).unwrap();
+    assert!(state.members.values().all(|member| !member.manager));
+    assert!(!state.automation.checkin_enabled);
+    assert_eq!(state.automation.manager_checkin_at, None);
     assert_eq!(state.messages.len(), 301, "retain data until all receipts");
     let a = ticket(&mut state, &architect, &config);
     let b = ticket(&mut state, &worker, &config);
@@ -241,10 +285,15 @@ fn completion_clears_single_space_history_and_retains_safe_reset_fences() {
     assert!(!public.contains(&a.token));
     assert!(!public.contains(&b.token));
     claim(&mut state, &architect, &a, &config).unwrap();
-    fresh_join(&mut state, &architect, "architect-fresh", &a, &config).unwrap();
+    fresh_join_with_manager(&mut state, &architect, "architect-fresh", &a, &config, true).unwrap();
+    assert!(state.members[&AgentId::new("architect-fresh")].manager);
     assert!(state.reset_frozen(&SpaceId::new("w1")));
     assert!(state.tasks.contains_key(&task));
     claim(&mut state, &worker, &b, &config).unwrap();
+    assert!(
+        fresh_join_with_manager(&mut state, &worker, "worker-fresh", &b, &config, true).is_err(),
+        "a second validated manager role cannot race into the reset slot"
+    );
     fresh_join(&mut state, &worker, "worker-fresh", &b, &config).unwrap();
     assert!(!state.reset_frozen(&SpaceId::new("w1")));
     assert!(state.tasks.is_empty());
@@ -256,6 +305,7 @@ fn completion_clears_single_space_history_and_retains_safe_reset_fences() {
             && !state.automation.pr_enabled
     );
     assert!(state.automation.todo.is_none() && state.automation.pr.is_none());
+    assert_eq!(state.automation.manager_checkin_at, None);
     assert!(state.automation.generation > 0);
     assert_eq!(state.members.len(), 2);
     assert!(state.retired.contains(&architect));

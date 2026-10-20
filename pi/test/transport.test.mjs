@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import net from "node:net";
 import { mkdtemp, rm } from "node:fs/promises";
 import { once } from "node:events";
-import { HubClient, insertionEvidence, messageText } from "../transport.mjs";
+import { HubClient, HubRemoteError, insertionEvidence, messageText } from "../transport.mjs";
 
 async function fixture(t, handler) {
   const directory = await mkdtemp("/tmp/mustr-transport-");
@@ -38,6 +38,26 @@ test("fragments and response IDs correlate without replay", async t => {
   assert.equal(await client.request({ op: "send" }), "received");
   assert.equal(calls.length, 1);
   assert.match(calls[0].id, /^[a-z0-9-]+$/);
+});
+
+test("typed preexecution rejection preserves transport but never replays a mutation", async t => {
+  const calls = [];
+  const client = await fixture(t, (request, socket) => {
+    calls.push(request.op);
+    const response = request.op === "send"
+      ? { id: request.id, ok: false, error: "Identity unavailable; not executed", error_code: "identity_unavailable" }
+      : { id: request.id, ok: true, result: { verified: true } };
+    socket.write(`${JSON.stringify(response)}\n`);
+  });
+  await assert.rejects(client.request({ op: "send" }), error => error instanceof HubRemoteError && error.code === "identity_unavailable");
+  assert.equal(client.connected, true);
+  assert.deepEqual(await client.request({ op: "sync" }), { verified: true });
+  assert.deepEqual(calls, ["send", "sync"]);
+});
+
+test("legacy errors are not inferred to be safe preexecution rejections from their text", async t => {
+  const client = await fixture(t, (request, socket) => socket.write(`${JSON.stringify({ id: request.id, ok: false, error: "identity_unavailable" })}\n`));
+  await assert.rejects(client.request({ op: "report" }), error => error instanceof HubRemoteError && error.code === undefined);
 });
 
 test("uncertain timeout never replays a mutation", async t => {

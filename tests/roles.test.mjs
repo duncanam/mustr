@@ -12,6 +12,7 @@ test("roles CLI resolves one graph independently and warns while listing valid r
   const [role] = JSON.parse(targeted.stdout);
   assert.equal(JSON.parse(targeted.stdout).length, 1);
   assert.equal(role.name, "architect");
+  assert.equal(role.manager, true);
   assert.match(role.prompt, /Role composition adds responsibilities/);
   assert.equal(targeted.stderr, "", "targeted resolution must not inspect unrelated invalid roles");
 
@@ -26,6 +27,37 @@ test("roles CLI resolves one graph independently and warns while listing valid r
     exec(binary, ["roles", "invalid", "--json"], { env: f.env }),
     error => /invalid -> missing/.test(error.stderr),
   );
+});
+
+test("manager metadata is root-only, defaults false, and must be boolean", { timeout: 12000 }, async t => {
+  const f = await fixture(t);
+  const roles = `${f.directory}/config/roles`;
+  await writeFile(`${roles}/manager-fragment.md`, `+++
+manager = true
++++
+Component prompt.
+`);
+  await writeFile(`${roles}/composed.md`, `+++
+compose = ["manager-fragment"]
++++
+Root prompt.
+`);
+  await writeFile(`${roles}/manager-root.md`, `+++
+manager = true
+compose = ["manager-fragment"]
++++
+Root prompt.
+`);
+  await writeFile(`${roles}/invalid-manager.md`, `+++
+manager = "yes"
++++
+Root prompt.
+`);
+
+  const resolve = async name => JSON.parse((await exec(binary, ["roles", name, "--json"], { env: f.env })).stdout)[0];
+  assert.equal((await resolve("composed")).manager, false, "component metadata is ignored");
+  assert.equal((await resolve("manager-root")).manager, true);
+  await assert.rejects(exec(binary, ["roles", "invalid-manager", "--json"], { env: f.env }));
 });
 
 test("explicit init restores only missing defaults; ordinary commands respect deletions", { timeout: 15000 }, async t => {

@@ -411,7 +411,7 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, view: &mut View, color: bool) {
     let mut mode_lines = if view.help {
         Vec::new()
     } else {
-        automation_lines(automation, area.width, color)
+        automation_lines(snapshot, area.width, color)
     };
     let spacious = area.height >= 20 && !view.help;
     // At the supported minimum size, retain the mode controls but sacrifice
@@ -491,7 +491,45 @@ fn draw_header(frame: &mut Frame, area: Rect, snapshot: &Snapshot, view: &View, 
     frame.render_widget(Paragraph::new(elide(&text, identity.width)), identity);
 }
 
-fn automation_lines(automation: &Automation, width: u16, color: bool) -> Vec<Line<'static>> {
+fn manager_line(snapshot: &Snapshot, width: u16, color: bool) -> Line<'static> {
+    let mut managers = snapshot.members.iter().filter(|member| {
+        member.space_id == snapshot.space_id
+            && member.manager
+            && member.activity != Activity::Offline
+    });
+    let manager = managers.next();
+    let (text, warning) = if managers.next().is_some() {
+        ("Manager: unavailable (multiple managers)".into(), true)
+    } else if let Some(manager) = manager {
+        let prefix = "Manager: ";
+        let suffix = format!(" · {}", label(manager.activity));
+        let fixed_width = Line::raw(prefix).width() + Line::raw(&suffix).width();
+        let name_width = width.saturating_sub(u16::try_from(fixed_width).unwrap_or(u16::MAX));
+        (
+            format!(
+                "{prefix}{}{suffix}",
+                elide(&clean(&manager.name), name_width)
+            ),
+            manager.activity == Activity::Paused && snapshot.automation.checkin_enabled,
+        )
+    } else {
+        (
+            "Manager: none · join a manager=true role".into(),
+            snapshot.automation.checkin_enabled,
+        )
+    };
+    Line::styled(
+        elide(&text, width),
+        if warning {
+            tone(color, Color::Yellow)
+        } else {
+            muted()
+        },
+    )
+}
+
+fn automation_lines(snapshot: &Snapshot, width: u16, color: bool) -> Vec<Line<'static>> {
+    let automation = &snapshot.automation;
     let inline = width >= 76;
     let mut lines = Vec::new();
     let mut line = if inline {
@@ -521,6 +559,7 @@ fn automation_lines(automation: &Automation, width: u16, color: bool) -> Vec<Lin
         controls += 1;
     }
     lines.push(line);
+    lines.push(manager_line(snapshot, width, color));
     let mut details = Line::default();
     if let Some(todo) = &automation.todo {
         details.spans.extend([
@@ -737,7 +776,12 @@ fn draw_members(frame: &mut Frame, area: Rect, members: &[&Member], color: bool)
             Cell::from(Text::from(vec![
                 Line::styled(clean(&member.name), bold()),
                 Line::styled(
-                    format!("{} · {}", clean(&member.role), clean(&member.pane_id)),
+                    format!(
+                        "{}{} · {}",
+                        if member.manager { "manager · " } else { "" },
+                        clean(&member.role),
+                        clean(&member.pane_id)
+                    ),
                     muted(),
                 ),
             ])),
@@ -915,6 +959,17 @@ fn draw_tasks(
             .find(|m| m.id == task.owner)
             .map(|m| m.name.as_str())
             .unwrap_or(task.owner.as_str());
+        let requester = snapshot
+            .members
+            .iter()
+            .find(|m| m.id == task.requester)
+            .map(|m| m.name.as_str())
+            .unwrap_or(task.requester.as_str());
+        let responsibility = match task.state {
+            TaskState::Review => format!("Review by {} · ", clean(requester)),
+            TaskState::Blocked => format!("Ask {} · ", clean(requester)),
+            _ => String::new(),
+        };
         let mut details = vec![
             Line::styled(
                 clean(&task.title),
@@ -926,7 +981,7 @@ fn draw_tasks(
             ),
             Line::styled(
                 format!(
-                    "{} · {} r{}",
+                    "{responsibility}{} · {} r{}",
                     clean(owner),
                     clean(task.id.as_str()).chars().take(8).collect::<String>(),
                     task.revision
@@ -935,12 +990,6 @@ fn draw_tasks(
             ),
         ];
         if task.state == TaskState::Paused {
-            let requester = snapshot
-                .members
-                .iter()
-                .find(|m| m.id == task.requester)
-                .map(|m| m.name.as_str())
-                .unwrap_or(task.requester.as_str());
             details.push(Line::styled(
                 elide(&clean(&task.note), inner.width.saturating_sub(12)),
                 tone(color, Color::Yellow),
@@ -1077,7 +1126,7 @@ fn draw_help(frame: &mut Frame, area: Rect, color: bool) {
         Line::raw("f               Messages / Tasks"),
         Line::raw("↑ ↓ / k j       scroll active tab"),
         Line::raw("t  TODO / continuation on/off"),
-        Line::raw("c  periodic check-ins on/off"),
+        Line::raw("c  manager check-ins on/off"),
         Line::raw("p  PR watcher on/off or discover"),
         Line::raw("r  start fresh / reset status (confirmation required)"),
         Line::raw("? / Esc         close help"),
@@ -1097,7 +1146,8 @@ fn draw_help(frame: &mut Frame, area: Rect, color: bool) {
         Line::raw("/mustr-todo [path/to/TODO.md]"),
         Line::raw("/mustr-pr [PR URL]"),
         Line::raw("https://github.com/OWNER/REPO/pull/N"),
-        Line::raw("Modes off after restart; off cancels undelivered, not running work."),
+        Line::raw("Check-in saved; TODO/PR restart off."),
+        Line::raw("Off cancels pending; not running work."),
         Line::styled("Activity ≠ completion. Done ≠ accepted.", bold()),
         Line::raw("Accepted tasks complete; cancelled are not."),
         Line::raw("Task highlight is browse-only; no actions."),
@@ -1177,7 +1227,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, snapshot: &Snapshot, view: &View, 
             if area.width < 60 {
                 "Quit leaves agents open."
             } else {
-                "Modes are opt-in · activity is not completion · quit leaves agents open"
+                "Check-in follows manager · activity is not completion · quit leaves agents open"
             },
             muted(),
         )
@@ -1193,6 +1243,7 @@ mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 
+    mod manager;
     mod pr;
     mod reliability;
     mod reset;
@@ -1216,6 +1267,7 @@ mod tests {
                 id: AgentId::new("ada"),
                 name: "Ada".into(),
                 role: "architect".into(),
+                manager: true,
                 pane_id: "w1:p1".into(),
                 space_id: SpaceId::new("w1"),
                 activity: Activity::Idle,
@@ -1227,6 +1279,7 @@ mod tests {
                 id: AgentId::new("lin"),
                 name: "Lin".into(),
                 role: "implementor".into(),
+                manager: false,
                 pane_id: "w1:p2".into(),
                 space_id: SpaceId::new("w1"),
                 activity: Activity::Working,
@@ -1377,7 +1430,7 @@ mod tests {
         let text = screen(&render(&snapshot, &view, 100, 24, true));
         assert!(text.contains("mustr  /  agent coordination"));
         assert!(text.contains("Orchard · w1"));
-        assert!(text.contains("[t] TODO: off   │   [c] Check-in: off   │   [p] PR: off"));
+        assert!(text.contains("[t] TODO: off   │   [c] Check-in: ON    │   [p] PR: off"));
         assert!(text.contains("/role NAME in Pi to join."));
         assert!(text.contains("Claude: mustr_join"));
         assert!(text.contains("No addressed messages yet."));
@@ -1543,7 +1596,7 @@ mod tests {
                 "f               Messages / Tasks",
                 "scroll active tab",
                 "t  TODO / continuation on/off",
-                "c  periodic check-ins on/off",
+                "c  manager check-ins on/off",
                 "p  PR watcher on/off or discover",
                 "q / Ctrl-C",
                 "? / Esc",
@@ -1553,7 +1606,8 @@ mod tests {
                 "p discovers from current checkout",
                 "when no",
                 "PR is attached.",
-                "Modes off after restart;",
+                "Check-in saved;",
+                "TODO/PR restart off.",
                 "not running work.",
                 "Done ≠ accepted.",
                 "Accepted tasks complete;",

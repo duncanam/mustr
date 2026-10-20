@@ -1,5 +1,7 @@
 use super::*;
 
+mod availability;
+
 use serde_json::{Value, json};
 use tokio::io::AsyncBufReadExt;
 
@@ -47,24 +49,30 @@ async fn socket_join(
     serde_json::from_str(&line).unwrap()
 }
 
+async fn serve_pane_requests(listener: UnixListener, count: usize) {
+    for _ in 0..count {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let mut reader = BufReader::new(read);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        let pane_id = request["params"]["caller_pane_id"].as_str().unwrap();
+        let response = json!({
+            "id": request["id"],
+            "result": {
+                "pane": {"pane_id": pane_id, "workspace_id": "w1", "agent": "pi"}
+            }
+        });
+        write
+            .write_all(format!("{response}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+}
+
 async fn serve_one_pane_request(listener: UnixListener) {
-    let (stream, _) = listener.accept().await.unwrap();
-    let (read, mut write) = stream.into_split();
-    let mut reader = BufReader::new(read);
-    let mut line = String::new();
-    reader.read_line(&mut line).await.unwrap();
-    let request: Value = serde_json::from_str(&line).unwrap();
-    let pane_id = request["params"]["caller_pane_id"].as_str().unwrap();
-    let response = json!({
-        "id": request["id"],
-        "result": {
-            "pane": {"pane_id": pane_id, "workspace_id": "w1", "agent": "pi"}
-        }
-    });
-    write
-        .write_all(format!("{response}\n").as_bytes())
-        .await
-        .unwrap();
+    serve_pane_requests(listener, 1).await;
 }
 
 #[test]
@@ -92,6 +100,98 @@ fn legacy_lock_probe_is_non_creating_and_detects_an_existing_exclusive_lock() {
     assert!(error.to_string().contains("legacy session-wide mustr hub"));
     drop(lock);
     fs::remove_file(lock_path).unwrap();
+}
+
+#[tokio::test]
+async fn server_attests_only_the_selected_root_role_as_manager() {
+    let directory = tempfile::tempdir().unwrap();
+    let roles_dir = directory.path().join("roles");
+    fs::create_dir(&roles_dir).unwrap();
+    fs::write(
+        roles_dir.join("lead.md"),
+        "+++\nmanager = true\n+++\nLead role.\n",
+    )
+    .unwrap();
+    fs::write(
+        roles_dir.join("manager-fragment.md"),
+        "+++\nmanager = true\n+++\nReusable text only.\n",
+    )
+    .unwrap();
+    fs::write(
+        roles_dir.join("composed.md"),
+        "+++\ncompose = ['manager-fragment']\n+++\nOrdinary root.\n",
+    )
+    .unwrap();
+    let service = Service::start(
+        SpaceId::new("w1"),
+        directory.path().join("hub.sqlite"),
+        crate::config::Scheduling::default(),
+    )
+    .await
+    .unwrap();
+    let space = SpaceId::new("w1");
+    let herdr_path = directory.path().join("herdr.sock");
+    let listener = UnixListener::bind(&herdr_path).unwrap();
+    let herdr = Herdr::new(herdr_path.clone()).unwrap();
+    let herdr_task = tokio::spawn(serve_pane_requests(listener, 2));
+
+    for (connection_id, agent, name, pane, role) in [
+        (1, "lead-agent", "lead", "w1:p1", "lead"),
+        (2, "composed-agent", "composed", "w1:p2", "composed"),
+    ] {
+        let response = socket_join(
+            &service,
+            &herdr,
+            &space,
+            &roles_dir,
+            connection_id,
+            request(
+                &format!("join-{agent}"),
+                Command::Join {
+                    version: VERSION,
+                    agent_id: AgentId::new(agent),
+                    name: name.into(),
+                    role: role.into(),
+                    pane_id: pane.into(),
+                    space_id: space.clone(),
+                    cwd: None,
+                    reset: None,
+                },
+            ),
+        )
+        .await;
+        assert!(response.ok, "{}", response.error.unwrap_or_default());
+    }
+    herdr_task.await.unwrap();
+
+    let mut snapshots = service.snapshots.clone();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while snapshots.borrow().members.len() < 2 {
+            snapshots.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let snapshot = snapshots.borrow().clone();
+    let members = snapshot.members;
+    assert!(snapshot.automation.checkin_enabled);
+    assert!(snapshot.automation.manager_checkin_at.is_some());
+    assert!(
+        members
+            .iter()
+            .find(|member| member.id.as_str() == "lead-agent")
+            .unwrap()
+            .manager
+    );
+    assert!(
+        !members
+            .iter()
+            .find(|member| member.id.as_str() == "composed-agent")
+            .unwrap()
+            .manager
+    );
+    assert_eq!(members.iter().filter(|member| member.manager).count(), 1);
+    service.stop().await;
 }
 
 #[tokio::test]

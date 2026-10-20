@@ -7,7 +7,10 @@ const MAX_FRAME = 256 * 1024;
 
 // A negative authoritative reply is distinct from a lost transport ACK. Only
 // the latter permits idempotent re-ack of an already-created fresh identity.
-export class HubRemoteError extends Error {}
+export class HubRemoteError extends Error {
+  /** @param {string} message @param {string | undefined} code */
+  constructor(message, code = undefined) { super(message); this.code = code; }
+}
 
 export class HubClient {
   /** @type {net.Socket | undefined} */
@@ -69,7 +72,7 @@ export class HubClient {
       if (!p) continue;
       clearTimeout(p.timer); this.pending.delete(response.id);
       if (response.ok === true) p.resolve(response.result);
-      else p.reject(new HubRemoteError(typeof response.error === "string" ? response.error : "Invalid hub response"));
+      else p.reject(new HubRemoteError(typeof response.error === "string" ? response.error : "Invalid hub response", typeof response.error_code === "string" ? response.error_code : undefined));
     }
     if (Buffer.byteLength(this.buffer) > MAX_FRAME) this.close();
   }
