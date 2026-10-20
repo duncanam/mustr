@@ -501,7 +501,7 @@ mod tests {
     }
 
     #[test]
-    fn combines_all_default_roles_with_the_shared_base_once() {
+    fn resolver_concatenates_role_text_but_preserves_the_conflict_contract() {
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("roles");
         let dir = tempfile::tempdir().unwrap();
         for name in ["base", "architect", "implementor", "reviewer", "researcher"] {
@@ -522,6 +522,9 @@ mod tests {
         let (_, base_prompt) =
             parse(&fs::read_to_string(dir.path().join("base.md")).unwrap()).unwrap();
         assert_eq!(role.prompt.matches(&base_prompt).count(), 1);
+        assert!(role.prompt.contains(
+            "report the conflict and obtain the human's direct selection of one functional role before proceeding"
+        ));
         let lower = role.prompt.to_ascii_lowercase();
         for override_text in [
             "ignore upstream instructions",

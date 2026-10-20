@@ -91,6 +91,52 @@ pub(crate) fn create_file(path: &Path, bytes: &[u8]) -> Result<bool> {
     }
 }
 
+/// Atomically create a file without replacing a path that appeared concurrently.
+pub(crate) fn create_file_atomically(path: &Path, bytes: &[u8]) -> Result<bool> {
+    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    match create_file(&temporary, bytes) {
+        Ok(true) => {}
+        Ok(false) => bail!("temporary file already exists: {}", temporary.display()),
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+    }
+    match fs::hard_link(&temporary, path) {
+        Ok(()) => {
+            let _ = fs::remove_file(&temporary);
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let _ = fs::remove_file(&temporary);
+            Ok(false)
+        }
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(error).wrap_err_with(|| format!("creating {}", path.display()))
+        }
+    }
+}
+
+/// Atomically replace a destination through a private temporary file in the same directory.
+/// Callers must validate that an existing destination is a regular file first.
+pub(crate) fn replace_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    match create_file(&temporary, bytes) {
+        Ok(true) => {}
+        Ok(false) => bail!("temporary file already exists: {}", temporary.display()),
+        Err(error) => {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+    }
+    if let Err(error) = fs::rename(&temporary, path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).wrap_err_with(|| format!("replacing {}", path.display()));
+    }
+    Ok(())
+}
+
 pub(crate) fn digest(value: impl AsRef<[u8]>) -> String {
     format!("{:x}", Sha256::digest(value.as_ref()))[..24].to_owned()
 }

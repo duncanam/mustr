@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { access, chmod, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, mkdtemp, mkdir, readFile, readdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { spawn } from "node:child_process";
 import { binary, exec, eventually, stop } from "./support.mjs";
 
@@ -69,10 +69,25 @@ test("config-only Claude bundle is idempotent, isolated, and launchable from pat
   const env = { ...process.env, HOME: home, PATH: `${fakeBin}:${process.env.PATH ?? ""}`, FAKE_CLAUDE_CALLS: fakeCalls, MUSTR_CONFIG_DIR: `${root}/config`, MUSTR_STATE_DIR: `${root}/state`, CLAUDE_CONFIG_DIR: claudeConfig };
   const options = { env, cwd: workspace };
   assert.match((await exec(binary, ["install", "--help"], options)).stdout, /claude\s+Register.*Claude Code MCP adapter/);
-  assert.match((await exec(binary, ["install", "claude", "--help"], options)).stdout, /--config-only/);
-  const installed = await exec(binary, ["install", "claude", "--config-only", "--directory", directory], options);
+  const claudeHelp = (await exec(binary, ["install", "claude", "--help"], options)).stdout.replace(/\s+/g, " ");
+  assert.match(claudeHelp, /--config-only/);
+  assert.match(claudeHelp, /--overwrite-roles/);
+  assert.match(claudeHelp, /all harnesses\/spaces sharing this config directory/);
+  assert.match(claudeHelp, /active prompt snapshots require explicit refresh\/reselection\/rejoin/i);
+  await exec(binary, ["init"], options);
+  const rolePath = `${root}/config/roles/architect.md`;
+  const roleOriginal = Buffer.from("config-only role customization\r\nexact bytes\n");
+  await writeFile(rolePath, roleOriginal);
+  const missingRole = `${root}/config/roles/reviewer.md`;
+  await rm(missingRole);
+  const installed = await exec(binary, ["install", "claude", "--config-only", "--directory", directory, "--overwrite-roles"], options);
   const canonicalDirectory = await realpath(directory);
   assert.ok(installed.stdout.includes(`${canonicalDirectory}/mcp.json`));
+  const roleBackup = `${root}/config/role-backups/architect.md.${hash(roleOriginal)}.bak`;
+  assert.ok(installed.stdout.includes(roleBackup));
+  assert.deepEqual(await readFile(roleBackup), roleOriginal);
+  assert.deepEqual(await readFile(rolePath), await readFile(new URL("../roles/architect.md", import.meta.url)));
+  assert.deepEqual(await readFile(missingRole), await readFile(new URL("../roles/reviewer.md", import.meta.url)));
   const configPath = `${canonicalDirectory}/mcp.json`;
   const original = await readFile(configPath, "utf8");
   const config = JSON.parse(original).mcpServers.mustr;
@@ -91,6 +106,7 @@ test("config-only Claude bundle is idempotent, isolated, and launchable from pat
   await assert.rejects(access(`${claudeConfig}/.mcp.json`), { code: "ENOENT" });
   await exec(binary, ["install", "claude", "--config-only", "--directory", directory], options);
   assert.equal(await readFile(configPath, "utf8"), original);
+  assert.deepEqual(await readFile(rolePath), await readFile(new URL("../roles/architect.md", import.meta.url)));
   await assert.rejects(access(fakeCalls), { code: "ENOENT" });
 
   const child = spawn(config.command, config.args, { env: { ...env, ...config.env }, cwd: workspace, stdio: ["pipe", "pipe", "pipe"] });
@@ -172,6 +188,53 @@ test("default Claude install adds once and upgrades through the stable managed l
   assert.equal(await readFile(`${isolatedPaths.claudeConfig}/settings.json`, "utf8"), settings);
 });
 
+test("registered Claude install refreshes roles only with the flag and does not register twice", async t => {
+  const root = await mkdtemp("/tmp/mustr-claude-role-refresh-");
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const isolatedPaths = await isolated(root);
+  await exec(binary, ["init"], isolatedPaths.options);
+  const config = `${root}/mustr-config`;
+  const roles = `${config}/roles`;
+  const architect = `${roles}/architect.md`;
+  const original = Buffer.from("registered Claude role edit\r\nexact bytes\n");
+  await writeFile(architect, original);
+  const missing = `${roles}/researcher.md`;
+  await rm(missing);
+  const customRole = `${roles}/my-custom-role.md`;
+  await writeFile(customRole, "custom Claude role\n");
+  const configPath = `${config}/config.toml`;
+  const configBefore = `${await readFile(configPath, "utf8")}# untouched by role refresh\n`;
+  await writeFile(configPath, configBefore);
+  await mkdir(isolatedPaths.env.MUSTR_STATE_DIR, { recursive: true });
+  const history = `${isolatedPaths.env.MUSTR_STATE_DIR}/history.sentinel`;
+  await writeFile(history, "history sentinel\n");
+
+  const directory = `${root}/bundle`;
+  await exec(binary, ["install", "claude", "--directory", directory], isolatedPaths.options);
+  assert.deepEqual(await readFile(architect), original);
+  await assert.rejects(access(missing), { code: "ENOENT" });
+  await assert.rejects(access(`${config}/role-backups`), { code: "ENOENT" });
+  assert.equal(await callCount(isolatedPaths.calls), 1);
+
+  const refreshed = await exec(binary, ["install", "claude", "--directory", directory, "--overwrite-roles"], isolatedPaths.options);
+  const backup = `${config}/role-backups/architect.md.${hash(original)}.bak`;
+  assert.ok(refreshed.stdout.includes(backup));
+  assert.ok(!refreshed.stdout.includes(original.toString()));
+  assert.deepEqual(await readFile(backup), original);
+  assert.deepEqual(await readFile(architect), await readFile(new URL("../roles/architect.md", import.meta.url)));
+  assert.deepEqual(await readFile(missing), await readFile(new URL("../roles/researcher.md", import.meta.url)));
+  assert.equal(await readFile(customRole, "utf8"), "custom Claude role\n");
+  assert.equal(await readFile(configPath, "utf8"), configBefore);
+  assert.equal(await readFile(history, "utf8"), "history sentinel\n");
+  assert.equal(await callCount(isolatedPaths.calls), 1, "already registered Claude is not re-registered");
+
+  const roleStat = await stat(architect);
+  await exec(binary, ["install", "claude", "--directory", directory, "--overwrite-roles"], isolatedPaths.options);
+  assert.equal((await stat(architect)).ino, roleStat.ino);
+  assert.equal((await readdir(`${config}/role-backups`)).length, 1);
+  assert.equal(await callCount(isolatedPaths.calls), 1);
+});
+
 test("default Claude profile uses HOME when CLAUDE_CONFIG_DIR is unset", async t => {
   const root = await mkdtemp("/tmp/mustr-claude-default-profile-");
   t.after(() => rm(root, { recursive: true, force: true }));
@@ -187,6 +250,10 @@ test("unmanaged user-scope mustr conflict refuses before switching the launcher 
   const root = await mkdtemp("/tmp/mustr-claude-conflict-");
   t.after(() => rm(root, { recursive: true, force: true }));
   const isolatedPaths = await isolated(root);
+  await exec(binary, ["init"], isolatedPaths.options);
+  const rolePath = `${root}/mustr-config/roles/architect.md`;
+  const roleOriginal = Buffer.from("custom role survives Claude registration guard\n");
+  await writeFile(rolePath, roleOriginal);
   const directory = `${root}/bundle`;
   await mkdir(directory);
   const previousAsset = Buffer.from("previous immutable adapter");
@@ -200,7 +267,7 @@ test("unmanaged user-scope mustr conflict refuses before switching the launcher 
   const profileBytes = JSON.stringify(profile, null, 2) + "\n";
   await writeFile(profilePath, profileBytes);
 
-  const error = await exec(binary, ["install", "claude", "--directory", directory], isolatedPaths.options).then(
+  const error = await exec(binary, ["install", "claude", "--directory", directory, "--overwrite-roles"], isolatedPaths.options).then(
     () => assert.fail("unmanaged collision should fail"),
     error => error,
   );
@@ -208,6 +275,8 @@ test("unmanaged user-scope mustr conflict refuses before switching the launcher 
   assert.match(error.stderr, /already registered with different settings/);
   assert.equal(await readFile(`${directory}/mustr.mjs`, "utf8"), previousLauncher);
   assert.equal(await readFile(profilePath, "utf8"), profileBytes);
+  assert.deepEqual(await readFile(rolePath), roleOriginal);
+  await assert.rejects(access(`${root}/mustr-config/role-backups`), { code: "ENOENT" });
   await assert.rejects(access(`${directory}/mcp.json`), { code: "ENOENT" });
   assert.equal(await callCount(isolatedPaths.calls), 0);
 });

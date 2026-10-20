@@ -36,7 +36,7 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Install the adapter for an agent harness.
+    /// Install a harness adapter; use its --overwrite-roles flag to refresh shipped role files.
     #[command(subcommand_value_name = "HARNESS")]
     Install {
         #[command(subcommand)]
@@ -56,12 +56,18 @@ pub(crate) enum InstallTarget {
         /// Generate a standalone MCP config without registering it with Claude Code.
         #[arg(long)]
         config_only: bool,
+        /// Replace edits under shipped names with embedded defaults across all harnesses/spaces sharing this config directory; back up exact originals. Active prompt snapshots require explicit refresh/reselection/rejoin.
+        #[arg(long)]
+        overwrite_roles: bool,
     },
     /// Install the Pi adapter into its auto-discovered extensions directory.
     Pi {
         /// Pi agent directory, not its extensions directory.
         #[arg(long, env = "PI_CODING_AGENT_DIR")]
         agent_dir: Option<PathBuf>,
+        /// Replace edits under shipped names with embedded defaults across all harnesses/spaces sharing this config directory; back up exact originals. Active prompt snapshots require explicit refresh/reselection/rejoin.
+        #[arg(long)]
+        overwrite_roles: bool,
     },
 }
 
@@ -83,6 +89,7 @@ mod tests {
             "pi",
             "--agent-dir",
             "/tmp/pi",
+            "--overwrite-roles",
             "--config-dir",
             "/tmp/mustr",
             "-v",
@@ -91,17 +98,17 @@ mod tests {
         assert_eq!(cli.config_dir, Some(PathBuf::from("/tmp/mustr")));
         assert_eq!(cli.verbosity.to_string(), "debug");
         assert!(
-            matches!(cli.command, Some(Command::Install { harness: InstallTarget::Pi { agent_dir: Some(path) } }) if path == std::path::Path::new("/tmp/pi"))
+            matches!(cli.command, Some(Command::Install { harness: InstallTarget::Pi { agent_dir: Some(path), overwrite_roles: true } }) if path == std::path::Path::new("/tmp/pi"))
         );
     }
 
     #[test]
     fn claude_install_has_separate_options() {
         assert!(matches!(
-            Cli::try_parse_from(["mustr", "install", "claude", "--directory", "/tmp/claude"])
+            Cli::try_parse_from(["mustr", "install", "claude", "--directory", "/tmp/claude", "--overwrite-roles"])
                 .unwrap()
                 .command,
-            Some(Command::Install { harness: InstallTarget::Claude { directory: Some(path), config_only: false } })
+            Some(Command::Install { harness: InstallTarget::Claude { directory: Some(path), config_only: false, overwrite_roles: true } })
                 if path == std::path::Path::new("/tmp/claude")
         ));
         assert!(matches!(
@@ -111,6 +118,25 @@ mod tests {
             Some(Command::Install {
                 harness: InstallTarget::Claude {
                     config_only: true,
+                    overwrite_roles: false,
+                    ..
+                }
+            })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "mustr",
+                "install",
+                "claude",
+                "--config-only",
+                "--overwrite-roles"
+            ])
+            .unwrap()
+            .command,
+            Some(Command::Install {
+                harness: InstallTarget::Claude {
+                    config_only: true,
+                    overwrite_roles: true,
                     ..
                 }
             })
@@ -119,6 +145,7 @@ mod tests {
             Cli::try_parse_from(["mustr", "install", "claude", "--agent-dir", "/tmp/x"]).is_err()
         );
         assert!(Cli::try_parse_from(["mustr", "install", "pi", "--directory", "/tmp/x"]).is_err());
+        assert!(Cli::try_parse_from(["mustr", "init", "--overwrite-roles"]).is_err());
     }
 
     #[test]

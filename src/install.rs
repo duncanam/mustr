@@ -12,7 +12,7 @@ use std::{
 
 use color_eyre::eyre::{Context, Result, ensure, eyre};
 
-use crate::paths::{Paths, check_regular, create_file, private_dir};
+use crate::paths::{Paths, check_regular, create_file, private_dir, replace_file};
 
 const ADAPTER: &str = include_str!("../pi/index.ts");
 const TRANSPORT: &str = include_str!("../pi/transport.mjs");
@@ -88,13 +88,7 @@ pub(crate) fn install(paths: &Paths, agent_dir: Option<PathBuf>) -> Result<PathB
 }
 
 fn replace(path: &Path, contents: &str) -> Result<()> {
-    let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-    create_file(&temporary, contents.as_bytes())?;
-    if let Err(error) = fs::rename(&temporary, path) {
-        let _ = fs::remove_file(&temporary);
-        return Err(error).wrap_err("installing adapter");
-    }
-    Ok(())
+    replace_file(path, contents.as_bytes()).wrap_err("installing adapter")
 }
 
 #[cfg(test)]
