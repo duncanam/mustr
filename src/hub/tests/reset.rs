@@ -226,6 +226,7 @@ fn reset_cancels_pending_manager_checkpoint_and_releases_live_slot() {
 fn completion_clears_single_space_history_and_retains_safe_reset_fences() {
     let (mut state, architect, worker, config) = fixture();
     let task = assign(&mut state, &architect, &worker, &config);
+    let next_task_sequence = state.next_seq;
     let template = state.tasks[&task].clone();
     for (index, task_state) in [
         TaskState::Assigned,
@@ -297,6 +298,10 @@ fn completion_clears_single_space_history_and_retains_safe_reset_fences() {
     fresh_join(&mut state, &worker, "worker-fresh", &b, &config).unwrap();
     assert!(!state.reset_frozen(&SpaceId::new("w1")));
     assert!(state.tasks.is_empty());
+    assert_eq!(
+        state.next_seq, next_task_sequence,
+        "reset retains the monotonic sequence fence"
+    );
     assert!(state.messages.is_empty());
     assert!(state.cache.is_empty());
     assert!(

@@ -18,11 +18,61 @@ use crate::{
 
 mod reset;
 
+const MAX_TASKS: usize = 1000;
+const MAX_MESSAGES: usize = 1000;
+
+#[derive(Clone, Copy)]
+enum DisconnectReason {
+    TransportClosed,
+    LeaseExpired,
+    Left,
+}
+
+impl DisconnectReason {
+    fn task_note(self) -> &'static str {
+        match self {
+            Self::TransportClosed => {
+                "Participant transport closed. Execution may have continued; reconcile before guidance."
+            }
+            Self::LeaseExpired => {
+                "Participant lease expired. Execution may have continued; reconcile before guidance."
+            }
+            Self::Left => {
+                "Participant left. Execution may have continued; reconcile before guidance."
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct TaskConflict(&'static str);
+
+impl TaskConflict {
+    fn stale_revision() -> Self {
+        Self("stale task revision; refresh the roster before acting")
+    }
+
+    fn no_longer_reportable() -> Self {
+        Self("task is no longer reportable; refresh the roster before acting")
+    }
+}
+
+impl std::fmt::Display for TaskConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for TaskConflict {}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct State {
     space_id: SpaceId,
     pub members: BTreeMap<AgentId, Member>,
     pub tasks: BTreeMap<TaskId, Task>,
+    /// Next global FIFO sequence to allocate; `u64::MAX` is the exhausted sentinel.
+    #[serde(default)]
+    next_seq: u64,
     pub messages: Vec<Message>,
     pub automation: Automation,
     cache: Vec<Cached>,
@@ -42,12 +92,33 @@ struct Cached {
     epoch: u64,
 }
 
+#[derive(Serialize)]
+struct CancellationGuard<'a> {
+    owner_id: &'a AgentId,
+    scope: CancelScope,
+    tasks: Vec<CancellationGuardTask<'a>>,
+}
+
+#[derive(Serialize)]
+struct CancellationGuardTask<'a> {
+    task_id: &'a TaskId,
+    revision: u32,
+    state: TaskState,
+}
+
+struct PlannedCancellationNotice {
+    to: AgentId,
+    task_id: Option<TaskId>,
+    text: String,
+}
+
 impl State {
     pub fn new(space_id: SpaceId) -> Self {
         Self {
             space_id,
             members: BTreeMap::new(),
             tasks: BTreeMap::new(),
+            next_seq: 1,
             messages: Vec::new(),
             automation: Automation::default(),
             cache: Vec::new(),
@@ -96,6 +167,13 @@ impl State {
 
 impl State {
     pub fn recover(&mut self) {
+        let next_after_tasks = self
+            .tasks
+            .values()
+            .map(|task| task.seq)
+            .max()
+            .map_or(1, |seq| seq.saturating_add(1));
+        self.next_seq = self.next_seq.max(next_after_tasks).max(1);
         self.reset_capable.clear();
         self.recover_resets();
         for member in self.members.values_mut() {
@@ -132,7 +210,30 @@ impl State {
                 .then_with(|| a.name.cmp(&b.name))
         });
         let mut tasks: Vec<_> = self.tasks.values().cloned().collect();
-        tasks.sort_by_key(|t| (t.state.finished(), std::cmp::Reverse(t.updated_at)));
+        tasks.sort_by(|left, right| {
+            let class = |task: &Task| {
+                if task.state.finished() {
+                    2
+                } else if task.state == TaskState::Queued {
+                    1
+                } else {
+                    0
+                }
+            };
+            class(left)
+                .cmp(&class(right))
+                .then_with(|| {
+                    if left.state == TaskState::Queued && right.state == TaskState::Queued {
+                        left.owner
+                            .cmp(&right.owner)
+                            .then_with(|| left.seq.cmp(&right.seq))
+                            .then_with(|| left.id.cmp(&right.id))
+                    } else {
+                        right.updated_at.cmp(&left.updated_at)
+                    }
+                })
+                .then_with(|| left.id.cmp(&right.id))
+        });
         Snapshot {
             space_id: self.space_id.clone(),
             space,
@@ -234,6 +335,26 @@ impl State {
                     ),
                 "space is frozen for fresh start; ordinary work is blocked"
             );
+            // Nonrequester cancellation authority must still be current before a
+            // successful mutation can be replayed from the idempotency cache.
+            match &request.command {
+                Command::Cancel { task_id, .. }
+                    if self
+                        .tasks
+                        .get(task_id)
+                        .is_none_or(|task| &task.requester != sender) =>
+                {
+                    ensure!(
+                        member.manager,
+                        "only the requester or current admitted manager may cancel unfinished work"
+                    );
+                }
+                Command::CancelOwnerTasks { .. } => ensure!(
+                    member.manager,
+                    "only the current admitted manager may cancel an owner's tasks"
+                ),
+                _ => {}
+            }
         }
         let fingerprint = digest(serde_json::to_vec(&request.command)?);
         let mutation = !matches!(
@@ -486,7 +607,15 @@ impl State {
                     .members
                     .values()
                     .filter(|m| m.space_id == member.space_id)
-                    .collect();
+                    .map(|m| {
+                        let mut value = serde_json::to_value(m)?;
+                        value
+                            .as_object_mut()
+                            .ok_or_else(|| eyre!("serialized member is not an object"))?
+                            .insert("task_queue".into(), self.task_queue_summary(&m.id)?);
+                        Ok(value)
+                    })
+                    .collect::<Result<_>>()?;
                 let mut relevant: Vec<_> = self
                     .tasks
                     .values()
@@ -495,14 +624,50 @@ impl State {
                             && (!t.state.finished() || &t.owner == sender || &t.requester == sender)
                     })
                     .collect();
-                relevant.sort_by_key(|t| {
-                    (
-                        t.state.finished(),
-                        &t.owner != sender,
-                        std::cmp::Reverse(t.updated_at),
-                    )
+                relevant.sort_by(|left, right| {
+                    let class = |task: &Task| {
+                        if task.state.finished() {
+                            2
+                        } else if task.state == TaskState::Queued {
+                            1
+                        } else {
+                            0
+                        }
+                    };
+                    class(left)
+                        .cmp(&class(right))
+                        .then_with(|| (&left.owner != sender).cmp(&(&right.owner != sender)))
+                        .then_with(|| {
+                            if left.state == TaskState::Queued && right.state == TaskState::Queued {
+                                left.owner
+                                    .cmp(&right.owner)
+                                    .then_with(|| left.seq.cmp(&right.seq))
+                                    .then_with(|| left.id.cmp(&right.id))
+                            } else {
+                                right.updated_at.cmp(&left.updated_at)
+                            }
+                        })
+                        .then_with(|| left.id.cmp(&right.id))
                 });
-                let tasks: Vec<_> = relevant.iter().take(64).map(|t| json!({"id":t.id,"requester":t.requester,"owner":t.owner,"title":t.title,"state":t.state,"revision":t.revision,"note":t.note.chars().take(300).collect::<String>()})).collect();
+                let tasks: Vec<_> = relevant
+                    .iter()
+                    .take(64)
+                    .map(|task| {
+                        let mut row = json!({
+                            "id":task.id,
+                            "requester":task.requester,
+                            "owner":task.owner,
+                            "title":task.title,
+                            "state":task.state,
+                            "revision":task.revision,
+                            "note":task.note.chars().take(300).collect::<String>()
+                        });
+                        if let Some(position) = self.queue_position(&task.id) {
+                            row["queue_position"] = json!(position);
+                        }
+                        row
+                    })
+                    .collect();
                 let a = &self.automation;
                 let automation = Some(json!({
                     "todo_enabled":a.todo_enabled,"checkin_enabled":a.checkin_enabled,"pr_enabled":a.pr_enabled,
@@ -541,16 +706,13 @@ impl State {
                 );
                 ensure!(sender != to, "assign to another participant");
                 ensure!(
-                    self.members[to].activity == Activity::Idle,
-                    "recipient must be idle and unpaused"
+                    matches!(
+                        self.members[to].activity,
+                        Activity::Idle | Activity::Working
+                    ),
+                    "recipient must be idle or working and unpaused"
                 );
-                ensure!(
-                    !self
-                        .tasks
-                        .values()
-                        .any(|t| &t.owner == to && !t.state.finished()),
-                    "recipient already owns an unfinished task"
-                );
+                ensure!(!self.retired.contains(to), "recipient is retired");
                 ensure!(
                     !(self.automation.todo_enabled
                         && self
@@ -561,36 +723,41 @@ impl State {
                     "recipient is running a TODO file; disable that mode before assigning work"
                 );
                 ensure!(
-                    self.tasks.len() < 1000,
+                    self.tasks.len() < MAX_TASKS,
                     "task history capacity reached; archive the stopped hub's state before continuing"
                 );
+                let max_seq = self.tasks.values().map(|task| task.seq).max().unwrap_or(0);
+                let seq = self.next_seq.max(max_seq.saturating_add(1)).max(1);
+                let next_seq = seq.checked_add(1).ok_or_else(|| {
+                    eyre!("task sequence exhausted; new assignments are disabled")
+                })?;
                 let id = TaskId::new(Uuid::new_v4().to_string());
                 let task = Task {
                     id: id.clone(),
+                    seq,
                     space_id: member.space_id.clone(),
                     requester: sender.clone(),
                     owner: to.clone(),
                     title: title.clone(),
                     description: text.clone(),
-                    state: TaskState::Assigned,
+                    state: TaskState::Queued,
                     revision: 1,
                     updated_at: now,
-                    checkin_at: now + scheduling.checkin_seconds,
+                    checkin_at: 0,
                     nudges: 0,
                     note: String::new(),
                 };
-                self.tasks.insert(id.clone(), task.clone());
-                self.queue(
-                    &member.space_id,
-                    Some(sender),
-                    to,
-                    Some(&task),
-                    MessageKind::Assignment,
-                    format!("{}\n\n{}", title, text),
-                    true,
-                    now,
-                )?;
-                Ok(json!({"task_id":id,"revision":1,"delivery":"queued"}))
+                self.next_seq = next_seq;
+                self.tasks.insert(id.clone(), task);
+                self.promote_next_for_owner(to, now, scheduling)?;
+                let task = &self.tasks[&id];
+                Ok(json!({
+                    "task_id":id,
+                    "revision":task.revision,
+                    "state":task.state,
+                    "queue_position":self.queue_position(&id),
+                    "delivery":if task.state == TaskState::Queued { "not_dispatched" } else { "queued" }
+                }))
             }
             Command::Report {
                 task_id,
@@ -599,15 +766,9 @@ impl State {
                 text,
             } => {
                 validate_text(text)?;
-                let mut task = self.task(&member, task_id, *revision)?.clone();
-                ensure!(
-                    &task.owner == sender && !task.state.finished(),
-                    "only the owner can report on unfinished work"
-                );
-                ensure!(
-                    task.state != TaskState::Review || *kind == ReportKind::Status,
-                    "task is awaiting review; wait for guidance"
-                );
+                let mut task = self
+                    .report_task(&member, sender, task_id, *revision, *kind)?
+                    .clone();
                 match kind {
                     ReportKind::Blocked => task.state = TaskState::Blocked,
                     ReportKind::Waiting => task.state = TaskState::Waiting,
@@ -654,34 +815,32 @@ impl State {
                 task_id,
                 revision,
                 text,
-            }
-            | Command::Cancel {
-                task_id,
-                revision,
-                text,
             } => {
                 validate_text(text)?;
                 let mut task = self.task(&member, task_id, *revision)?.clone();
                 ensure!(
                     &task.requester == sender && !task.state.finished(),
-                    "only the requester can guide/accept/cancel unfinished work"
+                    "only the requester can guide/accept unfinished work"
                 );
-                self.cancel_task_prompts(task_id);
                 let guide = matches!(command, Command::Guide { .. });
+                let queued = task.state == TaskState::Queued;
                 if guide {
+                    ensure!(!queued, "queued task has not been dispatched");
                     self.recipient(&member, &task.owner)?;
-                    task.state = TaskState::Assigned;
-                    task.revision += 1;
-                    task.nudges = 0;
-                    task.checkin_at = now + scheduling.checkin_seconds;
-                } else if matches!(command, Command::Accept { .. }) {
+                } else {
                     ensure!(
                         task.state == TaskState::Review,
                         "wait for a completion report before acceptance"
                     );
-                    task.state = TaskState::Accepted;
+                }
+                self.cancel_task_prompts(task_id);
+                if guide {
+                    task.state = TaskState::Assigned;
+                    task.revision += 1;
+                    task.nudges = 0;
+                    task.checkin_at = now + scheduling.checkin_seconds;
                 } else {
-                    task.state = TaskState::Cancelled;
+                    task.state = TaskState::Accepted;
                 }
                 task.note = text.clone();
                 task.updated_at = now;
@@ -701,6 +860,14 @@ impl State {
                 )?;
                 self.tasks.insert(task_id.clone(), task.clone());
                 Ok(json!({"state":task.state,"revision":task.revision}))
+            }
+            Command::Cancel {
+                task_id,
+                revision,
+                text,
+            } => self.cancel_task(&member, sender, task_id, *revision, text, now),
+            Command::CancelOwnerTasks { .. } => {
+                self.cancel_owner_tasks(&member, sender, command, now)
             }
             Command::Ack { message_id } => {
                 let message = self
@@ -816,7 +983,7 @@ impl State {
                 Ok(json!({"enabled":enabled}))
             }
             Command::Leave => {
-                self.disconnect(sender);
+                self.disconnect_with_reason(sender, DisconnectReason::Left);
                 Ok(json!({"left":true}))
             }
             Command::Join { .. } => unreachable!("join handled above"),
@@ -959,6 +1126,10 @@ impl State {
     }
 
     pub fn disconnect(&mut self, id: &AgentId) {
+        self.disconnect_with_reason(id, DisconnectReason::TransportClosed);
+    }
+
+    fn disconnect_with_reason(&mut self, id: &AgentId, reason: DisconnectReason) {
         self.reset_capable.remove(id);
         self.disconnect_reset(id);
         if let Some(member) = self.members.get_mut(id) {
@@ -978,7 +1149,7 @@ impl State {
             &t.owner == id && matches!(t.state, TaskState::Assigned | TaskState::Active)
         }) {
             task.state = TaskState::Paused;
-            task.note = "Participant disconnected. Execution may have continued; reconcile before guidance.".into();
+            task.note = reason.task_note().into();
         }
         let automation = &mut self.automation;
         let todo_driver = automation.todo.as_ref().is_some_and(|t| &t.driver == id);
@@ -1023,10 +1194,212 @@ impl State {
         Ok(task)
     }
 
+    fn report_task<'a>(
+        &'a self,
+        member: &Member,
+        sender: &AgentId,
+        id: &TaskId,
+        revision: u32,
+        kind: ReportKind,
+    ) -> Result<&'a Task> {
+        let task = self.tasks.get(id).ok_or_else(|| eyre!("unknown task"))?;
+        ensure!(
+            task.space_id == member.space_id,
+            "task belongs to another space"
+        );
+        ensure!(
+            &task.owner == sender,
+            "only the owner can report on unfinished work"
+        );
+        if task.revision != revision {
+            return Err(TaskConflict::stale_revision().into());
+        }
+        if task.state.finished()
+            || task.state == TaskState::Queued
+            || (task.state == TaskState::Review && kind != ReportKind::Status)
+            || (kind == ReportKind::Progress && task.state != TaskState::Active)
+        {
+            return Err(TaskConflict::no_longer_reportable().into());
+        }
+        Ok(task)
+    }
+
     fn pending_for(&self, id: &AgentId) -> bool {
         self.messages.iter().any(|m| {
             &m.to == id && m.wake && matches!(m.delivery, Delivery::Pending | Delivery::Offered)
         })
+    }
+
+    fn message_capacity_available(&self) -> bool {
+        self.messages.len() < MAX_MESSAGES
+            || self
+                .messages
+                .iter()
+                .any(|message| matches!(message.delivery, Delivery::Received | Delivery::Cancelled))
+    }
+
+    fn queued_tasks_for(&self, owner: &AgentId) -> Vec<&Task> {
+        let mut tasks: Vec<_> = self
+            .tasks
+            .values()
+            .filter(|task| &task.owner == owner && task.state == TaskState::Queued)
+            .collect();
+        tasks.sort_by(|left, right| {
+            left.seq
+                .cmp(&right.seq)
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        tasks
+    }
+
+    fn queue_position(&self, task_id: &TaskId) -> Option<usize> {
+        let task = self.tasks.get(task_id)?;
+        if task.state != TaskState::Queued {
+            return None;
+        }
+        Some(
+            self.tasks
+                .values()
+                .filter(|candidate| {
+                    candidate.owner == task.owner
+                        && candidate.state == TaskState::Queued
+                        && (candidate.seq, &candidate.id) < (task.seq, &task.id)
+                })
+                .count()
+                + 1,
+        )
+    }
+
+    fn task_queue_summary(&self, owner: &AgentId) -> Result<Value> {
+        let holder = self
+            .tasks
+            .values()
+            .filter(|task| &task.owner == owner && task.state.holds_slot())
+            .min_by(|left, right| left.id.cmp(&right.id));
+        let queued = self.queued_tasks_for(owner);
+        Ok(json!({
+            "holder": holder.map(|task| json!({
+                "id": task.id,
+                "state": task.state,
+                "revision": task.revision,
+                "requester": task.requester,
+            })),
+            "queued_count": queued.len(),
+            "next_queued": queued.first().map(|task| json!({
+                "id": task.id,
+                "title": task.title,
+                "requester": task.requester,
+            })),
+            "cancellation_guards": {
+                "queued_only": self.cancellation_guard(owner, CancelScope::QueuedOnly)?,
+                "all_unfinished": self.cancellation_guard(owner, CancelScope::AllUnfinished)?,
+            },
+        }))
+    }
+
+    fn tasks_for_cancel_scope(&self, owner: &AgentId, scope: CancelScope) -> Vec<&Task> {
+        let mut tasks: Vec<_> = self
+            .tasks
+            .values()
+            .filter(|task| {
+                task.space_id == self.space_id
+                    && &task.owner == owner
+                    && match scope {
+                        CancelScope::QueuedOnly => task.state == TaskState::Queued,
+                        CancelScope::AllUnfinished => !task.state.finished(),
+                    }
+            })
+            .collect();
+        tasks.sort_by(|left, right| left.id.cmp(&right.id));
+        tasks
+    }
+
+    fn cancellation_guard(&self, owner: &AgentId, scope: CancelScope) -> Result<String> {
+        let tasks = self.tasks_for_cancel_scope(owner, scope);
+        self.cancellation_guard_for_tasks(owner, scope, &tasks)
+    }
+
+    fn cancellation_guard_for_tasks(
+        &self,
+        owner: &AgentId,
+        scope: CancelScope,
+        tasks: &[&Task],
+    ) -> Result<String> {
+        let mut ordered = tasks.to_vec();
+        ordered.sort_by(|left, right| left.id.cmp(&right.id));
+        let guard = CancellationGuard {
+            owner_id: owner,
+            scope,
+            tasks: ordered
+                .iter()
+                .map(|task| CancellationGuardTask {
+                    task_id: &task.id,
+                    revision: task.revision,
+                    state: task.state,
+                })
+                .collect(),
+        };
+        Ok(digest(serde_json::to_vec(&guard)?))
+    }
+
+    fn promote_next_for_owner(
+        &mut self,
+        owner: &AgentId,
+        now: u64,
+        scheduling: &Scheduling,
+    ) -> Result<bool> {
+        if self.reset_frozen(&self.space_id)
+            || self.retired.contains(owner)
+            || self.members.get(owner).is_none_or(|member| {
+                member.space_id != self.space_id || member.activity != Activity::Idle
+            })
+            || (self.automation.todo_enabled
+                && self
+                    .automation
+                    .todo
+                    .as_ref()
+                    .is_some_and(|todo| &todo.driver == owner))
+            || self
+                .tasks
+                .values()
+                .any(|task| &task.owner == owner && task.state.holds_slot())
+        {
+            return Ok(false);
+        }
+        let Some(task) = self.queued_tasks_for(owner).into_iter().next().cloned() else {
+            return Ok(false);
+        };
+        if !self.message_capacity_available() {
+            return Ok(false);
+        }
+        self.queue(
+            &task.space_id,
+            Some(&task.requester),
+            owner,
+            Some(&task),
+            MessageKind::Assignment,
+            format!("{}\n\n{}", task.title, task.description),
+            true,
+            now,
+        )?;
+        let mut dispatched = task;
+        dispatched.state = TaskState::Assigned;
+        dispatched.updated_at = now;
+        dispatched.checkin_at = now.saturating_add(scheduling.checkin_seconds);
+        dispatched.nudges = 0;
+        self.tasks.insert(dispatched.id.clone(), dispatched);
+        Ok(true)
+    }
+
+    fn promote_queued_tasks(&mut self, now: u64, scheduling: &Scheduling) -> Result<()> {
+        if self.reset_frozen(&self.space_id) {
+            return Ok(());
+        }
+        let owners: Vec<_> = self.members.keys().cloned().collect();
+        for owner in owners {
+            self.promote_next_for_owner(&owner, now, scheduling)?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1042,7 +1415,7 @@ impl State {
         now: u64,
     ) -> Result<MessageId> {
         self.validate_space(space)?;
-        if self.messages.len() >= 1000 {
+        if self.messages.len() >= MAX_MESSAGES {
             if let Some(i) = self
                 .messages
                 .iter()
@@ -1094,6 +1467,220 @@ impl State {
         }
     }
 
+    fn cancel_task(
+        &mut self,
+        member: &Member,
+        sender: &AgentId,
+        task_id: &TaskId,
+        revision: u32,
+        text: &str,
+        now: u64,
+    ) -> Result<Value> {
+        validate_text(text)?;
+        let task = self.task(member, task_id, revision)?.clone();
+        ensure!(!task.state.finished(), "task is already finished");
+        let manager_action = member.manager;
+        ensure!(
+            &task.requester == sender || manager_action,
+            "only the requester or current admitted manager may cancel unfinished work"
+        );
+        let notices = self.cancel_selected_tasks(
+            std::slice::from_ref(&task),
+            sender,
+            text,
+            manager_action,
+            "single_task",
+            now,
+        )?;
+        let cancelled = self
+            .tasks
+            .get(task_id)
+            .ok_or_else(|| eyre!("task disappeared during cancellation"))?;
+        if manager_action {
+            Ok(json!({
+                "state":cancelled.state,
+                "revision":cancelled.revision,
+                "cancelled_task_ids":[cancelled.id],
+                "cancelled_count":1,
+                "actor_id":sender,
+                "notices_queued":notices,
+                "notice_status":if notices == 0 { "none" } else { "queued_not_delivered" },
+            }))
+        } else {
+            // Keep the original requester receipt shape stable.
+            Ok(json!({"state":cancelled.state,"revision":cancelled.revision}))
+        }
+    }
+
+    fn cancel_owner_tasks(
+        &mut self,
+        member: &Member,
+        sender: &AgentId,
+        command: &Command,
+        now: u64,
+    ) -> Result<Value> {
+        let Command::CancelOwnerTasks {
+            owner_id,
+            scope,
+            expected_guard,
+            text,
+        } = command
+        else {
+            unreachable!("cancel_owner_tasks called for another command")
+        };
+        ensure!(
+            member.manager,
+            "only the current admitted manager may cancel an owner's tasks"
+        );
+        validate_text(text)?;
+        let owner = self
+            .members
+            .get(owner_id)
+            .ok_or_else(|| eyre!("unknown task owner"))?;
+        ensure!(
+            owner.space_id == self.space_id && owner.space_id == member.space_id,
+            "task owner belongs to another space"
+        );
+        let selected = self.tasks_for_cancel_scope(owner_id, *scope);
+        let current_guard = self.cancellation_guard_for_tasks(owner_id, *scope, &selected)?;
+        ensure!(
+            current_guard == *expected_guard,
+            "owner task selection changed; refresh the roster and use its current cancellation guard"
+        );
+        let selected: Vec<_> = selected.into_iter().cloned().collect();
+        let task_ids: Vec<_> = selected.iter().map(|task| task.id.clone()).collect();
+        let notices =
+            self.cancel_selected_tasks(&selected, sender, text, true, scope.as_str(), now)?;
+        Ok(json!({
+            "owner_id":owner_id,
+            "scope":scope,
+            "cancelled_task_ids":task_ids,
+            "cancelled_count":selected.len(),
+            "actor_id":sender,
+            "notices_queued":notices,
+            "notice_status":if notices == 0 { "none" } else { "queued_not_delivered" },
+        }))
+    }
+
+    fn cancel_selected_tasks(
+        &mut self,
+        selected: &[Task],
+        actor: &AgentId,
+        reason: &str,
+        manager_action: bool,
+        scope: &str,
+        now: u64,
+    ) -> Result<usize> {
+        let notes: Vec<_> = selected
+            .iter()
+            .map(|_| {
+                let note = if manager_action {
+                    format!("Manager {actor} cancelled: {reason}")
+                } else {
+                    format!("Requester {actor} cancelled: {reason}")
+                };
+                validate_text(&note)?;
+                Ok(note)
+            })
+            .collect::<Result<_>>()?;
+
+        let mut notices = Vec::new();
+        for task in selected.iter().filter(|task| task.state.holds_slot()) {
+            let text = if manager_action {
+                format!(
+                    "Task cancelled by manager {actor}: {reason}. This is hub bookkeeping only; it does not stop tools or external jobs."
+                )
+            } else {
+                format!("Task cancelled by requester {actor}: {reason}")
+            };
+            validate_text(&text)?;
+            notices.push(PlannedCancellationNotice {
+                to: task.owner.clone(),
+                task_id: Some(task.id.clone()),
+                text,
+            });
+        }
+
+        if manager_action {
+            let mut requester_counts = BTreeMap::new();
+            for task in selected.iter().filter(|task| &task.requester != actor) {
+                *requester_counts
+                    .entry(task.requester.clone())
+                    .or_insert(0usize) += 1;
+            }
+            for (requester, count) in requester_counts {
+                let owner = selected
+                    .first()
+                    .map(|task| task.owner.as_str())
+                    .unwrap_or_default();
+                let text = format!(
+                    "Manager {actor} cancelled {count} task(s) owned by {owner} in {scope}; reason: {reason}. This is hub bookkeeping only and does not stop external work."
+                );
+                validate_text(&text)?;
+                notices.push(PlannedCancellationNotice {
+                    to: requester,
+                    task_id: None,
+                    text,
+                });
+            }
+        }
+
+        let selected_ids: BTreeSet<_> = selected.iter().map(|task| task.id.clone()).collect();
+        let reclaimable = self
+            .messages
+            .iter()
+            .filter(|message| {
+                matches!(message.delivery, Delivery::Received | Delivery::Cancelled)
+                    || (message.delivery == Delivery::Pending
+                        && message.wake
+                        && message
+                            .task_id
+                            .as_ref()
+                            .is_some_and(|task_id| selected_ids.contains(task_id)))
+            })
+            .count();
+        let available = MAX_MESSAGES
+            .saturating_sub(self.messages.len())
+            .saturating_add(reclaimable);
+        ensure!(
+            available >= notices.len(),
+            "message capacity reached; reconcile outstanding deliveries"
+        );
+
+        // Retire all selected pending wakes before queueing any notification, so
+        // capacity can be reclaimed across the complete selection.
+        for task_id in &selected_ids {
+            self.cancel_task_prompts(task_id);
+        }
+        for (task, note) in selected.iter().zip(notes) {
+            let current = self
+                .tasks
+                .get_mut(&task.id)
+                .ok_or_else(|| eyre!("task disappeared during cancellation"))?;
+            current.state = TaskState::Cancelled;
+            current.note = note;
+            current.updated_at = now;
+        }
+        let space = self.space_id.clone();
+        for notice in &notices {
+            let task = notice
+                .task_id
+                .as_ref()
+                .and_then(|task_id| self.tasks.get(task_id).cloned());
+            self.queue(
+                &space,
+                Some(actor),
+                &notice.to,
+                task.as_ref(),
+                MessageKind::Info,
+                notice.text.clone(),
+                false,
+                now,
+            )?;
+        }
+        Ok(notices.len())
+    }
+
     pub fn tick(&mut self, now: u64, scheduling: &Scheduling) -> Result<()> {
         let stale: Vec<_> = self
             .members
@@ -1102,7 +1689,7 @@ impl State {
             .map(|m| m.id.clone())
             .collect();
         for id in stale {
-            self.disconnect(&id);
+            self.disconnect_with_reason(&id, DisconnectReason::LeaseExpired);
         }
         for mut task in self.tasks.values().cloned().collect::<Vec<_>>() {
             if task.state != TaskState::Active || self.reset_frozen(&task.space_id) {
@@ -1173,7 +1760,7 @@ impl State {
                     &manager_id,
                     None,
                     MessageKind::Checkin,
-                    "Manager checkpoint: reconcile your approved role goal and inspect the current same-space roster, including unfinished Assigned, Active, Blocked, Waiting, Review, and Paused tasks. Check tasks_truncated; do not claim exhaustive review if the roster is truncated. Use Guide/Accept/Cancel only for tasks you requested. Receipt is not execution or completion; do not resubmit uncertain work or invent scope. If a genuine human decision is needed, remain responsive and report that dependency. The human controls this periodic mode with c or /mustr checkin on|off.".into(),
+                    "Manager checkpoint: reconcile your approved role goal and inspect the current same-space roster, including Queued, Assigned, Active, Blocked, Waiting, Review, and Paused tasks. Queued work is not dispatched; check its FIFO position and do not start it. Check tasks_truncated; do not claim exhaustive review if the roster is truncated. Use Guide/Accept only for tasks you requested. Cancel only tasks you requested unless the user explicitly directs redirection; manager cancellation changes hub bookkeeping and does not stop external work. Receipt is not execution or completion; do not resubmit uncertain work or invent scope. If a genuine human decision is needed, remain responsive and report that dependency. The human controls this periodic mode with c or /mustr checkin on|off.".into(),
                     true,
                     now,
                 )?;
@@ -1181,6 +1768,7 @@ impl State {
                     Some(now.saturating_add(scheduling.checkin_seconds));
             }
         }
+        self.promote_queued_tasks(now, scheduling)?;
         Ok(())
     }
 

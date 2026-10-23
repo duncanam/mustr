@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { chmod, readFile, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { fixture, binary, eventually, delay, stop } from "../../tests/support.mjs";
-import { HubClient } from "../transport.mjs";
+import { HubClient, HubRemoteError } from "../transport.mjs";
 
 import { harness } from "./adapter-harness.mjs";
 
@@ -15,7 +15,7 @@ test("fixture drains Pi adapter discovery before removing its config directory",
   const previousEnv = new Map(["HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_PANE_ID", "MUSTR_CONFIG_DIR", "MUSTR_STATE_DIR", "MUSTR_BIN"]
     .map(key => [key, process.env[key]]));
   const identity = {
-    pane_id: "w1:p1", space_id: "w1", server_key: "fixture",
+    protocol: 1, pane_id: "w1:p1", space_id: "w1", server_key: "fixture",
     socket: join(f.directory, "unused.sock"),
   };
   const roles = [{ name: "implementor", description: "fixture", prompt: "fixture role" }];
@@ -109,23 +109,31 @@ test("adapter: explicit join before hub, human gating, settled report, policies 
   assert.equal(report.terminate, true);
   await delay(1100);
   assert.equal((await peer.request({ op: "sync", activity: "idle", receive: false })).tasks[0].state, "active");
-  assert.equal((await h.emit("tool_call", { toolName: "bash" }))[0].block, true);
+  assert.equal((await h.emit("tool_call", { toolName: "bash" }))[0].block, true, "a provisional terminal report fences productive calls in its native run");
+  await h.emit("agent_before_settle", { outcome: "completed" });
   await h.settle();
   await eventually(async () => (await peer.request({ op: "sync", activity: "idle", receive: false })).tasks[0].state === "review");
+  assert.equal((await h.emit("tool_call", { toolName: "bash" }))[0], undefined, "settlement releases only the same-run fence for later host work");
   h.entries.push({ type: "message", message: { role: "assistant", content: [{ type: "toolCall", name: "mustr_send" }, { type: "toolCall", name: "read" }] } });
   assert.match((await h.emit("tool_call", { toolName: "mustr_send" }))[0].reason, /alone/);
-  await h.settle(true); // human abort wins
-  await peer.request({ op: "send", to: "pi-session", text: "Do not interrupt the pause", wake: true });
-  await delay(1200); assert.equal(h.messages.length, 2);
-  await h.commands.get("mustr").handler("resume", h.context);
-  await h.emit("input", { source: "interactive", text: "Accepted human authorization after report" });
-  await h.emit("message_start", { message: { role: "user", content: [{ type: "text", text: "Accepted human authorization after report" }] } });
+  await h.settle(true); // Pi owns abort; it does not create a Mustr pause.
+  await peer.request({ op: "send", to: "pi-session", text: "Delivery after host abort", wake: true });
   await eventually(() => h.messages.length === 3);
+  assert.doesNotMatch(h.statuses.at(-1), /interrupted/);
   await h.settle();
+  // Healthy pumps use the pinned identity; the authenticated hub request still
+  // catches pane movement, and fresh local discovery must reject rebinding.
   f.panes.set("w1:p1", { pane_id: "w1:p1", workspace_id: "w2", agent: "pi" });
-  await eventually(() => !h.active().includes("mustr_roster"));
+  await assert.rejects(h.tools.get("mustr_roster").execute("moved-pane", {}, undefined), error => {
+    if (error instanceof HubRemoteError) return error.code === "identity_unavailable" || /pane moved, disappeared/.test(error.message);
+    if (!(error instanceof Error)) return false;
+    return error.message.startsWith("mustr hold: identity check unavailable")
+      || error.message === "mustr identity became unverified before this operation could continue"
+      || error.message.startsWith("Hub disconnected; delivery may be uncertain.")
+      || error.message === "Hub is disconnected";
+  }, "route movement must reject the request through the authoritative typed identity, local hold, or connection-closure path");
+  await eventually(() => h.notifications.some(n => /space\/server changed/.test(n.message)), 8000);
   assert.deepEqual(h.active(), ["read", "bash", "policy-tool"]);
-  assert.ok(h.notifications.some(n => /space\/server changed/.test(n.message)));
   await peer.request({ op: "cancel", task_id: assignment.task_id, revision: 1, text: "Fixture reconciled; no external jobs." });
   f.panes.set("w1:p1", { pane_id: "w1:p1", workspace_id: "w1", agent: "pi" });
   await h.commands.get("role").handler("implementor", h.context);
@@ -158,6 +166,74 @@ test("mustr_roster identifies self among same-role participants", { timeout: 150
   assert.ok(sameRole.some(member => member.id === "pi-session"));
   assert.ok(sameRole.some(member => member.id === "same-role-peer"));
   assert.equal(JSON.stringify(result.details).includes("reset_control"), false);
+});
+
+test("default participant names use the full Pi identity and preserve explicit names", { timeout: 30000 }, async t => {
+  const f = await fixture(t); await f.start();
+  const longRole = "custom-role-with-a-very-long-name-for-testing";
+  await writeFile(`${f.directory}/config/roles/${longRole}.md`, "Long custom role fixture.\n");
+  const envKeys = ["HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_PANE_ID", "MUSTR_CONFIG_DIR", "MUSTR_STATE_DIR", "MUSTR_BIN"];
+  const previousEnv = new Map(envKeys.map(key => [key, process.env[key]]));
+  for (const key of envKeys) process.env[key] = f.env[key] ?? (key === "MUSTR_BIN" ? binary : "");
+  process.env.MUSTR_BIN = binary;
+  process.env.HERDR_PANE_ID = "w1:p1";
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (callback, ms, ...args) => realSetTimeout(callback, ms === 1000 ? 10000 : ms, ...args);
+  const { default: extension } = await import(`../index.ts?default-names=${Date.now()}`);
+  const firstId = "12345678-1111-4111-8111-111111111111";
+  const secondId = "12345678-2222-4222-8222-222222222222";
+  const first = harness(f.directory, { sessionId: firstId });
+  let second;
+  f.beforeCleanup(async () => {
+    try { if (second) await second.emit("session_shutdown"); }
+    finally {
+      try { await first.emit("session_shutdown"); }
+      finally {
+        for (const [key, value] of previousEnv) value === undefined ? delete process.env[key] : process.env[key] = value;
+        globalThis.setTimeout = realSetTimeout;
+      }
+    }
+  });
+  await extension(first.api); await first.emit("session_start");
+  const currentRoster = async h => h.tools.get("mustr_roster").execute("default-name-check", {}, undefined);
+  const select = async (h, role) => {
+    await h.commands.get("role").handler(role, h.context);
+    return eventually(() => currentRoster(h));
+  };
+
+  const initial = await select(first, "researcher");
+  const firstDefaultName = initial.details.self.name;
+  assert.equal(initial.details.self.id, firstId);
+  assert.match(firstDefaultName, /^[a-z][a-z0-9-]{0,47}$/);
+  assert.ok(firstDefaultName.length <= 48);
+
+  const repeated = await select(first, "researcher");
+  assert.equal(repeated.details.self.name, firstDefaultName, "the same full identity deterministically gets the same name");
+  const explicit = await select(first, "researcher explicitly-named");
+  assert.equal(explicit.details.self.name, "explicitly-named", "a supplied participant name is unchanged");
+
+  const longRoleRoster = await select(first, longRole);
+  assert.equal(longRoleRoster.details.self.role, longRole);
+  assert.match(longRoleRoster.details.self.name, /^[a-z][a-z0-9-]{0,47}$/);
+  assert.ok(longRoleRoster.details.self.name.length <= 48);
+  assert.ok(longRoleRoster.details.self.name.startsWith(`${longRole.slice(0, 12).replace(/-+$/, "")}-`));
+
+  const readyForPeer = await select(first, "researcher");
+  assert.equal(readyForPeer.details.self.name, firstDefaultName);
+  process.env.HERDR_PANE_ID = "w1:p2";
+  second = harness(f.directory, { sessionId: secondId });
+  await extension(second.api); await second.emit("session_start");
+  const secondRoster = await select(second, "researcher");
+  const peers = secondRoster.details.members.filter(member => member.role === "researcher");
+  assert.equal(peers.length, 2, "the real hub admits both default-named same-role participants");
+  const byId = new Map(peers.map(member => [member.id, member]));
+  assert.equal(byId.get(firstId)?.name, firstDefaultName);
+  assert.equal(byId.get(secondId)?.pane_id, "w1:p2");
+  assert.notEqual(byId.get(firstId)?.name, byId.get(secondId)?.name, "full identities sharing eight leading characters stay distinct");
+  for (const peer of peers) {
+    assert.match(peer.name, /^[a-z][a-z0-9-]{0,47}$/);
+    assert.ok(peer.name.length <= 48);
+  }
 });
 
 test("socket push delivers without a polling tick and coalesces concurrent wakeups", { timeout: 12000 }, async t => {
@@ -197,7 +273,7 @@ test("socket push delivers without a polling tick and coalesces concurrent wakeu
   assert.equal(h.entries.filter(e => e.type === "custom_message").length, 3);
 });
 
-for (const gate of ["editor", "human", "busy", "dialog"]) test(`offer/input race safely defers (${gate})`, { timeout: 15000 }, async t => {
+for (const gate of ["editor", "pending", "busy", "dialog"]) test(`offer/input race safely defers (${gate})`, { timeout: 15000 }, async t => {
   const f = await fixture(t); await f.start();
   for (const key of ["HERDR_ENV", "HERDR_SOCKET_PATH", "MUSTR_CONFIG_DIR", "MUSTR_STATE_DIR"]) process.env[key] = f.env[key];
   process.env.MUSTR_BIN = binary; process.env.HERDR_PANE_ID = "w1:p1";
@@ -218,7 +294,7 @@ for (const gate of ["editor", "human", "busy", "dialog"]) test(`offer/input race
     if (command.op === "sync" && result.inbox && !raced) {
       raced = true;
       if (gate === "editor") h.editor("unsent human draft");
-      if (gate === "human") await h.emit("input", { source: "interactive", text: "human race input" });
+      if (gate === "pending") h.pending(true);
       if (gate === "busy") await h.emit("agent_start");
       if (gate === "dialog") await h.emit("ui_prompt_start");
     }
@@ -231,51 +307,38 @@ for (const gate of ["editor", "human", "busy", "dialog"]) test(`offer/input race
   assert.equal(h.entries.filter(e => e.customType === "mustr-received").length, 0);
   assert.equal((await poll()).tasks.find(t => t.id === assigned.task_id).state, "assigned");
   h.editor(""); await h.emit("ui_prompt_end");
-  if (gate === "human") {
-    h.idle(false); await h.emit("agent_start");
-    await h.emit("message_start", { message: { role: "user", content: [{ type: "text", text: "human race input" }] } });
-  }
+  if (gate === "pending") h.pending(false);
   await h.settle();
   await eventually(() => h.messages.length === 1);
   await eventually(async () => (await poll()).tasks.find(t => t.id === assigned.task_id).state === "active");
   assert.equal(h.notifications.filter(n => n.level === "warning").length, 0);
 });
 
-test("active human input stays working and an older user start cannot release a newer generation", { timeout: 25000 }, async t => {
+test("delivery waits for Pi-visible pending messages, not input-hook generations", { timeout: 18000 }, async t => {
   const f = await fixture(t); await f.start();
   for (const key of ["HERDR_ENV", "HERDR_SOCKET_PATH", "MUSTR_CONFIG_DIR", "MUSTR_STATE_DIR"]) process.env[key] = f.env[key];
   process.env.MUSTR_BIN = binary; process.env.HERDR_PANE_ID = "w1:p1";
-  const { default: extension } = await import(`../index.ts?input-generations=${Date.now()}`);
+  const { default: extension } = await import(`../index.ts?native-pending=${Date.now()}`);
   const h = harness(f.directory); await extension(h.api); await h.emit("session_start");
   f.beforeCleanup(() => h.emit("session_shutdown"));
   await h.commands.get("role").handler("implementor", h.context);
   await eventually(() => h.tools.get("mustr_roster").execute("roster", {}, undefined));
   const peer = new HubClient(); t.after(() => peer.close());
   await peer.connect(f.discovery.socket, { agent_id: "peer", name: "peer", role: "architect", pane_id: "w1:p2", space_id: "w1" });
-  const poll = () => peer.request({ op: "sync", activity: "idle", receive: false });
 
-  // Two Pi input hooks are outstanding. The first message_start is for the older
-  // accepted input; the newer input is still preflight and has not entered Pi's queue.
-  h.idle(false); await h.emit("agent_start");
-  await h.emit("input", { source: "interactive", text: "older input", streamingBehavior: "steer" });
-  await h.emit("input", { source: "interactive", text: "newer input", streamingBehavior: "steer" });
-  h.pending(false);
-  await h.emit("message_start", { message: { role: "user", content: [{ type: "text", text: "older input" }] } });
-  await h.tools.get("mustr_roster").execute("publish-working", {}, undefined);
-  assert.equal((await poll()).members.find(member => member.id === "pi-session")?.activity, "working");
-
-  await peer.request({ op: "send", to: "pi-session", text: "Human turn boundary", wake: true });
+  h.idle(false); h.pending(true);
+  await h.emit("input", { source: "interactive", text: "Native pending submission" });
+  const sent = await peer.request({ op: "send", to: "pi-session", text: "Wait for host-visible pending work", wake: true });
   await delay(1200);
-  assert.equal(h.messages.length, 0, "the older user start must not release the newer input fence");
+  assert.equal(h.messages.length, 0, "Pi's pending-message state, rather than an inferred input generation, defers delivery");
 
-  await h.emit("message_start", { message: { role: "user", content: [{ type: "text", text: "newer input" }] } });
-  await eventually(() => h.messages.length === 1);
-  assert.equal(h.messages[0].options.deliverAs, "steer");
+  h.pending(false); h.idle(true); await h.emit("turn_end");
+  await eventually(() => h.messages.some(item => item.message.details?.id === sent.message_id));
+  assert.equal(h.messages[0].options.deliverAs, "followUp");
   assert.equal(h.messages[0].options.triggerTurn, true);
-  await eventually(() => h.entries.filter(entry => entry.customType === "mustr-received").length === 1);
 });
 
-for (const order of ["human-first", "extension-first"]) test(`extension-origin user starts preserve human preflight (${order})`, { timeout: 22000 }, async t => {
+for (const order of ["human-first", "extension-first"]) test(`input-hook order is not an acceptance correlation contract (${order})`, { timeout: 22000 }, async t => {
   const f = await fixture(t); await f.start();
   for (const key of ["HERDR_ENV", "HERDR_SOCKET_PATH", "MUSTR_CONFIG_DIR", "MUSTR_STATE_DIR"]) process.env[key] = f.env[key];
   process.env.MUSTR_BIN = binary; process.env.HERDR_PANE_ID = "w1:p1";
@@ -296,20 +359,18 @@ for (const order of ["human-first", "extension-first"]) test(`extension-origin u
   else { await input("extension", extensionText); await input("interactive", humanText); }
   h.pending(false);
 
-  // Exercise opposite message-start orderings: an extension start first, or a
-  // human start buffered while the extension-origin slot is still unresolved.
+  // No Pi-visible message is queued. The adapter does not correlate these
+  // hooks by text or origin; the active run can receive a normal steer.
   await start(order === "human-first" ? extensionText : humanText);
-  await peer.request({ op: "send", to: "pi-session", text: "Wait for human input acceptance", wake: true });
-  await delay(1200);
-  assert.equal(h.messages.length, 0, "extension-origin message_start must not consume the human preflight generation");
-
-  await start(order === "human-first" ? humanText : extensionText);
+  await peer.request({ op: "send", to: "pi-session", text: "Input hook source is not a Mustr fence", wake: true });
   await eventually(() => h.messages.length === 1);
   assert.equal(h.messages[0].options.deliverAs, "steer");
   assert.equal(h.messages[0].options.triggerTurn, true);
+  await start(order === "human-first" ? humanText : extensionText);
+  assert.equal(h.messages.length, 1, "later starts do not create or consume adapter input generations");
 });
 
-test("same-text cross-origin start stays fenced until explicit idle recovery", { timeout: 18000 }, async t => {
+test("same-text cross-origin input hooks do not invent a hidden Mustr hold", { timeout: 18000 }, async t => {
   const f = await fixture(t); await f.start();
   for (const key of ["HERDR_ENV", "HERDR_SOCKET_PATH", "MUSTR_CONFIG_DIR", "MUSTR_STATE_DIR"]) process.env[key] = f.env[key];
   process.env.MUSTR_BIN = binary; process.env.HERDR_PANE_ID = "w1:p1";
@@ -326,36 +387,48 @@ test("same-text cross-origin start stays fenced until explicit idle recovery", {
   await h.emit("input", { source: "extension", text: "same content", streamingBehavior: "steer" });
   h.pending(false);
   await h.emit("message_start", { message: { role: "user", content: [{ type: "text", text: "same content" }] } });
-  await peer.request({ op: "send", to: "pi-session", text: "Do not infer input origin", wake: true });
-  await delay(1200);
-  assert.equal(h.messages.length, 0, "ambiguous source cannot release the human fence");
-
-  await h.settle();
-  await h.commands.get("mustr").handler("resume", h.context);
+  await peer.request({ op: "send", to: "pi-session", text: "No input-origin correlation", wake: true });
   await eventually(() => h.messages.length === 1);
-  assert.equal(h.messages[0].options.deliverAs, "followUp");
+  assert.equal(h.messages[0].options.deliverAs, "steer");
+  assert.equal((await h.emit("tool_call", { toolName: "read" }))[0], undefined, "ordinary tools remain host-owned");
 });
 
-test("extension-origin input does not undo a terminal report stop", { timeout: 12000 }, async t => {
+test("terminal reports settle task scope without globally blocking later Pi tools", { timeout: 15000 }, async t => {
   const f = await fixture(t); await f.start();
   for (const key of ["HERDR_ENV", "HERDR_SOCKET_PATH", "MUSTR_CONFIG_DIR", "MUSTR_STATE_DIR"]) process.env[key] = f.env[key];
   process.env.MUSTR_BIN = binary; process.env.HERDR_PANE_ID = "w1:p1";
-  const { default: extension } = await import(`../index.ts?extension-report=${Date.now()}`);
+  const { default: extension } = await import(`../index.ts?terminal-scope=${Date.now()}`);
   const h = harness(f.directory); await extension(h.api); await h.emit("session_start");
   f.beforeCleanup(() => h.emit("session_shutdown"));
   await h.commands.get("role").handler("implementor", h.context);
   await eventually(() => h.tools.get("mustr_roster").execute("roster", {}, undefined));
-  const report = await h.tools.get("mustr_report").execute("terminal", { task_id: "task", revision: 1, kind: "done", text: "Staged only" }, undefined);
+  const peer = new HubClient(); t.after(() => peer.close());
+  await peer.connect(f.discovery.socket, { agent_id: "peer", name: "peer", role: "architect", pane_id: "w1:p2", space_id: "w1" });
+  const task = await peer.request({ op: "assign", to: "pi-session", title: "Terminal scope", text: "No external work" });
+  await h.tools.get("mustr_roster").execute("refresh", {}, undefined);
+
+  const report = await h.tools.get("mustr_report").execute("terminal", { task_id: task.task_id, revision: task.revision, kind: "done", text: "Task is complete." }, undefined);
   assert.equal(report.terminate, true);
-  await h.emit("input", { source: "extension", text: "Extension-generated user prompt" });
-  assert.equal((await h.emit("tool_call", { toolName: "bash" }))[0].block, true);
+  await h.emit("input", { source: "extension", text: "Synthetic start" });
+  await h.emit("message_start", { message: { role: "user", content: [{ type: "text", text: "Synthetic start" }] } });
+  assert.equal((await h.emit("tool_call", { toolName: "bash" }))[0].block, true, "same-run productive tools stay fenced until report settlement");
+  await assert.rejects(h.tools.get("mustr_report").execute("staged-progress", { task_id: task.task_id, revision: task.revision, kind: "progress", text: "Must not replace the staged terminal claim." }, undefined), /terminal report.*staged/);
+  await h.emit("agent_before_settle", { outcome: "completed" });
+  await h.settle(false);
+  await eventually(async () => (await peer.request({ op: "sync", activity: "idle", receive: false })).tasks.find(item => item.id === task.task_id)?.state === "review");
+  assert.equal((await h.emit("tool_call", { toolName: "bash" }))[0], undefined, "later host tools are not gated by the published task fence");
+
+  await h.emit("input", { source: "interactive", text: "Human input does not clear the task stop" });
+  await h.emit("message_start", { message: { role: "user", content: [{ type: "text", text: "Human input does not clear the task stop" }] } });
+  assert.equal((await h.emit("tool_call", { toolName: "bash" }))[0], undefined);
+  await assert.rejects(h.tools.get("mustr_report").execute("old-task", { task_id: task.task_id, revision: task.revision, kind: "progress", text: "Do not reopen a terminal report." }, undefined), /terminal report/);
 });
 
-test("handled or rejected input fails closed until an explicit idle resume", { timeout: 18000 }, async t => {
+test("handled preflight input alone creates no persistent delivery fence", { timeout: 15000 }, async t => {
   const f = await fixture(t); await f.start();
   for (const key of ["HERDR_ENV", "HERDR_SOCKET_PATH", "MUSTR_CONFIG_DIR", "MUSTR_STATE_DIR"]) process.env[key] = f.env[key];
   process.env.MUSTR_BIN = binary; process.env.HERDR_PANE_ID = "w1:p1";
-  const { default: extension } = await import(`../index.ts?handled-input=${Date.now()}`);
+  const { default: extension } = await import(`../index.ts?handled-preflight=${Date.now()}`);
   const h = harness(f.directory); await extension(h.api); await h.emit("session_start");
   f.beforeCleanup(() => h.emit("session_shutdown"));
   await h.commands.get("role").handler("implementor", h.context);
@@ -363,19 +436,14 @@ test("handled or rejected input fails closed until an explicit idle resume", { t
   const peer = new HubClient(); t.after(() => peer.close());
   await peer.connect(f.discovery.socket, { agent_id: "peer", name: "peer", role: "architect", pane_id: "w1:p2", space_id: "w1" });
 
-  // No user message_start follows: a later handler may have handled the input or
-  // Pi may have rejected it before a run. Never time out the preflight fence.
+  // No user message_start follows. The adapter cannot infer whether Pi handled,
+  // rejected, or later transformed this hook; it relies on native host state.
   await h.emit("input", { source: "interactive", text: "handled elsewhere" });
-  await h.tools.get("mustr_roster").execute("publish-fenced", {}, undefined);
-  assert.equal((await peer.request({ op: "sync", activity: "idle", receive: false })).members.find(member => member.id === "pi-session")?.activity, "working");
-  await peer.request({ op: "send", to: "pi-session", text: "Held until the user decides", wake: false });
-  await delay(1200);
-  assert.equal(h.messages.length, 0);
-
-  await h.commands.get("mustr").handler("resume", h.context);
-  await eventually(() => h.messages.length === 1);
+  const sent = await peer.request({ op: "send", to: "pi-session", text: "No inferred input lifecycle", wake: false });
+  await eventually(() => h.messages.some(item => item.message.details?.id === sent.message_id));
   assert.equal(h.messages[0].options.deliverAs, "followUp");
   assert.equal(h.messages[0].options.triggerTurn, false);
+  assert.equal((await h.emit("tool_call", { toolName: "read" }))[0], undefined);
 });
 
 test("attempt marker without a message is never acknowledged or reinjected", { timeout: 15000 }, async t => {
@@ -474,21 +542,16 @@ test("live feedback reaches a busy agent; slow insertion keeps heartbeats and hu
   await eventually(() => h.messages.length === 3);
   assert.equal(h.messages[2].options.deliverAs, "steer");
   assert.equal(h.messages[2].options.triggerTurn, true);
-  for (const gate of ["editor", "pending", "dialog", "human"]) {
+  for (const gate of ["editor", "pending", "dialog"]) {
     if (gate === "editor") h.editor("typing");
     if (gate === "pending") h.pending(true);
     if (gate === "dialog") await h.emit("ui_prompt_start");
-    if (gate === "human") await h.emit("input", { source: "interactive", text: "human feedback" });
     const count = h.messages.length;
     await peer.request({ op: "send", to: "pi-session", text: `Respect ${gate}`, wake: false });
     await delay(1200); assert.equal(h.messages.length, count);
     if (gate === "editor") h.editor("");
     if (gate === "pending") h.pending(false);
     if (gate === "dialog") await h.emit("ui_prompt_end");
-    if (gate === "human") {
-      await h.emit("message_start", { message: { role: "user", content: [{ type: "text", text: "human feedback" }] } });
-      await h.settle();
-    }
     await eventually(() => h.messages.length === count + 1);
   }
 });

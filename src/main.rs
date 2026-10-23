@@ -22,8 +22,11 @@ use color_eyre::eyre::{Context, Result};
 use crate::{
     cli::{Cli, Command, InstallTarget},
     config::{Config, initialize, seed_roles},
+    herdr::HerdrUnavailable,
     paths::Paths,
 };
+
+const CONTEXT_UNAVAILABLE_EXIT_CODE: i32 = 75;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -109,10 +112,18 @@ async fn main() -> Result<()> {
                 print_role_refresh(&report);
             }
         }
-        Command::Context => println!(
-            "{}",
-            serde_json::to_string(&herdr::Herdr::from_env()?.discovery().await?)?
-        ),
+        Command::Context => match herdr::Herdr::from_env()?.discovery().await {
+            Ok(discovery) => println!("{}", serde_json::to_string(&discovery)?),
+            Err(error) => {
+                if let Some(unavailable) = error.downcast_ref::<HerdrUnavailable>() {
+                    // This command-only status is the adapter's narrow transient
+                    // context contract. Avoid color-eyre chains/backtraces here.
+                    eprintln!("{unavailable}");
+                    std::process::exit(CONTEXT_UNAVAILABLE_EXIT_CODE);
+                }
+                return Err(error);
+            }
+        },
         Command::Run { headless } => {
             let server =
                 server::Server::start(herdr::Herdr::from_env()?, &paths, &config, cli.verbosity)

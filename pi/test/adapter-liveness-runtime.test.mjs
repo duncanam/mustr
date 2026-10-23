@@ -119,11 +119,43 @@ function blockedProvider() {
     },
   };
 }
+function gatedProvider(content) {
+  const started = deferred(), release = deferred();
+  return {
+    started: started.promise,
+    release: () => release.resolve(),
+    step({ options }) {
+      const stream = createAssistantMessageEventStream();
+      let finished = false;
+      const abort = () => {
+        if (finished) return;
+        finished = true;
+        options.signal.removeEventListener("abort", abort);
+        const message = {
+          role: "assistant", content: [], api: model.api, provider: model.provider,
+          model: model.id, usage: structuredClone(zeroUsage), stopReason: "aborted",
+          errorMessage: "Synthetic gated request cancelled", timestamp: Date.now(),
+        };
+        stream.push({ type: "error", reason: "aborted", error: message });
+      };
+      if (options.signal.aborted) abort();
+      else options.signal.addEventListener("abort", abort, { once: true });
+      started.resolve();
+      void release.promise.then(async () => {
+        if (finished) return;
+        finished = true;
+        options.signal.removeEventListener("abort", abort);
+        for await (const event of assistant(content, "toolUse")) stream.push(event);
+      });
+      return stream;
+    },
+  };
+}
 
 async function fixture(t, { retryDelay = 1 } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "mustr-liveness-"));
   const identity = {
-    socket: join(directory, "peer.sock"), server_key: "synthetic-server",
+    protocol: 1, socket: join(directory, "peer.sock"), server_key: "synthetic-server",
     space_id: "fixture-space", pane_id: "fixture-pane",
   };
   const cli = join(directory, "mustr-fixture.mjs");
@@ -135,7 +167,7 @@ async function fixture(t, { retryDelay = 1 } = {}) {
   const peerErrors = [], extensionErrors = [], unexpectedRequests = [], streamErrors = [], notices = [], operations = [];
   calls.diagnostics = () => ({ streamErrors, events: events.entries, status: statuses.entries.at(-1) });
   const tasks = new Map(), messages = [], sockets = new Set(), steps = [], lifecycleGates = new Set();
-  const control = { handleInput: false, transformInput: undefined, rewriteMessageID: false, shuttingDown: false, settlementGate: undefined, retryStartGate: undefined, rejectBeforeExecution: new Map() };
+  const control = { handleInput: false, transformInput: undefined, rewriteMessageID: false, shuttingDown: false, settlementGate: undefined, retryStartGate: undefined, queueAtBeforeSettle: undefined, rejectBeforeExecution: new Map() };
   let session, runner, agentId, messageSequence = 0, syncSequence = 0;
   let nextAbortToolResult = false, abortPromise;
   const server = net.createServer(socket => {
@@ -306,6 +338,11 @@ async function fixture(t, { retryDelay = 1 } = {}) {
       }]],
       ["agent_before_settle", [async event => {
         events.push({ type: "agent_before_settle", outcome: event.outcome });
+        if (event.outcome === "completed" && control.queueAtBeforeSettle) {
+          const text = control.queueAtBeforeSettle; control.queueAtBeforeSettle = undefined;
+          const result = await session.steer(text);
+          events.push({ type: "boundary_steer_queued", text, result });
+        }
         if (event.outcome === "completed" && control.settlementGate) {
           const gate = control.settlementGate; control.settlementGate = undefined;
           gate.entered.resolve();
@@ -447,6 +484,22 @@ const reports = (f, taskId) => f.calls.entries.filter(call => call.op === "repor
 const settled = f => f.events.entries.filter(event => event.type === "agent_settled");
 const toolResults = (f, name) => f.events.entries.filter(event => event.type === "tool_result" && event.tool === name);
 const currentStatus = f => f.statuses.entries.at(-1)?.text ?? "";
+function timedTrace(f, t) {
+  const startedAt = performance.now();
+  const trace = [];
+  const listener = () => {
+    const event = f.events.entries.at(-1);
+    if (!event || !["input", "accepted_user", "tool_result", "agent_settled"].includes(event.type)) return;
+    trace.push({
+      atMs: Number((performance.now() - startedAt).toFixed(1)),
+      type: event.type, source: event.source, tool: event.tool,
+      isError: event.isError, aborted: event.aborted,
+    });
+  };
+  f.events.listeners.add(listener);
+  t.after(() => f.events.listeners.delete(listener));
+  return trace;
+}
 
 // Publication must cross REAL Pi settlement, not a hand-written settle(false).
 test("real SDK: terminal report publishes once after settlement without pausing", { timeout: 15000 }, async t => {
@@ -463,6 +516,55 @@ test("real SDK: terminal report publishes once after settlement without pausing"
   await f.checkpoint("idle");
   assert.equal(reports(f, "first-task").length, 1);
   assert.doesNotMatch(currentStatus(f), /manual pause|interrupted|awaiting human decision|unresolved error/);
+});
+
+test("real SDK: terminal report fences a native boundary continuation but releases later host tools", { timeout: 15000 }, async t => {
+  const f = await fixture(t);
+  const task = f.ownTask("same-native-run-report-fence");
+  const queuedText = "SAME_NATIVE_RUN_CONTINUATION_AFTER_REPORT";
+  f.control.queueAtBeforeSettle = queuedText;
+  const optional = completed;
+  f.plan(report(task.id), ({ context }) => {
+    assert.match(JSON.stringify(context.messages), new RegExp(queuedText), "Pi actually processes the queued boundary continuation");
+    return callTool("read", { scope: "same-native-run-after-report" })();
+  }, optional);
+  await f.prompt();
+  const published = await f.calls.waitFor(call => call.op === "report" && call.task_id === task.id, "terminal report publishes after the fenced native continuation settles");
+  await f.session.waitForIdle();
+  assert.equal(published.settled, 1);
+  assert.ok(f.events.entries.some(event => event.type === "boundary_steer_queued" && event.text === queuedText));
+  assert.equal(f.modelRequests.entries.length, 2, "the same AgentSession run continued after the report result");
+  assert.equal(toolResults(f, "read").at(-1)?.isError, true, "the continuation cannot execute productive task work");
+  assert.deepEqual(f.operations, []);
+  assert.equal(task.state, "review");
+  f.discardOptionalCompletion(optional);
+
+  f.plan(callTool("read", { scope: "separate-host-run-after-report-settlement" }), completed);
+  await f.prompt("A separate later host turn can use ordinary Pi tools.");
+  assert.deepEqual(f.operations, [{ tool: "read", scope: "separate-host-run-after-report-settlement" }]);
+  assert.equal(toolResults(f, "read").at(-1)?.isError, false);
+  assert.equal(task.state, "review", "later host work does not reopen the reported task revision");
+});
+
+test("real SDK: a later failed continuation invalidates an earlier successful report candidate", { timeout: 15000 }, async t => {
+  const f = await fixture(t);
+  const task = f.ownTask("candidate-report-failure");
+  const queuedText = "REPORT_CANDIDATE_THEN_CONTINUATION_FAILURE";
+  f.control.queueAtBeforeSettle = queuedText;
+  f.plan(report(task.id), ({ context }) => {
+    assert.match(JSON.stringify(context.messages), new RegExp(queuedText), "the run advances after its successful report candidate");
+    return unavailable();
+  }, unavailable);
+  await f.prompt();
+  await f.checkpoint("idle");
+  assert.ok(f.events.entries.some(event => event.type === "agent_before_settle" && event.outcome === "completed"));
+  assert.equal(f.events.entries.at(-1)?.type, "agent_settled");
+  assert.deepEqual(settled(f), [{ type: "agent_settled", aborted: false }]);
+  assert.ok(f.events.entries.filter(event => event.type === "agent_before_settle").some(event => event.outcome === "error"), "the later continuation's final candidate is failure");
+  assert.equal(f.modelRequests.entries.length, 3, "one report response, one failed continuation, and Pi's one native retry");
+  assert.equal(reports(f, task.id).length, 0, "candidate completion is not final publication evidence");
+  assert.equal(task.state, "active");
+  assert.doesNotMatch(currentStatus(f), /awaiting guidance/);
 });
 
 test("real SDK: pre-execution ACK rejection retains the persisted message without reinsertion or another model run", { timeout: 15000 }, async t => {
@@ -488,7 +590,7 @@ test("real SDK: pre-execution ACK rejection retains the persisted message withou
   assert.deepEqual(settled(f), [{ type: "agent_settled", aborted: false }]);
 });
 
-test("real SDK: pre-execution report rejection retains the settled report and publishes it exactly once", { timeout: 15000 }, async t => {
+test("real SDK: settled report survives typed pre-execution rejection and a later unrelated host abort", { timeout: 15000 }, async t => {
   const f = await fixture(t);
   const task = f.ownTask("typed-rejected-report");
   f.rejectOnceBeforeExecution("report");
@@ -498,16 +600,27 @@ test("real SDK: pre-execution report rejection retains the settled report and pu
   assert.equal(rejected.settled, 1, "even the rejected publication waits for actual settlement");
   assert.equal(task.state, "active");
   assert.deepEqual(toolResults(f, "mustr_report").map(result => result.isError), [false]);
+
+  const unrelatedProvider = blockedProvider();
+  f.plan(unrelatedProvider.step);
+  const unrelatedRun = f.session.prompt("An unrelated host turn starts while the settled report awaits retry.", { source: "extension" });
+  void unrelatedRun.catch(() => {});
+  await unrelatedProvider.started;
+  await f.session.abort();
+  await unrelatedRun;
+  assert.equal(task.state, "active", "the unrelated host abort does not publish or discard the retained report");
+  assert.equal(reports(f, task.id).filter(call => !call.rejectedBeforeExecution).length, 0, "the typed rejection is still the only report attempt before recovery");
+
   const published = await f.calls.waitFor(call => call.op === "report" && call.task_id === task.id && !call.rejectedBeforeExecution, "retained settled report publishes after fresh validation");
   await f.checkpoint("idle");
-  assert.equal(published.settled, 1);
+  assert.equal(published.settled, 2, "publication follows its successful report settlement and the later unrelated abort");
   for (const key of ["task_id", "revision", "kind", "text"]) assert.deepEqual(published[key], rejected[key], `retained report preserves ${key}`);
   assert.equal(task.state, "review");
   assert.equal(reports(f, task.id).length, 2);
   assert.equal(reports(f, task.id).filter(call => !call.rejectedBeforeExecution).length, 1, "the definitely rejected report was never published twice");
   assert.equal(f.calls.entries.filter(call => call.op === "join").length, 1);
-  assert.equal(f.modelRequests.entries.length, 1, "publication recovery does not repeat a tool/model run");
-  assert.deepEqual(settled(f), [{ type: "agent_settled", aborted: false }]);
+  assert.equal(f.modelRequests.entries.length, 2, "the unrelated abort runs once; report publication does not rerun either model turn");
+  assert.deepEqual(settled(f), [{ type: "agent_settled", aborted: false }, { type: "agent_settled", aborted: true }]);
 });
 
 test("real SDK: native 503 recovery remains reachable to the next addressed wake", { timeout: 15000 }, async t => {
@@ -570,7 +683,7 @@ test("real SDK: manual pause survives retry success and ordinary accepted input"
   assert.equal(f.inserted(message), true);
 });
 
-test("real SDK: abort after a normal report result wins and never publishes it", { timeout: 15000 }, async t => {
+test("real SDK: abort after a report discards its stage without locking later host work", { timeout: 15000 }, async t => {
   const f = await fixture(t);
   f.ownTask("interrupted-report");
   f.abortNextReportResult();
@@ -580,79 +693,211 @@ test("real SDK: abort after a normal report result wins and never publishes it",
   assert.deepEqual(toolResults(f, "mustr_report").map(result => result.isError), [false]);
   assert.deepEqual(settled(f), [{ type: "agent_settled", aborted: true }]);
   assert.deepEqual(f.events.entries.filter(event => event.type === "assistant").map(event => event.stopReason), ["toolUse"]);
-  await f.checkpoint("paused");
-  assert.match(currentStatus(f), /interrupted/);
+  await f.checkpoint("idle");
+  assert.doesNotMatch(currentStatus(f), /interrupted|awaiting guidance/);
   assert.equal(reports(f, "interrupted-report").length, 0);
-  const message = f.enqueue({ text: "HELD_AFTER_REPORT_ABORT" });
-  await f.checkpoint("paused");
-  assert.equal(f.inserted(message), false);
-  f.plan(completed, completed);
-  await f.prompt("Accepted human instruction authorizes recovery, not the old staged report.");
+
+  f.plan(callTool("read", { scope: "ordinary-after-aborted-report" }), completed);
+  const message = f.enqueue({ text: "AVAILABLE_AFTER_REPORT_ABORT" });
   await f.ack(message);
   await f.session.waitForIdle();
   await f.checkpoint("idle");
-  assert.equal(reports(f, "interrupted-report").length, 0, "old report stays discarded after recovery");
+  assert.deepEqual(f.operations, [{ tool: "read", scope: "ordinary-after-aborted-report" }]);
+  assert.equal(reports(f, "interrupted-report").length, 0, "the aborted terminal report is never replayed");
   assert.equal(f.tasks.get("interrupted-report").state, "active");
 });
 
-test("real SDK: model decision and genuine abort holds require accepted human input", { timeout: 20000 }, async t => {
+test("real SDK: explicit Mustr pause is delivery-only; input and abort are Pi-owned", { timeout: 20000 }, async t => {
   const f = await fixture(t);
   f.plan(callTool("mustr_pause", { reason: "Synthetic human decision needed" }));
   await f.prompt();
   await f.checkpoint("paused");
   assert.match(currentStatus(f), /awaiting human decision/);
-  f.plan(completed);
-  await f.prompt("An extension-origin prompt cannot release the human-decision hold.", { source: "extension" });
+  const message = f.enqueue({ text: "WAITING_FOR_EXPLICIT_MUSTR_RESUME" });
+  const held = await f.checkpoint("paused");
+  assert.equal(held.receive, false);
+  assert.equal(f.inserted(message), false);
+
+  f.plan(callTool("read", { scope: "ordinary-extension-turn-during-pause" }), completed);
+  await f.prompt("Extension-origin user start does not resume Mustr delivery.", { source: "extension" });
+  assert.deepEqual(f.operations, [{ tool: "read", scope: "ordinary-extension-turn-during-pause" }]);
   await f.checkpoint("paused");
   assert.match(currentStatus(f), /awaiting human decision/);
+  assert.equal(f.inserted(message), false);
+
   f.plan(completed);
-  const acceptedText = "A genuinely accepted human instruction releases the model-decision hold.";
+  const acceptedText = "Accepted human input also leaves the explicit Mustr pause in force.";
   await f.prompt(acceptedText);
   assert.ok(f.events.entries.some(event => event.type === "input" && event.source === "interactive" && event.text === acceptedText));
-  assert.ok(f.events.entries.some(event => event.type === "accepted_user" && event.text === acceptedText), "plain interactive input and its real accepted user message preserve exact text");
+  assert.ok(f.events.entries.some(event => event.type === "accepted_user" && event.text === acceptedText));
+  await f.checkpoint("paused");
+  assert.match(currentStatus(f), /awaiting human decision/);
+  assert.equal(f.inserted(message), false);
+
+  await f.command("/mustr resume");
+  f.plan(completed);
+  await f.ack(message);
+  await f.session.waitForIdle();
   await f.checkpoint("idle");
-  assert.doesNotMatch(currentStatus(f), /awaiting human decision/);
+  assert.equal(f.inserted(message), true, "only the explicit Mustr command resumes coordination delivery");
 
   const provider = blockedProvider();
   f.plan(provider.step);
-  const running = f.session.prompt("Start a stream that a human will genuinely interrupt.");
-  void running.catch(() => {}); // Await below after the deterministic provider-start barrier.
+  const running = f.session.prompt("Start a stream that Pi will abort.", { source: "extension" });
+  void running.catch(() => {});
   await provider.started;
   await f.session.abort();
   await running;
-  await f.checkpoint("paused");
-  assert.match(currentStatus(f), /interrupted/);
-  const message = f.enqueue({ text: "ONLY_ACCEPTED_HUMAN_MAY_RELEASE" });
-  await f.checkpoint("paused");
-  assert.equal(f.inserted(message), false);
-  f.plan(completed);
-  await f.prompt("Extension origin still cannot resume an interrupted run.", { source: "extension" });
-  await f.checkpoint("paused");
-  assert.equal(f.inserted(message), false);
-  f.plan(completed, completed);
-  await f.prompt("Accepted human recovery instruction.");
-  await f.ack(message);
+  await f.checkpoint("idle");
+  assert.doesNotMatch(currentStatus(f), /interrupted/);
+  f.plan(callTool("read", { scope: "ordinary-after-abort" }), completed);
+  const afterAbort = f.enqueue({ text: "AVAILABLE_AFTER_ABORT" });
+  await f.ack(afterAbort);
   await f.session.waitForIdle();
-  assert.equal(f.inserted(message), true);
-
-  // A later hook can consume input without creating any accepted user message.
-  // Do not credit a subsequent extension-only boundary to that human preflight.
-  f.plan(callTool("mustr_pause", { reason: "Separate synthetic decision" }));
-  await f.prompt("Set up a separate fail-closed handled-input case.");
-  f.control.handleInput = true;
-  const beforeHandled = f.modelRequests.entries.length;
-  await f.prompt("This human input is handled, not accepted by the agent.");
-  assert.equal(f.modelRequests.entries.length, beforeHandled);
-  await f.checkpoint("paused");
-  assert.match(currentStatus(f), /awaiting human decision/);
-  f.control.handleInput = false;
-  f.plan(completed);
-  await f.prompt("An extension-only accepted input cannot stand in for the handled human prompt.", { source: "extension" });
-  await f.checkpoint("paused");
-  assert.match(currentStatus(f), /awaiting human decision/);
+  await f.checkpoint("idle");
+  assert.equal(f.inserted(afterAbort), true);
+  assert.deepEqual(f.operations, [
+    { tool: "read", scope: "ordinary-extension-turn-during-pause" },
+    { tool: "read", scope: "ordinary-after-abort" },
+  ]);
 });
 
-test("real SDK: valid transformed human input releases a soft hold without text matching or manual resume", { timeout: 15000 }, async t => {
+test("real SDK: Pi owns queued steering and abort state; Mustr does not gate ordinary tools", { timeout: 20000 }, async t => {
+  const f = await fixture(t);
+  const abortingProvider = blockedProvider();
+  f.plan(abortingProvider.step);
+  const abortingRun = f.session.prompt("Extension-origin run that Pi will abort.", { source: "extension" });
+  void abortingRun.catch(() => {});
+  await abortingProvider.started;
+  await f.session.abort();
+  await abortingRun;
+  await f.checkpoint("idle");
+  assert.doesNotMatch(currentStatus(f), /interrupted/);
+
+  const trace = timedTrace(f, t);
+  const oldTurn = gatedProvider([{ type: "toolCall", id: "old-turn-read", name: "read", arguments: { scope: "before-real-human-start" } }]);
+  f.plan(oldTurn.step, callTool("bash", { scope: "after-real-human-start" }), completed);
+  const running = f.session.prompt("Extension-origin host turn after abort.", { source: "extension" });
+  void running.catch(() => {});
+  await oldTurn.started;
+
+  const steerText = "REAL_INTERACTIVE_STEER_FOR_INPUT_BOUNDARY";
+  assert.equal(await f.session.steer(steerText), "queued");
+  assert.equal(f.session.pendingMessageCount, 1);
+  const pending = await f.checkpoint("working");
+  assert.equal(pending.receive, false, "Pi-visible queued input still defers autonomous Mustr delivery");
+  assert.equal(f.events.entries.some(event => event.type === "accepted_user" && event.text === steerText), false, "Pi has not emitted the queued user message start yet");
+
+  oldTurn.release();
+  await running;
+  assert.equal(toolResults(f, "read").at(-1)?.isError, false, "an old-turn ordinary tool remains Pi-owned before input acceptance");
+  assert.deepEqual(f.operations[0], { tool: "read", scope: "before-real-human-start" });
+
+  // A terminated old turn may leave the steer queued. A later prompt lets Pi,
+  // not mustr, decide when that text becomes a user message.
+  if (!f.events.entries.some(event => event.type === "accepted_user" && event.text === steerText)) {
+    await f.prompt("A later genuine human response follows the queued steer.");
+  }
+  await f.session.waitForIdle();
+  await f.checkpoint("idle");
+  assert.ok(f.events.entries.some(event => event.type === "accepted_user" && event.text === steerText));
+  assert.deepEqual(f.operations, [
+    { tool: "read", scope: "before-real-human-start" },
+    { tool: "bash", scope: "after-real-human-start" },
+  ]);
+  assert.equal(toolResults(f, "bash").at(-1)?.isError, false);
+  assert.doesNotMatch(currentStatus(f), /interrupted|input awaiting acceptance/);
+
+  const interactiveInput = trace.findIndex(event => event.type === "input" && event.source === "interactive");
+  const oldToolResult = trace.findIndex(event => event.type === "tool_result" && event.tool === "read");
+  const acceptedUser = trace.findIndex((event, index) => index > interactiveInput && event.type === "accepted_user");
+  const newToolResult = trace.findIndex(event => event.type === "tool_result" && event.tool === "bash");
+  assert.ok(interactiveInput >= 0 && interactiveInput < oldToolResult);
+  assert.ok(oldToolResult < acceptedUser && acceptedUser < newToolResult, "Pi accepts steering between host-owned tool work, without Mustr input attribution");
+});
+
+test("real SDK: handled input preflight does not poison a later ordinary host turn", { timeout: 15000 }, async t => {
+  const f = await fixture(t);
+  const trace = timedTrace(f, t);
+  f.control.handleInput = true;
+  const modelRequestsBeforeHandled = f.modelRequests.entries.length;
+  await f.prompt("HANDLED_PREFLIGHT_WITHOUT_USER_MESSAGE");
+  assert.equal(f.modelRequests.entries.length, modelRequestsBeforeHandled, "handled preflight ends before any agent turn or user message_start");
+  assert.equal(f.events.entries.some(event => event.type === "accepted_user" && event.text === "HANDLED_PREFLIGHT_WITHOUT_USER_MESSAGE"), false);
+  f.control.handleInput = false;
+
+  f.plan(callTool("read", { scope: "after-handled-preflight" }), completed);
+  await f.prompt("GENUINE_HUMAN_INPUT_AFTER_HANDLED_PREFLIGHT");
+  await f.checkpoint("idle");
+
+  const acceptedUser = trace.findIndex(event => event.type === "accepted_user");
+  const readResult = trace.findIndex(event => event.type === "tool_result" && event.tool === "read");
+  assert.ok(acceptedUser >= 0 && acceptedUser < readResult, "the later real user message precedes its ordinary tool result");
+  assert.deepEqual(f.operations, [{ tool: "read", scope: "after-handled-preflight" }]);
+  assert.equal(toolResults(f, "read").at(-1)?.isError, false);
+  assert.doesNotMatch(currentStatus(f), /awaiting human decision|input awaiting acceptance|unresolved error/);
+});
+
+test("real SDK: clearQueue editor restoration does not poison the next ordinary host turn", { timeout: 15000 }, async t => {
+  const f = await fixture(t);
+  const provider = blockedProvider();
+  f.plan(provider.step);
+  const running = f.session.prompt("Extension-origin run to exercise queue restoration.", { source: "extension" });
+  void running.catch(() => {});
+  await provider.started;
+
+  const queuedText = "QUEUED_HUMAN_STEER_RETURNED_TO_EDITOR";
+  assert.equal(await f.session.steer(queuedText), "queued");
+  assert.equal(f.session.pendingMessageCount, 1);
+  const returnedToEditor = f.session.clearQueue();
+  assert.deepEqual(returnedToEditor, { steering: [queuedText], followUp: [] });
+  assert.equal(f.session.pendingMessageCount, 0);
+  assert.equal(f.events.entries.some(event => event.type === "accepted_user" && event.text === queuedText), false, "clearQueue returns the text; it does not emit an accepted user message");
+
+  await f.session.abort();
+  await running;
+  await f.checkpoint("idle");
+  assert.doesNotMatch(currentStatus(f), /interrupted/);
+
+  const trace = timedTrace(f, t);
+  const completion = completed;
+  f.plan(callTool("read", { scope: "after-editor-restored-human-input" }), completion);
+  await f.prompt(queuedText);
+  await f.session.waitForIdle();
+  await f.checkpoint();
+  f.discardOptionalCompletion(completion);
+
+  const acceptedUser = trace.findIndex(event => event.type === "accepted_user");
+  const readResult = trace.findIndex(event => event.type === "tool_result" && event.tool === "read");
+  assert.ok(acceptedUser >= 0 && acceptedUser < readResult, "the restored text is accepted by Pi before ordinary tool execution");
+  assert.deepEqual(f.operations, [{ tool: "read", scope: "after-editor-restored-human-input" }]);
+  assert.equal(toolResults(f, "read").at(-1)?.isError, false);
+  assert.doesNotMatch(currentStatus(f), /interrupted|input awaiting acceptance|unresolved error/);
+});
+
+test("real SDK: abort leaves queued steer pending until clearQueue explicitly restores it", { timeout: 15000 }, async t => {
+  const f = await fixture(t);
+  const provider = blockedProvider();
+  f.plan(provider.step);
+  const running = f.session.prompt("Extension-origin run to verify abort queue semantics.", { source: "extension" });
+  void running.catch(() => {});
+  await provider.started;
+  const queuedText = "ABORT_MUST_NOT_CLEAR_THIS_QUEUED_STEER";
+  assert.equal(await f.session.steer(queuedText), "queued");
+  assert.equal(f.session.pendingMessageCount, 1);
+
+  await f.session.abort();
+  await running;
+  assert.equal(f.session.pendingMessageCount, 1, "abort does not clear AgentSession's steering queue");
+  assert.deepEqual(f.session.getSteeringMessages(), [queuedText]);
+  assert.equal(f.events.entries.some(event => event.type === "accepted_user" && event.text === queuedText), false);
+
+  const restored = f.session.clearQueue();
+  assert.deepEqual(restored, { steering: [queuedText], followUp: [] }, "clearQueue returns queued text for the caller to restore to the editor");
+  assert.equal(f.session.pendingMessageCount, 0);
+});
+
+test("real SDK: transformed human input leaves explicit Mustr pause intact while ordinary tools run", { timeout: 15000 }, async t => {
   const f = await fixture(t);
   f.plan(callTool("mustr_pause", { reason: "Synthetic human decision before transformed input" }));
   await f.prompt();
@@ -663,26 +908,32 @@ test("real SDK: valid transformed human input releases a soft hold without text 
   f.control.transformInput = text => text === original ? transformed : text;
   f.plan(({ context }) => {
     assert.match(JSON.stringify(context.messages), /TRANSFORMED_VALID_HUMAN_RECOVERY/);
-    return completed();
-  });
+    return callTool("read", { scope: "ordinary-tool-during-explicit-pause" })();
+  }, completed);
   await f.prompt(original);
   assert.ok(f.events.entries.some(event => event.type === "input" && event.source === "interactive" && event.text === original));
   assert.ok(f.events.entries.some(event => event.type === "accepted_user" && event.text === transformed));
   assert.equal(f.events.entries.some(event => event.type === "accepted_user" && event.text === original), false, "the actual SDK accepted transformed text, not a matching copy of the input hook");
-  await f.checkpoint("idle");
-  assert.doesNotMatch(currentStatus(f), /awaiting human decision|interrupted|unresolved error/);
+  await f.checkpoint("paused");
+  assert.match(currentStatus(f), /awaiting human decision/);
+  assert.deepEqual(f.operations, [{ tool: "read", scope: "ordinary-tool-during-explicit-pause" }]);
+  assert.equal(toolResults(f, "read").at(-1)?.isError, false);
+  const wake = f.enqueue({ text: "TRANSFORMED_RECOVERY_MAILBOX" });
+  const held = await f.checkpoint("paused");
+  assert.equal(held.receive, false);
+  assert.equal(f.inserted(wake), false);
+  await f.command("/mustr resume");
   f.plan(({ context }) => {
     assert.match(JSON.stringify(context.messages), /TRANSFORMED_RECOVERY_MAILBOX/);
     return completed();
   });
-  const wake = f.enqueue({ text: "TRANSFORMED_RECOVERY_MAILBOX" });
   await f.ack(wake);
   await f.session.waitForIdle();
   await f.checkpoint("idle");
   assert.equal(f.inserted(wake), true);
 });
 
-for (const cancel of [false, true]) test(`real SDK: ${cancel ? "retry cancellation" : "retry exhaustion"} stays a labelled fault without adapter retry`, { timeout: 15000 }, async t => {
+for (const cancel of [false, true]) test(`real SDK: ${cancel ? "retry cancellation" : "retry exhaustion"} clears its transient gate at final settlement`, { timeout: 15000 }, async t => {
   const f = await fixture(t, { retryDelay: cancel ? 1000 : 1 });
   if (cancel) {
     f.session.subscribe(event => {
@@ -695,106 +946,30 @@ for (const cancel of [false, true]) test(`real SDK: ${cancel ? "retry cancellati
   }
   f.plan(unavailable, ...(!cancel ? [unavailable] : []));
   await f.prompt();
-  assert.equal(f.modelRequests.entries.length, cancel ? 1 : 2);
+  const attempts = cancel ? 1 : 2;
+  assert.equal(f.modelRequests.entries.length, attempts);
   assert.deepEqual(settled(f), [{ type: "agent_settled", aborted: false }]);
   assert.equal(f.events.entries.find(event => event.type === "auto_retry_end").success, false);
   assert.equal(f.events.entries.find(event => event.type === "agent_before_settle").outcome, "error");
-  await f.checkpoint("paused");
-  assert.match(currentStatus(f), /unresolved error/);
-  assert.equal(f.modelRequests.entries.length, cancel ? 1 : 2, "no adapter retry/replay after host settlement");
-  f.ownTask("fault-task");
-  const message = f.enqueue({ kind: "guide", task_id: "fault-task", revision: 1, text: "FRESH_GUIDANCE_MUST_RESPECT_UNRESOLVED_FAULT" });
-  const held = await f.checkpoint("paused");
-  assert.equal(held.receive, false);
-  assert.equal(f.inserted(message), false, "even fresh guidance cannot bypass unresolved cancellation ambiguity");
-  assert.equal(f.modelRequests.entries.length, cancel ? 1 : 2);
-  f.plan(completed, completed);
-  await f.prompt("Accepted human recovery, not an automatic retry of the failed run.");
+  await f.checkpoint("idle");
+  assert.doesNotMatch(currentStatus(f), /retrying after provider error|unresolved error/);
+  assert.equal(f.modelRequests.entries.length, attempts, "mustr adds no retry after native settlement");
+
+  f.plan(callTool("read", { scope: "ordinary-after-final-native-error" }), completed);
+  const message = f.enqueue({ text: "WAKE_AFTER_FINAL_NATIVE_ERROR" });
   await f.ack(message);
   await f.session.waitForIdle();
-  assert.equal(f.inserted(message), true);
   await f.checkpoint("idle");
-  assert.doesNotMatch(currentStatus(f), /unresolved error/);
-  // These two cases deliberately have the SAME extension-visible final state.
-  // Neither the test nor adapter parses finalError or intercepts raw Escape.
+  assert.equal(f.inserted(message), true, "autonomous coordination delivery resumes after the native final event");
+  assert.deepEqual(f.operations, [{ tool: "read", scope: "ordinary-after-final-native-error" }]);
+  assert.equal(f.modelRequests.entries.length, attempts + 2, "the addressed wake starts one tool call and one tool-result follow-up; mustr adds no recovery run");
+  // Exhaustion and retry cancellation expose the same final event; the adapter
+  // neither parses finalError nor intercepts raw Escape.
 });
 
-test("real SDK: extension-only retry recovery cannot clear a pre-existing final retry-cancellation hold", { timeout: 15000 }, async t => {
-  const f = await fixture(t, { retryDelay: 1000 });
-  const stopCancelling = f.session.subscribe(event => {
-    if (event.type === "auto_retry_start") queueMicrotask(() => f.session.abortRetry());
-  });
-  f.plan(unavailable);
-  await f.prompt("Establish an ambiguous final retry-cancellation fault.");
-  stopCancelling();
-  await f.checkpoint("paused");
-  assert.match(currentStatus(f), /unresolved error/);
-  assert.deepEqual(settled(f), [{ type: "agent_settled", aborted: false }]);
-  assert.equal(f.events.entries.find(event => event.type === "auto_retry_end").success, false);
 
-  const beforeExtension = f.events.entries.length;
-  f.plan(unavailable, completed);
-  await f.prompt("An extension retries successfully without human authorization.", { source: "extension" });
-  const extensionEvents = f.events.entries.slice(beforeExtension);
-  assert.ok(extensionEvents.some(event => event.type === "input" && event.source === "extension"));
-  assert.equal(extensionEvents.some(event => event.type === "input" && event.source === "interactive"), false);
-  assert.deepEqual(extensionEvents.filter(event => event.type === "assistant").map(event => event.stopReason), ["error", "stop"]);
-  assert.ok(extensionEvents.some(event => event.type === "auto_retry_end" && event.success));
-  assert.deepEqual(settled(f), [{ type: "agent_settled", aborted: false }, { type: "agent_settled", aborted: false }]);
-  const held = await f.checkpoint();
-  assert.equal(held.activity, "paused", "recovery of this extension run must not overwrite an older final fault");
-  assert.equal(held.receive, false);
-  assert.match(currentStatus(f), /unresolved error/);
-  f.ownTask("older-cancelled-fault");
-  const guide = f.enqueue({ kind: "guide", task_id: "older-cancelled-fault", revision: 1, text: "GUIDANCE_CANNOT_AUTHORIZE_OLD_FAULT_RECOVERY" });
-  await f.checkpoint("paused");
-  assert.equal(f.inserted(guide), false);
-  assert.equal(f.calls.entries.some(call => call.op === "ack" && call.message_id === guide.id), false);
-  assert.equal(f.modelRequests.entries.length, 3, "only the initial attempt and later extension attempt/native retry ran");
-});
 
-test("real SDK: a new assistant error after accepted-human fault release creates a new hold", { timeout: 15000 }, async t => {
-  const f = await fixture(t);
-  f.plan(unavailable, unavailable);
-  await f.prompt("Establish an older final fault before accepted-human recovery.");
-  await f.checkpoint("paused");
-  assert.match(currentStatus(f), /unresolved error/);
 
-  // Hold the real native retry's agent_start before it drains steering. This
-  // lets accepted human input release the older fault after this run has seen
-  // an error, without sleeps or directly invoking adapter lifecycle handlers.
-  const boundary = f.blockNextAgentStartAfterError();
-  const humanText = "ACCEPTED_HUMAN_RELEASE_PRECEDES_A_DISTINCT_NEW_ERROR";
-  f.plan(unavailable, ({ context }) => {
-    assert.match(JSON.stringify(context.messages), /ACCEPTED_HUMAN_RELEASE_PRECEDES_A_DISTINCT_NEW_ERROR/);
-    assert.doesNotMatch(currentStatus(f), /unresolved error/, "the accepted message really released the older fault before the next provider result");
-    return unavailable();
-  });
-  const running = f.prompt("An extension run starts before a human queues recovery.", { source: "extension" });
-  void running.catch(() => {});
-  await boundary.entered.promise;
-  const beforeHuman = f.events.entries.length;
-  await f.session.steer(humanText);
-  assert.ok(f.events.entries.slice(beforeHuman).some(event => event.type === "input" && event.source === "interactive" && event.text === humanText));
-  assert.equal(f.events.entries.slice(beforeHuman).some(event => event.type === "accepted_user" && event.text === humanText), false, "steering stays queued until the real retry start proceeds");
-  boundary.release.resolve();
-  await running;
-  const recoveryEvents = f.events.entries.slice(beforeHuman);
-  const acceptedIndex = recoveryEvents.findIndex(event => event.type === "accepted_user" && event.text === humanText);
-  const newErrorIndex = recoveryEvents.findIndex(event => event.type === "assistant" && event.stopReason === "error");
-  assert.ok(acceptedIndex >= 0 && newErrorIndex > acceptedIndex, "a genuinely accepted human message precedes a new assistant error");
-  assert.equal(f.events.entries.filter(event => event.type === "auto_retry_end" && !event.success).length, 2);
-  assert.equal(f.events.entries.filter(event => event.type === "agent_before_settle" && event.outcome === "error").length, 2);
-  assert.deepEqual(settled(f), [{ type: "agent_settled", aborted: false }, { type: "agent_settled", aborted: false }]);
-  const held = await f.checkpoint();
-  assert.equal(held.activity, "paused", "accepted-human release cannot forgive a later assistant error in the same native retry run");
-  assert.equal(held.receive, false);
-  assert.match(currentStatus(f), /unresolved error/);
-  const wake = f.enqueue({ text: "NEW_FAULT_MUST_BLOCK_ADDRESSED_WAKE" });
-  await f.checkpoint("paused");
-  assert.equal(f.inserted(wake), false);
-  assert.equal(f.modelRequests.entries.length, 4, "the new error remains final rather than causing adapter replay");
-});
 
 test("real SDK: child completion permits read/test review and acceptance without reopening reported work", { timeout: 20000 }, async t => {
   const f = await fixture(t);
@@ -853,7 +1028,7 @@ test("real SDK: exact taskless hub checkpoint permits reconciliation but preserv
   // A task-linked legacy worker check-in is not a manager checkpoint, even
   // though both arrive over the trusted peer and request a model wake.
   const optionalLinkedReply = completed;
-  const linkedProbe = callTool("read", { scope: "MUST_NOT_REOPEN_TASK_LINKED_CHECKIN" });
+  const linkedProbe = callTool("mustr_report", { task_id: parent.id, revision: 1, kind: "progress", text: "TASK_LINKED_CHECKIN_CANNOT_REOPEN_PARENT" });
   const beforeLinked = f.events.entries.length;
   f.plan(linkedProbe, optionalLinkedReply);
   const linked = f.enqueue({ kind: "checkin", from: null, task_id: parent.id, revision: 1, wake: true, text: "TASK_LINKED_WORKER_CHECKIN_IS_NOT_A_SCOPE" });
@@ -865,7 +1040,7 @@ test("real SDK: exact taskless hub checkpoint permits reconciliation but preserv
     f.withdrawEnvelope(linked);
     f.withdrawUnstartedSteps(linkedProbe, optionalLinkedReply);
   } else {
-    await f.events.waitFor(event => event.type === "tool_result" && event.tool === "read" && event.isError, "task-linked check-in cannot grant tool scope", beforeLinked);
+    await f.events.waitFor(event => event.type === "tool_result" && event.tool === "mustr_report" && event.isError, "task-linked check-in cannot reopen the stopped parent task", beforeLinked);
     await f.session.waitForIdle();
     f.discardOptionalCompletion(optionalLinkedReply);
   }
@@ -919,25 +1094,30 @@ test("real SDK: ordinary waking request is acknowledged and communication stays 
   f.plan(report(task.id));
   await f.prompt();
   await f.calls.waitFor(call => call.op === "report", "parent is reported before ordinary request");
+  f.plan(callTool("read", { scope: "ordinary-user-turn-after-terminal-report" }), completed);
+  await f.prompt("A later ordinary host turn may use Pi tools without Mustr guidance.");
+  assert.deepEqual(f.operations, [{ tool: "read", scope: "ordinary-user-turn-after-terminal-report" }]);
+  await f.command("/mustr resume");
+  assert.equal(task.state, "review", "resume clears only explicit pause state, not a published task revision");
   const optionalExplanation = completed;
   const beforeRequest = f.events.entries.length;
   f.plan(
     callTool("mustr_roster"),
     callTool("mustr_send", { to: "fixture-manager", text: "Request acknowledged; old task stays reported.", wake: false }),
     report(task.id, "status"),
-    callTool("read", { scope: "MUST_NOT_RESUME_OLD_WORK_FROM_REQUEST" }),
+    callTool("mustr_report", { task_id: task.id, revision: 1, kind: "progress", text: "ORDINARY_REQUEST_DOES_NOT_REOPEN_OLD_WORK" }),
     optionalExplanation,
   );
   const request = f.enqueue({ kind: "request", task_id: null, revision: null, text: "ORDINARY_ADDRESSED_REQUEST_IS_NOT_NEW_WORK_AUTHORIZATION" });
   await f.ack(request);
   await f.calls.waitFor(call => call.op === "report" && call.kind === "status", "communication-only status after request");
-  await f.events.waitFor(event => event.type === "tool_result" && event.tool === "read" && event.isError, "ordinary request does not unlock old work tools", beforeRequest);
+  await f.events.waitFor(event => event.type === "tool_result" && event.tool === "mustr_report" && event.isError, "ordinary request does not reopen the stopped task", beforeRequest);
   await f.session.waitForIdle();
   f.discardOptionalCompletion(optionalExplanation);
   assert.equal(f.inserted(request), true);
   assert.equal(f.calls.entries.filter(call => call.op === "send").length, 1);
   assert.equal(toolResults(f, "mustr_roster").at(-1).isError, false);
-  assert.deepEqual(f.operations, []);
+  assert.deepEqual(f.operations, [{ tool: "read", scope: "ordinary-user-turn-after-terminal-report" }]);
   assert.equal(task.state, "review");
   assert.deepEqual(reports(f, task.id).map(call => call.kind), ["done", "status"]);
 
@@ -948,7 +1128,10 @@ test("real SDK: ordinary waking request is acknowledged and communication stays 
   await f.calls.waitFor(call => call.op === "report" && call.task_id === task.id && call.revision === 2, "later authorized guidance remains reachable");
   await f.session.waitForIdle();
   assert.equal(f.inserted(guide), true);
-  assert.deepEqual(f.operations, [{ tool: "read", scope: "later-authorized-guide" }]);
+  assert.deepEqual(f.operations, [
+    { tool: "read", scope: "ordinary-user-turn-after-terminal-report" },
+    { tool: "read", scope: "later-authorized-guide" },
+  ]);
   assert.deepEqual(reports(f, task.id).map(call => [call.revision, call.kind]), [[1, "done"], [1, "status"], [2, "progress"]]);
 });
 
@@ -962,18 +1145,20 @@ test("real SDK: message_start cannot grant a review permit without matching pers
   f.tasks.set(child.id, child);
   f.control.rewriteMessageID = true;
   const optionalExplanation = completed;
-  f.plan(callTool("read", { scope: "UNCONFIRMED_SCOPE_MUST_NOT_EXECUTE" }), optionalExplanation);
+  f.plan(callTool("read", { scope: "ordinary-tool-without-task-permit" }), optionalExplanation);
   const beforeOffer = f.events.entries.length;
   const message = f.enqueue({ kind: "done", from: child.owner, task_id: child.id, revision: 1, text: "VALIDATED_BUT_NOT_MATCHINGLY_PERSISTED_SCOPE" });
   await f.events.waitFor(event => event.type === "custom_rewritten" && event.original === message.id, "later extension rewrites final custom-message identity", beforeOffer);
-  await f.events.waitFor(event => event.type === "tool_result" && event.tool === "read" && event.isError, "unpersisted scope cannot authorize a tool", beforeOffer);
+  await f.events.waitFor(event => event.type === "tool_result" && event.tool === "read" && !event.isError, "ordinary host tools do not require a task permit", beforeOffer);
   await f.session.waitForIdle();
   f.discardOptionalCompletion(optionalExplanation);
   assert.ok(f.events.entries.some(event => event.type === "custom_started" && event.id === message.id), "the real SDK did emit the tempting original message_start");
   assert.equal(f.inserted(message), false);
   assert.ok(f.session.sessionManager.getBranch().some(entry => entry.type === "custom_message" && entry.details?.id === `rewritten-${message.id}`));
   assert.equal(f.calls.entries.some(call => call.op === "ack" && call.message_id === message.id), false);
-  assert.deepEqual(f.operations, []);
+  assert.deepEqual(f.operations, [{ tool: "read", scope: "ordinary-tool-without-task-permit" }]);
+  assert.match(currentStatus(f), /awaiting guidance/);
+  assert.doesNotMatch(currentStatus(f), /reviewing delegated task/);
   assert.equal(parent.state, "review");
   assert.deepEqual(reports(f, parent.id).map(call => call.kind), ["done"]);
 });

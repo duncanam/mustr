@@ -114,6 +114,7 @@ test("production mustr adapter preserves real Pi model-context prefixes across t
   const identityPath = join(directory, "identity.json");
   const cliPath = join(directory, "mustr-fixture.mjs");
   const identity = {
+    protocol: 1,
     socket: socketPath,
     server_key: "synthetic-server",
     space_id: "synthetic-space",

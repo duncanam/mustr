@@ -722,6 +722,7 @@ fn task_style(state: TaskState, color: bool) -> Style {
             tone(color, Color::Yellow).add_modifier(Modifier::BOLD)
         }
         TaskState::Active | TaskState::Assigned => accent(color).add_modifier(Modifier::BOLD),
+        TaskState::Queued => tone(color, Color::Cyan),
         TaskState::Accepted => tone(color, Color::Green),
         TaskState::Paused | TaskState::Cancelled => muted(),
     }
@@ -889,7 +890,36 @@ fn draw_work(
         .iter()
         .filter(|task| task.state == TaskState::Accepted)
         .count();
-    let counts = format!("{} tasks · {accepted} accepted", tasks.len());
+    let queued = tasks
+        .iter()
+        .filter(|task| task.state == TaskState::Queued)
+        .count();
+    let counts = if queued > 0 {
+        format!(
+            "{} tasks · {queued} queued · {accepted} accepted",
+            tasks.len()
+        )
+    } else {
+        format!("{} tasks · {accepted} accepted", tasks.len())
+    };
+    let compact_counts = if queued > 0 {
+        format!("{} · {queued} queued · {accepted} accepted", tasks.len())
+    } else {
+        format!("{} · {accepted} accepted", tasks.len())
+    };
+    let labels = if queued > 0 {
+        format!("{queued} queued · {accepted} accepted")
+    } else {
+        format!("{accepted} accepted")
+    };
+    // Bottom titles are inside the pane's side borders and add one padding
+    // space on each side of the summary.
+    let summary_width = usize::from(area.width.saturating_sub(4));
+    let fits_summary = |text: &str| Line::raw(text).width() <= summary_width;
+    debug_assert!(
+        fits_summary(&labels),
+        "complete task-state labels must fit the supported work-pane width"
+    );
     let summary = if view.work_tab == WorkTab::Tasks && !tasks.is_empty() {
         let visible = if range.is_empty() {
             "0".into()
@@ -897,15 +927,29 @@ fn draw_work(
             format!("{}–{}", range.start + 1, range.end)
         };
         let full = format!("{visible}/{counts}");
-        if Line::raw(&full).width() + 2 <= usize::from(area.width.saturating_sub(2)) {
+        if fits_summary(&full) {
             full
         } else {
-            // The tabs already label the task total, so omit only the repeated
-            // noun on narrow panes, never the accepted count or visible range.
-            format!("{visible}/{} · {accepted} accepted", tasks.len())
+            // The tabs already label the task total, so first omit only the
+            // repeated noun; then drop the total, and finally the range if needed.
+            let compact = format!("{visible}/{compact_counts}");
+            if fits_summary(&compact) {
+                compact
+            } else {
+                let positioned_labels = format!("{visible} · {labels}");
+                if fits_summary(&positioned_labels) {
+                    positioned_labels
+                } else {
+                    labels
+                }
+            }
         }
-    } else {
+    } else if fits_summary(&counts) {
         counts
+    } else if fits_summary(&compact_counts) {
+        compact_counts
+    } else {
+        labels
     };
     let hint = match view.work_tab {
         WorkTab::Messages => "addressed · newest first",
@@ -920,6 +964,23 @@ fn draw_work(
         WorkTab::Messages => draw_messages(frame, inner, snapshot, space, automation, view, color),
         WorkTab::Tasks => draw_tasks(frame, inner, snapshot, &tasks, &view.tasks, range, color),
     }
+}
+
+fn queue_position(task: &Task, tasks: &[&Task]) -> Option<usize> {
+    if task.state != TaskState::Queued {
+        return None;
+    }
+    Some(
+        tasks
+            .iter()
+            .filter(|candidate| {
+                candidate.owner == task.owner
+                    && candidate.state == TaskState::Queued
+                    && (candidate.seq, candidate.id.as_str()) < (task.seq, task.id.as_str())
+            })
+            .count()
+            + 1,
+    )
 }
 
 fn task_row_height(tasks: &[&Task]) -> u16 {
@@ -943,7 +1004,7 @@ fn draw_tasks(
         frame.render_widget(
             Paragraph::new(vec![
                 Line::styled("No tasks assigned.", muted()),
-                Line::raw("A joined agent can assign work to an idle participant."),
+                Line::raw("Work can queue behind an owner's current task."),
             ])
             .wrap(Wrap { trim: false }),
             inner,
@@ -968,6 +1029,9 @@ fn draw_tasks(
         let responsibility = match task.state {
             TaskState::Review => format!("Review by {} · ", clean(requester)),
             TaskState::Blocked => format!("Ask {} · ", clean(requester)),
+            TaskState::Queued => queue_position(task, tasks)
+                .map(|position| format!("Queue #{position} · "))
+                .unwrap_or_else(|| "Queued · ".into()),
             _ => String::new(),
         };
         let mut details = vec![
@@ -1291,6 +1355,7 @@ mod tests {
         snapshot.tasks = vec![
             Task {
                 id: TaskId::new("a1b2c3d4-1111"),
+                seq: 1,
                 space_id: SpaceId::new("w1"),
                 requester: AgentId::new("ada"),
                 owner: AgentId::new("lin"),
@@ -1305,6 +1370,7 @@ mod tests {
             },
             Task {
                 id: TaskId::new("e5f6a7b8-2222"),
+                seq: 2,
                 space_id: SpaceId::new("w1"),
                 requester: AgentId::new("lin"),
                 owner: AgentId::new("ada"),
@@ -1443,7 +1509,7 @@ mod tests {
         assert!(view.navigate(KeyCode::Char('f'), &snapshot));
         let tasks = screen(&render(&snapshot, &view, 100, 24, true));
         assert!(tasks.contains("No tasks assigned."));
-        assert!(tasks.contains("A joined agent can assign work to an idle participant."));
+        assert!(tasks.contains("Work can queue behind an owner's current task."));
         assert!(!tasks.contains("No addressed messages yet."));
         for text in [&text, &tasks] {
             assert!(text.contains("0 tasks · 0 accepted"));

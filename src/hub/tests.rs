@@ -1,7 +1,11 @@
 use super::*;
 
 mod delivery;
+mod lease_expiry;
+mod manager_cancel;
+mod queue;
 mod reset;
+mod roles;
 
 fn request(id: &str, command: Command) -> Request {
     Request {
@@ -82,6 +86,131 @@ fn assign(state: &mut State, architect: &AgentId, worker: &AgentId, config: &Sch
         .unwrap();
     serde_json::from_value(result["task_id"].clone()).unwrap()
 }
+
+#[test]
+fn task_conflicts_are_typed_only_for_obsolete_reports() {
+    let (mut state, architect, worker, config) = setup();
+    let id = assign(&mut state, &architect, &worker, &config);
+    state
+        .apply(
+            &request(
+                "guide",
+                Command::Guide {
+                    task_id: id.clone(),
+                    revision: 1,
+                    text: "Revise the task before reporting".into(),
+                },
+            ),
+            Some(&architect),
+            1,
+            &config,
+        )
+        .unwrap();
+
+    let before_stale_report = state.clone();
+    let stale_report = state
+        .apply(
+            &request(
+                "stale-report",
+                Command::Report {
+                    task_id: id.clone(),
+                    revision: 1,
+                    kind: ReportKind::Done,
+                    text: "Obsolete report".into(),
+                },
+            ),
+            Some(&worker),
+            2,
+            &config,
+        )
+        .unwrap_err();
+    assert!(stale_report.downcast_ref::<TaskConflict>().is_some());
+    assert!(stale_report.to_string().contains("refresh the roster"));
+    assert_eq!(
+        state, before_stale_report,
+        "rejected report has no task or inbox side effects"
+    );
+
+    let unauthorized_report = state
+        .apply(
+            &request(
+                "unauthorized-report",
+                Command::Report {
+                    task_id: id.clone(),
+                    revision: 1,
+                    kind: ReportKind::Done,
+                    text: "A stale revision is not a permission grant".into(),
+                },
+            ),
+            Some(&architect),
+            2,
+            &config,
+        )
+        .unwrap_err();
+    assert!(unauthorized_report.downcast_ref::<TaskConflict>().is_none());
+    assert!(unauthorized_report.to_string().contains("only the owner"));
+
+    for (request_id, command) in [
+        (
+            "stale-guide",
+            Command::Guide {
+                task_id: id.clone(),
+                revision: 1,
+                text: "Stale guidance".into(),
+            },
+        ),
+        (
+            "stale-cancel",
+            Command::Cancel {
+                task_id: id.clone(),
+                revision: 1,
+                text: "Stale cancellation".into(),
+            },
+        ),
+    ] {
+        let error = state
+            .apply(&request(request_id, command), Some(&architect), 2, &config)
+            .unwrap_err();
+        assert!(error.downcast_ref::<TaskConflict>().is_none());
+        assert!(error.to_string().contains("refresh the roster"));
+    }
+
+    state
+        .apply(
+            &request(
+                "cancel-current",
+                Command::Cancel {
+                    task_id: id.clone(),
+                    revision: 2,
+                    text: "Stop this task".into(),
+                },
+            ),
+            Some(&architect),
+            3,
+            &config,
+        )
+        .unwrap();
+    let revision = state.tasks.get(&id).unwrap().revision;
+    let finished_report = state
+        .apply(
+            &request(
+                "finished-report",
+                Command::Report {
+                    task_id: id,
+                    revision,
+                    kind: ReportKind::Done,
+                    text: "Must not reopen cancelled work".into(),
+                },
+            ),
+            Some(&worker),
+            4,
+            &config,
+        )
+        .unwrap_err();
+    assert!(finished_report.downcast_ref::<TaskConflict>().is_some());
+    assert!(finished_report.to_string().contains("no longer reportable"));
+}
+
 #[test]
 fn working_recipients_receive_only_live_comments_without_head_of_line_blocking() {
     let (mut state, architect, worker, config) = setup();
@@ -240,9 +369,9 @@ fn ownership_revision_review_and_idempotency() {
                 &request(
                     "other",
                     Command::Assign {
-                        to: worker.clone(),
-                        title: "Overlap".into(),
-                        text: "No".into()
+                        to: architect.clone(),
+                        title: "Self assignment".into(),
+                        text: "Not permitted".into()
                     }
                 ),
                 Some(&architect),
@@ -898,7 +1027,7 @@ fn done_report_wakes_requester_and_remains_reviewable_with_all_modes_off() {
 }
 
 #[test]
-fn manager_role_does_not_override_requester_only_task_authority() {
+fn manager_role_only_adds_cancel_authority_for_redirection() {
     let (mut state, manager, worker, config) = setup();
     let requester = AgentId::new("other-requester");
     state
@@ -951,11 +1080,6 @@ fn manager_role_does_not_override_requester_only_task_authority() {
             revision: before.revision,
             text: "Manager cannot accept another requester task.".into(),
         },
-        Command::Cancel {
-            task_id: task.clone(),
-            revision: before.revision,
-            text: "Manager cannot cancel another requester task.".into(),
-        },
     ] {
         assert!(
             state
@@ -970,6 +1094,31 @@ fn manager_role_does_not_override_requester_only_task_authority() {
         assert_eq!(state.tasks[&task], before);
     }
     assert!(state.members[&manager].manager);
+    let cancelled = state
+        .apply(
+            &request(
+                "manager-redirection-cancel",
+                Command::Cancel {
+                    task_id: task.clone(),
+                    revision: before.revision,
+                    text: "The user redirected this task.".into(),
+                },
+            ),
+            Some(&manager),
+            3,
+            &config,
+        )
+        .unwrap();
+    assert_eq!(cancelled["state"], "cancelled");
+    assert_eq!(state.tasks[&task].state, TaskState::Cancelled);
+    assert!(
+        state.tasks[&task]
+            .note
+            .starts_with("Manager architect-id cancelled:")
+    );
+    assert_eq!(state.messages.last().unwrap().from, Some(manager.clone()));
+    assert_eq!(state.messages.last().unwrap().kind, MessageKind::Info);
+    assert!(!state.messages.last().unwrap().wake);
 }
 
 #[test]

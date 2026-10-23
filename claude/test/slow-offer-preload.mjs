@@ -1,6 +1,22 @@
 // Test-only preload used to deterministically cancel after the hub has offered
 // an inbox message but before the MCP adapter receives the response.
-import { HubClient } from "../../pi/transport.mjs";
+import { appendFileSync } from "node:fs";
+import crypto from "node:crypto";
+import { syncBuiltinESMExports } from "node:module";
+import { HubClient, HubRemoteError } from "../../pi/transport.mjs";
+
+if (process.env.MUSTR_TEST_AGENT_ID) {
+  const randomUUID = crypto.randomUUID;
+  let useInjectedId = true;
+  crypto.randomUUID = (...args) => {
+    if (useInjectedId) {
+      useInjectedId = false;
+      return process.env.MUSTR_TEST_AGENT_ID;
+    }
+    return randomUUID(...args);
+  };
+  syncBuiltinESMExports();
+}
 
 const delayMs = Number(process.env.MUSTR_TEST_DELAY_OFFER_MS || 0);
 if (Number.isInteger(delayMs) && delayMs > 0) {
@@ -11,6 +27,22 @@ if (Number.isInteger(delayMs) && delayMs > 0) {
       await new Promise(resolve => setTimeout(resolve, delayMs));
     }
     return result;
+  };
+}
+
+if (process.env.MUSTR_TEST_RETIRE_OP) {
+  const request = HubClient.prototype.request;
+  const retireAfter = Math.max(1, Number(process.env.MUSTR_TEST_RETIRE_AFTER || 1));
+  let matchingRequests = 0;
+  let retired = false;
+  HubClient.prototype.request = async function (command, timeoutMs) {
+    if (process.env.MUSTR_TEST_REQUEST_LOG) appendFileSync(process.env.MUSTR_TEST_REQUEST_LOG, `${command?.op ?? "unknown"}\n`);
+    if (command?.op === process.env.MUSTR_TEST_RETIRE_OP) matchingRequests++;
+    if (!retired && matchingRequests >= retireAfter && command?.op === process.env.MUSTR_TEST_RETIRE_OP) {
+      retired = true;
+      throw new HubRemoteError("connection is retired; rejoin explicitly from the correct session", "connection_retired");
+    }
+    return request.call(this, command, timeoutMs);
   };
 }
 

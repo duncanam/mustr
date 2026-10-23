@@ -128,6 +128,30 @@ test("socket admission rejects invalid initial/reset joins and resolves shared c
   assert.equal((await sync(second)).members.length, 2);
 });
 
+test("real hub admits duplicate non-manager roles with distinct identities and names", { timeout: 20000 }, async t => {
+  const f = await fixture(t);
+  const roles = `${f.directory}/config/roles`;
+  await writeFile(`${roles}/custom.md`, "+++\ncompose = [\"researcher\"]\n+++\nCustom composed role fixture.\n");
+  await f.start();
+
+  for (const [index, role] of ["researcher", "reviewer", "implementor", "custom"].entries()) {
+    const first = await join(t, f, `${role}-first`, "w1:p1", "w1", role);
+    const firstActivity = ["paused", "idle", "working", "paused"][index];
+    await sync(first, false, firstActivity);
+    const second = await join(t, f, `${role}-second`, "w1:p2", "w1", role);
+    const roster = await sync(second, false, "working");
+    const peers = roster.members.filter(member => member.role === role);
+    assert.deepEqual(peers.map(member => [member.id, member.name]).sort(), [
+      [`${role}-first`, `${role}-first`], [`${role}-second`, `${role}-second`],
+    ]);
+    assert.equal(peers.length, 2, `${role}: both peers remain in the roster`);
+    assert.equal(peers.find(member => member.id === `${role}-first`).activity, firstActivity);
+    assert.equal(peers.find(member => member.id === `${role}-second`).activity, "working");
+    await first.request({ op: "leave" });
+    await second.request({ op: "leave" });
+  }
+});
+
 test("real socket hub: isolated spaces, task exchange, rollback and restart reconciliation", { timeout: 20000 }, async t => {
   const f = await fixture(t);
   let hub = await f.start();

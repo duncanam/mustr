@@ -216,7 +216,7 @@ test("MCP lifecycle gates normal requests until initialized, exempts ping, and l
   assert.equal(listed.error, undefined);
   assert.ok(Array.isArray(listed.result.tools));
   const byName = new Map(listed.result.tools.map(tool => [tool.name, tool]));
-  for (const name of ["mustr_join", "mustr_wait", "mustr_ack", "mustr_roster", "mustr_leave"]) {
+  for (const name of ["mustr_join", "mustr_wait", "mustr_ack", "mustr_roster", "mustr_assign", "mustr_cancel", "mustr_leave"]) {
     assert.ok(byName.has(name), `tools/list includes ${name}`);
     assert.equal(byName.get(name).inputSchema.type, "object");
   }
@@ -224,6 +224,9 @@ test("MCP lifecycle gates normal requests until initialized, exempts ping, and l
     assert.deepEqual(byName.get(name).inputSchema.properties, {});
     assert.equal(byName.get(name).inputSchema.additionalProperties, false);
   }
+  assert.match(byName.get("mustr_assign").description, /per-owner FIFO/i);
+  assert.match(byName.get("mustr_assign").description, /not executed until the hub dispatches/i);
+  assert.match(byName.get("mustr_cancel").description, /does NOT stop running tools or external jobs/i);
 });
 
 test("initialize requires well-formed parameters and cannot be repeated", { timeout: testTimeoutMs }, async t => {

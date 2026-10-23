@@ -49,6 +49,17 @@ async fn socket_join(
     serde_json::from_str(&line).unwrap()
 }
 
+async fn socket_exchange(client: &mut BufReader<UnixStream>, request: Request) -> Response {
+    client
+        .get_mut()
+        .write_all(format!("{}\n", serde_json::to_string(&request).unwrap()).as_bytes())
+        .await
+        .unwrap();
+    let mut line = String::new();
+    client.read_line(&mut line).await.unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+
 async fn serve_pane_requests(listener: UnixListener, count: usize) {
     for _ in 0..count {
         let (stream, _) = listener.accept().await.unwrap();
@@ -191,6 +202,346 @@ async fn server_attests_only_the_selected_root_role_as_manager() {
             .manager
     );
     assert_eq!(members.iter().filter(|member| member.manager).count(), 1);
+    service.stop().await;
+}
+
+#[tokio::test]
+async fn obsolete_report_conflict_keeps_the_same_socket_usable_after_a_guide_race() {
+    let directory = tempfile::tempdir().unwrap();
+    let roles_dir = directory.path().join("roles");
+    fs::create_dir(&roles_dir).unwrap();
+    fs::write(roles_dir.join("worker.md"), "Worker role.\n").unwrap();
+    let service = Service::start(
+        SpaceId::new("w1"),
+        directory.path().join("hub.sqlite"),
+        crate::config::Scheduling::default(),
+    )
+    .await
+    .unwrap();
+    let space = SpaceId::new("w1");
+    let requester = AgentId::new("requester");
+    let owner = AgentId::new("owner");
+    let requester_join = request(
+        "join-requester",
+        Command::Join {
+            version: VERSION,
+            agent_id: requester.clone(),
+            name: "requester".into(),
+            role: "architect".into(),
+            pane_id: "w1:p9".into(),
+            space_id: space.clone(),
+            cwd: None,
+            reset: None,
+        },
+    );
+    assert!(service.join(100, requester_join, true).await.unwrap().ok);
+    assert!(
+        service
+            .request(
+                100,
+                request(
+                    "requester-idle",
+                    Command::Sync {
+                        activity: Activity::Idle,
+                        receive: false,
+                    },
+                ),
+            )
+            .await
+            .unwrap()
+            .ok
+    );
+
+    let herdr_path = directory.path().join("herdr.sock");
+    let listener = UnixListener::bind(&herdr_path).unwrap();
+    let herdr = Herdr::new(herdr_path.clone()).unwrap();
+    let herdr_task = tokio::spawn(serve_pane_requests(listener, 5));
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    let server_herdr = herdr.clone();
+    let server_space = space.clone();
+    let server_service = service.clone();
+    let server_roles = roles_dir.clone();
+    let connection_task = tokio::spawn(async move {
+        connection(
+            server_stream,
+            2,
+            &server_herdr,
+            &server_space,
+            &server_service,
+            &server_roles,
+        )
+        .await
+    });
+    let mut client = BufReader::new(client_stream);
+    let joined = socket_exchange(
+        &mut client,
+        request(
+            "join-owner",
+            Command::Join {
+                version: VERSION,
+                agent_id: owner.clone(),
+                name: "worker".into(),
+                role: "worker".into(),
+                pane_id: "w1:p1".into(),
+                space_id: space.clone(),
+                cwd: None,
+                reset: None,
+            },
+        ),
+    )
+    .await;
+    assert!(joined.ok, "{:?}", joined.error);
+    let idle = socket_exchange(
+        &mut client,
+        request(
+            "owner-idle",
+            Command::Sync {
+                activity: Activity::Idle,
+                receive: false,
+            },
+        ),
+    )
+    .await;
+    assert!(idle.ok, "{:?}", idle.error);
+
+    let assigned = service
+        .request(
+            100,
+            request(
+                "assign",
+                Command::Assign {
+                    to: owner.clone(),
+                    title: "Reconcile a stale report".into(),
+                    text: "A new Guide may race a staged terminal report.".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(assigned.ok, "{:?}", assigned.error);
+    let task_id: TaskId =
+        serde_json::from_value(assigned.result.unwrap()["task_id"].clone()).unwrap();
+
+    let before_guide = socket_exchange(
+        &mut client,
+        request(
+            "sync-before-guide",
+            Command::Sync {
+                activity: Activity::Idle,
+                receive: false,
+            },
+        ),
+    )
+    .await;
+    assert!(before_guide.ok, "{:?}", before_guide.error);
+    assert_eq!(before_guide.result.unwrap()["tasks"][0]["revision"], 1);
+
+    let guided = service
+        .request(
+            100,
+            request(
+                "guide",
+                Command::Guide {
+                    task_id: task_id.clone(),
+                    revision: 1,
+                    text: "Advance the task before the old report arrives.".into(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(guided.ok, "{:?}", guided.error);
+
+    let stale_report = socket_exchange(
+        &mut client,
+        request(
+            "stale-report",
+            Command::Report {
+                task_id: task_id.clone(),
+                revision: 1,
+                kind: ReportKind::Done,
+                text: "Obsolete staged report".into(),
+            },
+        ),
+    )
+    .await;
+    assert!(!stale_report.ok);
+    assert_eq!(stale_report.error_code.as_deref(), Some("task_conflict"));
+
+    let current = socket_exchange(
+        &mut client,
+        request(
+            "sync-after-conflict",
+            Command::Sync {
+                activity: Activity::Idle,
+                receive: false,
+            },
+        ),
+    )
+    .await;
+    assert!(
+        current.ok,
+        "the same socket must remain usable: {:?}",
+        current.error
+    );
+    let current_task = current.result.unwrap()["tasks"][0].clone();
+    assert_eq!(current_task["id"], serde_json::to_value(&task_id).unwrap());
+    assert_eq!(current_task["revision"], 2);
+    assert_eq!(
+        current_task["state"], "assigned",
+        "the rejected report does not pause newer work"
+    );
+
+    drop(client);
+    connection_task.await.unwrap().unwrap();
+    herdr_task.await.unwrap();
+    service.stop().await;
+}
+
+#[tokio::test]
+async fn retired_connection_error_is_typed_on_the_wire_before_actor_mutation() {
+    let directory = tempfile::tempdir().unwrap();
+    let roles_dir = directory.path().join("roles");
+    fs::create_dir(&roles_dir).unwrap();
+    fs::write(roles_dir.join("worker.md"), "Worker role.\n").unwrap();
+    let service = Service::start(
+        SpaceId::new("w1"),
+        directory.path().join("hub.sqlite"),
+        crate::config::Scheduling::default(),
+    )
+    .await
+    .unwrap();
+    let space = SpaceId::new("w1");
+    service
+        .tx
+        .send(Event::Space(Ok(Space {
+            id: space.clone(),
+            label: "Fixture".into(),
+        })))
+        .await
+        .unwrap();
+
+    let herdr_path = directory.path().join("herdr.sock");
+    let listener = UnixListener::bind(&herdr_path).unwrap();
+    let herdr = Herdr::new(herdr_path.clone()).unwrap();
+    let herdr_task = tokio::spawn(serve_pane_requests(listener, 4));
+    let (server_stream, client_stream) = UnixStream::pair().unwrap();
+    let server_herdr = herdr.clone();
+    let server_space = space.clone();
+    let server_service = service.clone();
+    let server_roles = roles_dir.clone();
+    let connection_task = tokio::spawn(async move {
+        connection(
+            server_stream,
+            1,
+            &server_herdr,
+            &server_space,
+            &server_service,
+            &server_roles,
+        )
+        .await
+    });
+    let mut client = BufReader::new(client_stream);
+    let joined = socket_exchange(
+        &mut client,
+        request(
+            "join-worker",
+            Command::Join {
+                version: VERSION,
+                agent_id: AgentId::new("worker"),
+                name: "worker".into(),
+                role: "worker".into(),
+                pane_id: "w1:p1".into(),
+                space_id: space.clone(),
+                cwd: None,
+                reset: None,
+            },
+        ),
+    )
+    .await;
+    assert!(joined.ok, "{:?}", joined.error);
+    assert!(
+        socket_exchange(
+            &mut client,
+            request("reset-capability", Command::ResetCapability)
+        )
+        .await
+        .ok
+    );
+    assert!(
+        socket_exchange(
+            &mut client,
+            request(
+                "idle",
+                Command::Sync {
+                    activity: Activity::Idle,
+                    receive: false,
+                },
+            ),
+        )
+        .await
+        .ok
+    );
+
+    let preview = service.reset_preview().await.unwrap();
+    service.reset_start(preview).await.unwrap();
+    let mut snapshots = service.snapshots.clone();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while snapshots
+            .borrow()
+            .reset
+            .as_ref()
+            .is_none_or(|reset| reset.state != ResetPhase::Prepared)
+        {
+            snapshots.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let plan_id = snapshots.borrow().reset.as_ref().unwrap().plan_id.clone();
+    service.reset_abandon(plan_id).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while snapshots
+            .borrow()
+            .reset
+            .as_ref()
+            .is_none_or(|reset| reset.state != ResetPhase::Abandoned)
+        {
+            snapshots.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    let before = snapshots.borrow().clone();
+
+    let retired = socket_exchange(
+        &mut client,
+        request(
+            "retired-sync",
+            Command::Sync {
+                activity: Activity::Paused,
+                receive: true,
+            },
+        ),
+    )
+    .await;
+    assert!(!retired.ok);
+    assert_eq!(retired.error_code.as_deref(), Some("connection_retired"));
+    assert_eq!(
+        retired.error.as_deref(),
+        Some("connection is retired; rejoin explicitly from the correct session")
+    );
+    let after = snapshots.borrow().clone();
+    assert_eq!(after.members, before.members);
+    assert_eq!(after.tasks, before.tasks);
+    assert_eq!(after.messages, before.messages);
+    assert_eq!(after.automation, before.automation);
+    assert_eq!(after.reset, before.reset);
+    assert_eq!(after.epoch, before.epoch);
+
+    drop(client);
+    connection_task.await.unwrap().unwrap();
+    herdr_task.await.unwrap();
     service.stop().await;
 }
 

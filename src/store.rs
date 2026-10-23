@@ -111,7 +111,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{AgentId, SpaceId};
+    use crate::protocol::{Activity, AgentId, Member, SpaceId, Task, TaskId, TaskState};
 
     #[test]
     fn refuses_legacy_data_without_changing_its_version_or_payload() {
@@ -292,6 +292,111 @@ mod tests {
             loaded.automation.pr.unwrap().url.as_deref(),
             Some("https://github.com/example/repo/pull/1")
         );
+    }
+
+    #[test]
+    fn v3_fifo_fields_default_and_recover_without_a_schema_migration() {
+        assert_eq!(VERSION, 3);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hub.sqlite");
+        let space = SpaceId::new("w1");
+        let requester = AgentId::new("requester");
+        let owner = AgentId::new("owner");
+        let mut state = State::new(space.clone());
+        for id in [&requester, &owner] {
+            state.members.insert(
+                id.clone(),
+                Member {
+                    id: id.clone(),
+                    name: id.to_string(),
+                    role: "custom".into(),
+                    pane_id: format!("w1:{}", id),
+                    space_id: space.clone(),
+                    manager: false,
+                    cwd: None,
+                    activity: Activity::Idle,
+                    last_seen: 1,
+                    idle_since: 1,
+                },
+            );
+        }
+        for (id, seq) in [("legacy-zero", 0), ("legacy-high", 17)] {
+            state.tasks.insert(
+                TaskId::new(id),
+                Task {
+                    id: TaskId::new(id),
+                    seq,
+                    space_id: space.clone(),
+                    requester: requester.clone(),
+                    owner: owner.clone(),
+                    title: id.into(),
+                    description: "legacy task".into(),
+                    state: TaskState::Accepted,
+                    revision: 1,
+                    updated_at: 1,
+                    checkin_at: 0,
+                    nudges: 0,
+                    note: String::new(),
+                },
+            );
+        }
+        let mut store = Store::open(&path, space.clone()).unwrap();
+        store.save(&state).unwrap();
+        let mut legacy = serde_json::to_value(&state).unwrap();
+        legacy.as_object_mut().unwrap().remove("next_seq");
+        legacy["tasks"]["legacy-zero"]
+            .as_object_mut()
+            .unwrap()
+            .remove("seq");
+        legacy["tasks"]["legacy-high"]["seq"] = serde_json::json!(17);
+        let legacy_payload = serde_json::to_string(&legacy).unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE hub SET payload = ?1 WHERE id = 1",
+                [&legacy_payload],
+            )
+            .unwrap();
+
+        let mut loaded = store.load().unwrap();
+        assert_eq!(loaded.tasks[&TaskId::new("legacy-zero")].seq, 0);
+        assert_eq!(serde_json::to_value(&loaded).unwrap()["next_seq"], 0);
+        loaded.recover();
+        assert_eq!(serde_json::to_value(&loaded).unwrap()["next_seq"], 18);
+        for member in loaded.members.values_mut() {
+            member.activity = Activity::Idle;
+        }
+        let assigned = loaded
+            .apply(
+                &crate::protocol::Request {
+                    id: "after-recovery".into(),
+                    command: crate::protocol::Command::Assign {
+                        to: owner.clone(),
+                        title: "After restart".into(),
+                        text: "Continue from a recovered sequence".into(),
+                    },
+                },
+                Some(&requester),
+                2,
+                &crate::config::Scheduling::default(),
+            )
+            .unwrap();
+        let assigned_id: TaskId = serde_json::from_value(assigned["task_id"].clone()).unwrap();
+        assert_eq!(loaded.tasks[&assigned_id].seq, 18);
+
+        let stored: String = store
+            .connection
+            .query_row("SELECT payload FROM hub WHERE id = 1", [], |row| row.get(0))
+            .unwrap();
+        let version: u32 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            stored, legacy_payload,
+            "loading must not rewrite legacy state"
+        );
+        assert_eq!(version, 3, "FIFO fields do not bump the v3 schema");
     }
 
     #[test]

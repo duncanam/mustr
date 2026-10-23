@@ -37,7 +37,7 @@ async function until(check, description) {
 async function fixture(t, { cancelOrder, rejectReceipt = false } = {}) {
   const directory = await mkdtemp("/tmp/mustr-runtime-");
   const socketPath = `${directory}/peer.sock`;
-  const identity = { socket: socketPath, server_key: "fixture-server", space_id: "w1", pane_id: "w1:p1" };
+  const identity = { protocol: 1, socket: socketPath, server_key: "fixture-server", space_id: "w1", pane_id: "w1:p1" };
   const cli = `${directory}/mustr.mjs`;
   await writeFile(`${directory}/identity.json`, JSON.stringify(identity));
   await writeFile(cli, `#!${process.execPath}\nimport {readFileSync} from 'node:fs';\nconst args=process.argv.slice(2);\nif(args.includes('context')) console.log(readFileSync(${JSON.stringify(`${directory}/identity.json`)},'utf8'));\nelse if(args.includes('roles')) console.log(JSON.stringify([{name:'researcher',description:'Fixture role',prompt:'APPROVED RESEARCH ROLE'}]));\nelse process.exit(2);\n`, { mode: 0o700 });

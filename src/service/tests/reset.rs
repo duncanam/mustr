@@ -530,23 +530,24 @@ async fn abandon_revokes_old_connections_but_keeps_verified_fresh_connections_an
             .ok
     );
     service.reset_abandon(b.plan_id.clone()).await.unwrap();
-    assert!(
-        !service
-            .request(
-                2,
-                request(
-                    "old-idle",
-                    Command::Sync {
-                        activity: Activity::Idle,
-                        receive: true
-                    }
-                )
-            )
-            .await
-            .unwrap()
-            .ok
-    );
-    assert!(!claim(&service, 2, &b).await.ok);
+    let old_idle = service
+        .request(
+            2,
+            request(
+                "old-idle",
+                Command::Sync {
+                    activity: Activity::Idle,
+                    receive: true,
+                },
+            ),
+        )
+        .await
+        .unwrap();
+    assert!(!old_idle.ok);
+    assert_eq!(old_idle.error_code.as_deref(), Some("connection_retired"));
+    let old_claim = claim(&service, 2, &b).await;
+    assert!(!old_claim.ok);
+    assert_eq!(old_claim.error_code.as_deref(), Some("connection_retired"));
     let fresh = poll(&service, 3).await;
     assert_eq!(fresh["tasks"].as_array().unwrap().len(), 1);
     assert_eq!(fresh["tasks"][0]["state"], "paused");
@@ -562,12 +563,14 @@ async fn abandon_revokes_old_connections_but_keeps_verified_fresh_connections_an
             .unwrap()
             .ok
     );
-    assert!(
-        !service
-            .request(5, join("architect", "architect", "w1:p1", None))
-            .await
-            .unwrap()
-            .ok
+    let claimed_identity = service
+        .request(5, join("architect", "architect", "w1:p1", None))
+        .await
+        .unwrap();
+    assert!(!claimed_identity.ok);
+    assert_eq!(
+        claimed_identity.error_code, None,
+        "fresh-Join admission rejection is not a connection-retired request"
     );
     service.stop().await;
     handle.await.unwrap();

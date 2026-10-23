@@ -61,7 +61,7 @@ fn accepted_only_counts_are_space_scoped_and_visible_in_either_tab() {
         TaskState::Review,
         TaskState::Paused,
         TaskState::Accepted,
-        TaskState::Cancelled,
+        TaskState::Queued,
     ]) {
         task.state = state;
     }
@@ -75,7 +75,8 @@ fn accepted_only_counts_are_space_scoped_and_visible_in_either_tab() {
         for (width, rows) in [(35, 12), (40, 16), (56, 34), (120, 30)] {
             let text = screen(&render(&snapshot, &view, width, rows, false));
             assert!(text.contains("Tasks 8"), "{text}");
-            assert!(text.contains("8 tasks · 1 accepted"), "{text}");
+            assert!(text.contains("1 queued"), "{text}");
+            assert!(text.contains("1 accepted"), "{text}");
             assert!(!text.contains("2 accepted"));
         }
     }
@@ -84,7 +85,78 @@ fn accepted_only_counts_are_space_scoped_and_visible_in_either_tab() {
         assert!(!view.navigate(KeyCode::Tab, &snapshot));
         let text = screen(&render(&snapshot, &view, 120, 30, false));
         assert!(text.contains("Tasks 8"), "{text}");
-        assert!(text.contains("8 tasks · 1 accepted"), "{text}");
+        assert!(text.contains("8 tasks · 1 queued · 1 accepted"), "{text}");
+    }
+}
+
+#[test]
+fn narrow_summary_keeps_complete_counts_near_max_tasks_in_both_tabs() {
+    let mut snapshot = many_tasks(1000);
+    for task in &mut snapshot.tasks {
+        task.state = TaskState::Active;
+    }
+    for task in &mut snapshot.tasks[..100] {
+        task.state = TaskState::Queued;
+    }
+    for task in &mut snapshot.tasks[100..988] {
+        task.state = TaskState::Accepted;
+    }
+
+    let labels = "100 queued · 888 accepted";
+    for tab in [WorkTab::Messages, WorkTab::Tasks] {
+        let mut view = selected_view(&snapshot);
+        view.work_tab = tab;
+        if tab == WorkTab::Tasks {
+            view.tasks.index = 999;
+            view.tasks.selected = Some(snapshot.tasks[999].id.clone());
+        }
+        for width in [35, 40] {
+            let text = screen(&render(&snapshot, &view, width, 30, false));
+            let summary_line = text
+                .lines()
+                .find(|line| line.contains(labels))
+                .unwrap_or_else(|| panic!("complete count labels were clipped:\n{text}"));
+            let title = summary_line
+                .split_once('╰')
+                .expect("summary is in the work-pane bottom title")
+                .1
+                .split_once('╯')
+                .expect("summary title keeps its right border")
+                .0
+                .trim()
+                .trim_end_matches('─')
+                .trim();
+            assert!(
+                title.ends_with(labels),
+                "incomplete title {title:?}:\n{text}"
+            );
+            assert!(
+                Line::raw(title).width() <= usize::from(width.saturating_sub(4)),
+                "summary exceeds its narrow-pane title budget:\n{text}"
+            );
+        }
+    }
+}
+
+#[test]
+fn queued_rows_show_fifo_positions_and_the_queue_count() {
+    let mut snapshot = many_tasks(3);
+    for (task, seq) in snapshot.tasks.iter_mut().zip([30, 10, 20]) {
+        task.owner = AgentId::new("lin");
+        task.seq = seq;
+        task.state = TaskState::Queued;
+    }
+    let view = tasks_view(&snapshot);
+    let text = screen(&render(&snapshot, &view, 120, 18, false));
+    assert!(text.contains("3 tasks · 3 queued · 0 accepted"), "{text}");
+    for (title, queue_label) in [
+        ("Task 000", "Queue #3"),
+        ("Task 001", "Queue #1"),
+        ("Task 002", "Queue #2"),
+    ] {
+        let (_, title_row) = position(&text, title);
+        let (_, queue_row) = position(&text, queue_label);
+        assert_eq!(queue_row, title_row + 1, "{text}");
     }
 }
 

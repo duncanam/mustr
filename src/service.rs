@@ -2,6 +2,8 @@
 
 use std::{
     collections::BTreeMap,
+    error::Error,
+    fmt,
     path::PathBuf,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -11,7 +13,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
     config::Scheduling,
-    hub::State,
+    hub::{State, TaskConflict},
     protocol::*,
     store::Store,
     watchers::{PrSnapshot, TodoSnapshot},
@@ -207,6 +209,17 @@ impl Service {
     }
 }
 
+#[derive(Debug)]
+struct ConnectionRetired;
+
+impl fmt::Display for ConnectionRetired {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("connection is retired; rejoin explicitly from the correct session")
+    }
+}
+
+impl Error for ConnectionRetired {}
+
 #[derive(Clone)]
 struct Binding {
     agent: AgentId,
@@ -288,10 +301,9 @@ impl Actor {
         self.connections
             .get(&connection)
             .map(|binding| {
-                ensure!(
-                    self.binding_valid(connection, binding),
-                    "connection is retired; rejoin explicitly from the correct session"
-                );
+                if !self.binding_valid(connection, binding) {
+                    return Err(ConnectionRetired.into());
+                }
                 Ok(binding.agent.clone())
             })
             .transpose()
@@ -433,7 +445,13 @@ impl Actor {
                         }
                         Err(error) => {
                             tracing::debug!(connection, error = %error, "request rejected");
-                            Response::failure(request.id, error)
+                            if error.downcast_ref::<TaskConflict>().is_some() {
+                                Response::task_conflict(request.id, error)
+                            } else if error.downcast_ref::<ConnectionRetired>().is_some() {
+                                Response::connection_retired(request.id, error)
+                            } else {
+                                Response::failure(request.id, error)
+                            }
                         }
                     };
                     let _ = reply.send(response);
@@ -629,7 +647,10 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    mod connection_retirement;
+    mod manager_cancel;
     mod reset;
+    mod task_conflicts;
 
     #[tokio::test]
     async fn dashboard_pr_enable_binds_the_exact_selected_live_member() {
@@ -896,7 +917,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn assignment_queue_failure_rolls_back_inserted_task_and_heartbeats_are_ephemeral() {
+    async fn assignment_capacity_persists_queued_task_and_heartbeats_are_ephemeral() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("hub.sqlite");
         let worker = AgentId::new("worker");
@@ -973,23 +994,48 @@ mod tests {
                     id: "assign".into(),
                     command: Command::Assign {
                         to: worker,
-                        title: "Must roll back".into(),
-                        text: "Queue is full".into(),
+                        title: "Persist in queue".into(),
+                        text: "Message queue is full".into(),
                     },
                 },
             )
             .await
             .unwrap();
-        assert!(!response.ok);
-        let snapshot = service.request(2, sync()).await.unwrap();
-        assert_eq!(snapshot.result.unwrap()["tasks"], json!([]));
         assert!(
-            Store::open(&path, SpaceId::new("w1"))
-                .unwrap()
-                .load()
-                .unwrap()
-                .tasks
-                .is_empty()
+            response.ok,
+            "assignment should be accepted into the queue: {:?}",
+            response.error
+        );
+        let assigned = response.result.unwrap();
+        assert_eq!(assigned["state"], "queued");
+        assert_eq!(assigned["queue_position"], 1);
+        assert_eq!(assigned["delivery"], "not_dispatched");
+        let task_id = TaskId::new(assigned["task_id"].as_str().unwrap());
+
+        let snapshot = service.request(2, sync()).await.unwrap();
+        let snapshot = snapshot.result.unwrap();
+        let tasks = snapshot["tasks"].as_array().unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0]["id"], task_id.as_str());
+        assert_eq!(tasks[0]["state"], "queued");
+
+        let stored = Store::open(&path, SpaceId::new("w1"))
+            .unwrap()
+            .load()
+            .unwrap();
+        assert_eq!(stored.tasks.len(), 1, "successful assignment is durable");
+        assert_eq!(stored.tasks[&task_id].state, TaskState::Queued);
+        assert_eq!(
+            stored.messages.len(),
+            1000,
+            "capacity does not evict uncertain deliveries"
+        );
+        assert!(
+            !stored
+                .messages
+                .iter()
+                .any(|message| { message.task_id.as_ref() == Some(&task_id) }),
+            "queued assignment has no envelope until promotion"
         );
         service.stop().await;
     }

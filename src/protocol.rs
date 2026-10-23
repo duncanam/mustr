@@ -116,6 +116,12 @@ pub(crate) enum Command {
         revision: u32,
         text: String,
     },
+    CancelOwnerTasks {
+        owner_id: AgentId,
+        scope: CancelScope,
+        expected_guard: String,
+        text: String,
+    },
     Ack {
         message_id: MessageId,
     },
@@ -253,6 +259,22 @@ pub(crate) enum ReportKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub(crate) enum CancelScope {
+    QueuedOnly,
+    AllUnfinished,
+}
+
+impl CancelScope {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::QueuedOnly => "queued_only",
+            Self::AllUnfinished => "all_unfinished",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum TaskState {
     Assigned,
     Active,
@@ -260,12 +282,17 @@ pub(crate) enum TaskState {
     Waiting,
     Review,
     Paused,
+    Queued,
     Accepted,
     Cancelled,
 }
 impl TaskState {
     pub fn finished(self) -> bool {
         matches!(self, Self::Accepted | Self::Cancelled)
+    }
+
+    pub fn holds_slot(self) -> bool {
+        !self.finished() && self != Self::Queued
     }
 }
 
@@ -322,6 +349,9 @@ pub(crate) struct Member {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Task {
     pub id: TaskId,
+    /// Global monotonic ordering key for the owner's FIFO queue.
+    #[serde(default)]
+    pub seq: u64,
     pub space_id: SpaceId,
     pub requester: AgentId,
     pub owner: AgentId,
@@ -435,8 +465,7 @@ pub(crate) struct Response {
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// Present only when live identity could not be checked and the request was
-    /// definitely rejected before actor execution. Not a command retry policy.
+    /// Optional typed outcome for a request that was definitely rejected before execution.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
 }
@@ -466,12 +495,62 @@ impl Response {
             ..Self::failure(id, error)
         }
     }
+
+    pub fn task_conflict(id: String, error: impl ToString) -> Self {
+        Self {
+            error_code: Some("task_conflict".into()),
+            ..Self::failure(id, error)
+        }
+    }
+
+    pub fn connection_retired(id: String, error: impl ToString) -> Self {
+        Self {
+            error_code: Some("connection_retired".into()),
+            ..Self::failure(id, error)
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn task_conflict_is_an_optional_rejected_error_code() {
+        let response = Response::task_conflict(
+            "stale-report".into(),
+            "stale task revision; refresh the roster before acting",
+        );
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["error_code"], "task_conflict");
+        assert!(!response.ok);
+        assert!(response.result.is_none());
+        assert_eq!(
+            serde_json::from_value::<Response>(value)
+                .unwrap()
+                .error_code,
+            response.error_code
+        );
+    }
+
+    #[test]
+    fn connection_retired_is_an_optional_preexecution_error_code() {
+        let response = Response::connection_retired(
+            "stale-connection".into(),
+            "connection is retired; rejoin explicitly from the correct session",
+        );
+        let value = serde_json::to_value(&response).unwrap();
+        assert_eq!(value["error_code"], "connection_retired");
+        assert!(!response.ok);
+        assert!(response.result.is_none());
+        assert_eq!(
+            serde_json::from_value::<Response>(value)
+                .unwrap()
+                .error_code,
+            response.error_code
+        );
+    }
 
     #[test]
     fn identity_unavailable_is_an_optional_preexecution_error_code() {
@@ -534,6 +613,33 @@ mod tests {
         assert!(automation.checkin_enabled);
         assert!(!automation.todo_enabled);
         assert!(!automation.pr_enabled);
+    }
+
+    #[test]
+    fn owner_cancellation_scope_is_required_and_wire_fields_are_strict() {
+        let valid = json!({
+            "id":"cancel-owner",
+            "op":"cancel_owner_tasks",
+            "owner_id":"owner",
+            "scope":"queued_only",
+            "expected_guard":"0123456789abcdef01234567",
+            "text":"Redirect this work"
+        });
+        let request: Request = serde_json::from_value(valid.clone()).unwrap();
+        assert!(matches!(
+            request.command,
+            Command::CancelOwnerTasks {
+                scope: CancelScope::QueuedOnly,
+                ..
+            }
+        ));
+        for invalid in [
+            json!({"id":"cancel-owner","op":"cancel_owner_tasks","owner_id":"owner","expected_guard":"guard","text":"reason"}),
+            json!({"id":"cancel-owner","op":"cancel_owner_tasks","owner_id":"owner","scope":"all","expected_guard":"guard","text":"reason"}),
+            json!({"id":"cancel-owner","op":"cancel_owner_tasks","owner_id":"owner","scope":"all_unfinished","expected_guard":"guard","text":"reason","extra":true}),
+        ] {
+            assert!(serde_json::from_value::<Request>(invalid).is_err());
+        }
     }
 
     #[test]

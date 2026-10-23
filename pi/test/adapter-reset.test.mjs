@@ -48,12 +48,11 @@ test("actual adapter commands replace factory/session/history only after one cla
   assertPrivate(f);
 });
 
-for (const gate of ["idle", "busy", "human", "paused", "editor", "dialog", "pending", "staged", "delivery"]) {
+for (const gate of ["idle", "busy", "paused", "editor", "dialog", "pending", "staged", "delivery"]) {
   test(`strict reset pre-claim safety gate: ${gate}`, async t => {
     const f = await resetFixture(t);
     if (gate === "idle") f.h.idle(false);
     if (gate === "busy") await f.h.emit("agent_start");
-    if (gate === "human") await f.h.emit("input", { source: "interactive" });
     if (gate === "paused") await f.h.commands.get("mustr").handler("pause", f.h.context);
     if (gate === "editor") f.h.editor("Unsent human draft");
     if (gate === "dialog") await f.h.emit("ui_prompt_start");
@@ -75,13 +74,23 @@ for (const gate of ["idle", "busy", "human", "paused", "editor", "dialog", "pend
   });
 }
 
-for (const race of ["editor", "pending", "human", "dialog", "topology", "connection", "generation"]) {
+test("reset readiness does not infer accepted input from an uncorrelated input hook", async t => {
+  const f = await resetFixture(t);
+  // Only native idle/pending/editor/dialog state is reset-readiness evidence.
+  await f.h.emit("input", { source: "interactive", text: "Not visible in Pi's pending queue" });
+  f.hub.prepare(); await f.discover();
+  await eventually(() => f.hub.completed && f.h.root.replacements === 1);
+  assert.equal(f.hub.claims, 1);
+  assert.equal(f.h.root.attempts, 1);
+  assertPrivate(f);
+});
+
+for (const race of ["editor", "pending", "dialog", "topology", "connection", "generation"]) {
   test(`post-claim race consumes attempt without replacement: ${race}`, async t => {
     const f = await resetFixture(t);
     f.hub.claimHook = async current => {
       if (race === "editor") f.h.editor("Arrived while claim awaited");
       if (race === "pending") f.h.pending(true);
-      if (race === "human") await f.h.emit("input", { source: "interactive" });
       if (race === "dialog") await f.h.emit("ui_prompt_start");
       if (race === "topology") f.f.panes.set("w1:p1", { pane_id: "w1:p1", workspace_id: "w2", agent: "pi" });
       if (race === "connection") current.close();

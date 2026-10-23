@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import net from "node:net";
 import { isAbsolute } from "node:path";
 import { fixture, eventually, pause } from "./fixture.mjs";
@@ -75,6 +75,99 @@ test("join is explicit, resolves the role, and keeps ordinary activity working",
   const duplicate = await mcp.tool("mustr_join", { role: "implementor" });
   assert.equal(duplicate.isError, true);
   assert.match(duplicate.content[0].text, /Already joined/);
+});
+
+test("default participant names hash full Claude identity and leave explicit names unchanged", { timeout: 60000 }, async t => {
+  const f = await fixture(t);
+  const longRole = "custom-role-with-a-very-long-name-for-testing";
+  await writeFile(`${f.env.MUSTR_CONFIG_DIR}/roles/${longRole}.md`, "Long custom role fixture.\n");
+  const firstId = "12345678-1111-4111-8111-111111111111";
+  const secondId = "12345678-2222-4222-8222-222222222222";
+  const { mcp: first } = f.startAdapter({ HERDR_PANE_ID: "w1:p1", MUSTR_TEST_AGENT_ID: firstId });
+  const { mcp: second } = f.startAdapter({ HERDR_PANE_ID: "w1:p2", MUSTR_TEST_AGENT_ID: secondId });
+  await initialize(first); await initialize(second);
+
+  const firstJoin = await joined(first, "researcher");
+  const secondJoin = await joined(second, "researcher");
+  assert.notEqual(firstJoin.name, secondJoin.name, "different full identities sharing eight leading characters get distinct defaults");
+  for (const value of [firstJoin, secondJoin]) {
+    assert.match(value.name, /^[a-z][a-z0-9-]{0,47}$/);
+    assert.ok(value.name.length <= 48);
+  }
+  const roster = resultValue(await first.tool("mustr_roster"));
+  const peers = roster.members.filter(member => member.role === "researcher");
+  assert.deepEqual(peers.map(member => [member.id, member.name, member.pane_id]).sort(), [
+    [firstId, firstJoin.name, "w1:p1"], [secondId, secondJoin.name, "w1:p2"],
+  ]);
+
+  await resultValue(await second.tool("mustr_leave"));
+  const collision = await second.tool("mustr_join", { role: "researcher", name: firstJoin.name });
+  assert.equal(collision.isError, true);
+  assert.match(collision.content[0].text, /name already in use in this space/);
+  const secondAgain = await joined(second, "researcher");
+  assert.equal(secondAgain.name, secondJoin.name, "a rejected explicit-name collision is not auto-retried or renamed");
+
+  await resultValue(await first.tool("mustr_leave"));
+  const repeated = await joined(first, "researcher");
+  assert.equal(repeated.name, firstJoin.name, "the same full process identity deterministically gets the same default");
+  await resultValue(await first.tool("mustr_leave"));
+  const explicit = resultValue(await first.tool("mustr_join", { role: "researcher", name: "explicitly-named" }));
+  assert.equal(explicit.name, "explicitly-named", "a supplied name is preserved exactly");
+  await resultValue(await first.tool("mustr_leave"));
+
+  const long = resultValue(await first.tool("mustr_join", { role: longRole }));
+  assert.equal(long.role, longRole);
+  assert.match(long.name, /^[a-z][a-z0-9-]{0,47}$/);
+  assert.ok(long.name.length <= 48);
+  assert.ok(long.name.startsWith(`${longRole.slice(0, 12).replace(/-+$/, "")}-`));
+});
+
+test("authoritative connection retirement closes Claude's client without Leave or automatic rejoin", { timeout: 60000 }, async t => {
+  const f = await fixture(t);
+  const requestLog = `${f.directory}/retired-requests.log`;
+  const { mcp } = f.startAdapter({ MUSTR_TEST_RETIRE_OP: "send", MUSTR_TEST_REQUEST_LOG: requestLog });
+  await initialize(mcp);
+  const peer = await f.observer();
+  const first = await joined(mcp);
+  const before = await readFile(requestLog, "utf8").catch(() => "");
+
+  const retired = await mcp.tool("mustr_send", { to: "peer", text: "This request is rejected before execution", wake: false });
+  assert.equal(retired.isError, true);
+  assert.match(retired.content[0].text, /retired or superseded this connection/);
+  assert.match(retired.content[0].text, /explicitly use mustr_join/);
+  const after = await readFile(requestLog, "utf8");
+  assert.equal(after.slice(before.length).trim().split("\n").filter(Boolean).filter(op => op === "send").length, 1);
+  assert.equal(after.slice(before.length).includes("leave\n"), false, "retirement cleanup sends no unverified Leave");
+
+  const noLongerJoined = await mcp.tool("mustr_roster");
+  assert.equal(noLongerJoined.isError, true);
+  assert.match(noLongerJoined.content[0].text, /Not joined/);
+  await eventually(async () => (await f.members(peer)).find(member => member.id === first.agent_id)?.activity === "offline");
+  await pause(1200);
+  assert.equal(await readFile(requestLog, "utf8"), after, "no heartbeat or automatic rejoin follows retirement");
+
+  const explicit = await joined(mcp);
+  assert.equal(explicit.agent_id, first.agent_id, "the existing session identity is reused only after explicit Join and admission");
+});
+
+test("authoritative connection retirement in Claude's heartbeat disconnects without retry or rejoin", { timeout: 60000 }, async t => {
+  const f = await fixture(t);
+  const requestLog = `${f.directory}/retired-heartbeat-requests.log`;
+  const { mcp } = f.startAdapter({
+    MUSTR_TEST_RETIRE_OP: "sync", MUSTR_TEST_RETIRE_AFTER: "2", MUSTR_TEST_REQUEST_LOG: requestLog,
+  });
+  await initialize(mcp);
+  const peer = await f.observer();
+  const first = await joined(mcp);
+  await eventually(() => mcp.stderr.includes("retired or superseded this connection"));
+  assert.equal((mcp.stderr.match(/retired or superseded this connection/g) ?? []).length, 1, "one actionable heartbeat notice is emitted");
+  await eventually(async () => (await f.members(peer)).find(member => member.id === first.agent_id)?.activity === "offline");
+  const after = await readFile(requestLog, "utf8");
+  const noLongerJoined = await mcp.tool("mustr_roster");
+  assert.equal(noLongerJoined.isError, true);
+  assert.match(noLongerJoined.content[0].text, /Not joined/);
+  await pause(1200);
+  assert.equal(await readFile(requestLog, "utf8"), after, "the heartbeat retirement does not reconnect or send follow-up work");
 });
 
 test("Claude Join advertises its absolute checkout without shell or model discovery", { timeout: 60000 }, async t => {
@@ -193,6 +286,35 @@ test("pause preserves an outstanding offer without receipt and permits roster/le
   const roster = resultValue(await mcp.tool("mustr_roster"));
   assert.equal(roster.tasks.find(task => task.id === assignment.task_id).state, "assigned", "pause did not acknowledge/activate the assignment");
   assert.equal(resultValue(await mcp.tool("mustr_leave")).left, true);
+});
+
+test("queued assignment reaches Claude only after an explicit wait and dispatch", { timeout: 60000 }, async t => {
+  const { f, mcp } = await setup(t);
+  const peer = await f.observer();
+  const joinedValue = await joined(mcp);
+
+  const assignment = await peer.request({
+    op: "assign",
+    to: joinedValue.agent_id,
+    title: "Wait for dispatch",
+    text: "Do not begin before the assignment message is returned by mustr_wait.",
+  });
+  assert.equal(assignment.state, "queued");
+  assert.equal(assignment.queue_position, 1);
+  const queued = resultValue(await mcp.tool("mustr_roster"));
+  assert.equal(queued.tasks.find(task => task.id === assignment.task_id).state, "queued");
+  assert.equal(queued.tasks.find(task => task.id === assignment.task_id).queue_position, 1);
+  assert.equal(queued.members.find(member => member.id === joinedValue.agent_id).task_queue.queued_count, 1);
+
+  const wait = mcp.send("tools/call", { name: "mustr_wait", arguments: { timeout_seconds: 10 } });
+  await waitUntilIdle(f, peer, joinedValue.agent_id);
+  const offer = await toolPromise(wait.promise);
+  assert.equal(offer.message.kind, "assignment");
+  assert.equal(offer.message.task_id, assignment.task_id);
+  assert.equal(offer.acknowledged, false);
+  assert.equal(resultValue(await mcp.tool("mustr_ack", { message_id: offer.message.id })).acknowledged, true);
+  const active = resultValue(await mcp.tool("mustr_roster"));
+  assert.equal(active.tasks.find(task => task.id === assignment.task_id).state, "active");
 });
 
 test("mixed task exchange acknowledges only after wait, supports guide and terminal report", { timeout: 60000 }, async t => {
