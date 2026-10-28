@@ -45,6 +45,45 @@ id_type!(SpaceId);
 id_type!(TaskId);
 id_type!(MessageId);
 
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct LaunchId(String);
+impl LaunchId {
+    pub(crate) fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct StartupGrantToken(String);
+impl StartupGrantToken {
+    pub(crate) fn new(value: String) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+impl fmt::Debug for StartupGrantToken {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("[REDACTED]")
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StartupGrant {
+    pub version: u32,
+    pub launch_id: LaunchId,
+    pub token: StartupGrantToken,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Request {
     pub id: String,
@@ -66,6 +105,8 @@ pub(crate) enum Command {
         cwd: Option<std::path::PathBuf>,
         #[serde(default)]
         reset: Option<ResetReceipt>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        startup_grant: Option<StartupGrant>,
     },
     /// Negotiate the single-attempt reset control protocol for this connection.
     ResetCapability,
@@ -499,6 +540,56 @@ mod tests {
                 .unwrap()
                 .error_code,
             response.error_code
+        );
+    }
+
+    #[test]
+    fn startup_grant_join_is_optional_strict_and_redacts_its_token() {
+        let manual: Request = serde_json::from_value(json!({
+            "id":"manual",
+            "op":"join",
+            "version":1,
+            "agent_id":"agent",
+            "name":"worker",
+            "role":"custom",
+            "pane_id":"w1:p1",
+            "space_id":"w1"
+        }))
+        .unwrap();
+        let manual_value = serde_json::to_value(&manual).unwrap();
+        assert!(manual_value.get("startup_grant").is_none());
+
+        let token = "fedcba9876543210fedcba9876543210";
+        let mut startup_value = json!({
+            "id":"startup",
+            "op":"join",
+            "version":1,
+            "agent_id":"startup-agent",
+            "name":"worker",
+            "role":"custom",
+            "pane_id":"w1:p1",
+            "space_id":"w1",
+            "startup_grant": {
+                "version": 1,
+                "launch_id": "0123456789abcdef0123456789abcdef",
+                "token": token
+            }
+        });
+        let startup: Request = serde_json::from_value(startup_value.clone())
+            .expect("versioned startup Join must decode");
+        assert_eq!(
+            serde_json::to_value(&startup).unwrap()["startup_grant"]["version"],
+            1
+        );
+        assert!(
+            !format!("{startup:?}").contains(token),
+            "Debug output must not reveal the startup bearer token"
+        );
+
+        startup_value["startup_grant"]["unexpected"] = json!(true);
+        assert!(
+            serde_json::from_value::<Request>(startup_value).is_err(),
+            "startup grant fields remain strict"
         );
     }
 

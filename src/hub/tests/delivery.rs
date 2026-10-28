@@ -188,6 +188,7 @@ fn disconnect_requires_explicit_guidance_even_after_reconnect_with_automation_on
                     space_id: SpaceId::new("w1"),
                     cwd: None,
                     reset: None,
+                    startup_grant: None,
                 },
             ),
             None,

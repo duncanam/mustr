@@ -5,6 +5,8 @@ import defaultFactory from "../index.ts";
 // lives in pi-reset.test.mjs and the independent production-runtime regression.
 export function harness(directory, options = {}) {
   const root = { states: [], errors: [], staleCalls: [], dispatches: [], replacements: 0, attempts: 0,
+    flagValues: new Map(options.flagValues instanceof Map ? options.flagValues : Object.entries(options.flagValues ?? {})),
+    flagReads: [], registeredFlags: new Map(),
     factory: options.factory ?? defaultFactory, cancel: false, cancelFirst: false, depth: 0 };
   function renderPromptSections(promptOptions) {
     if (promptOptions.forceSystemPrompt !== undefined) return promptOptions.forceSystemPrompt;
@@ -26,11 +28,7 @@ export function harness(directory, options = {}) {
         if (root.cancel && root.cancelFirst) return { cancelled: true };
         const before = await emit("session_before_switch", { reason: "new" });
         if (before.some(value => value?.cancel) || root.cancel) return { cancelled: true };
-        await emit("session_shutdown", { reason: "new" });
-        alive = false;
-        const next = create(`${options.sessionId ?? "pi-session"}-fresh-${++root.replacements}`);
-        root.current = next;
-        await root.factory(next.api); await next.emit("session_start", { reason: "new" });
+        const next = await root.replace("new", { beforeDone: true });
         await root.beforeFreshRestore?.(next);
         await opts.withSession?.(next.context);
         return { cancelled: false };
@@ -73,6 +71,8 @@ export function harness(directory, options = {}) {
       getActiveTools: () => { live("active tools"); return active; },
       setActiveTools: names => { live("set tools"); active = names; },
       on: (event, handler) => { const handlers = events.get(event) ?? []; handlers.push(handler); events.set(event, handlers); },
+      registerFlag: (name, definition) => root.registeredFlags.set(name, definition),
+      getFlag: name => { root.flagReads.push(name); return root.flagValues.get(name); },
       registerCommand: (name, value) => commands.set(name, value), registerTool: definition => tools.set(definition.name, definition),
       appendEntry: (customType, data) => { live("append"); entries.push({ type: "custom", customType, data }); },
       sendUserMessage(text, opts) { live("old command dispatch"); void Promise.resolve().then(() => dispatch(text, opts)).catch(error => root.errors.push(error)); },
@@ -85,11 +85,27 @@ export function harness(directory, options = {}) {
     const state = { api, context, emit, commands, tools, entries, messages, notifications, statuses, root,
       prompt: async base => { const event = { systemPrompt: base ?? "" }; await emit("before_agent_start", event); return { text: event.systemPrompt, options: event.systemPromptOptions }; },
       active: () => active, editor: text => { editor = text; }, pending: value => { pending = value; }, idle: value => { idle = value; },
-      deferInsertion: value => { deferInsertion = value; }, insert,
+      deferInsertion: value => { deferInsertion = value; }, insert, invalidate: () => { alive = false; },
       settle: async (aborted = false) => { idle = true; await emit("agent_settled", { aborted }); },
     };
     root.states.push(state); return state;
   }
   root.current = create(options.sessionId ?? "pi-session");
+  root.replace = async (reason, { beforeDone = false } = {}) => {
+    const current = root.current;
+    if (!beforeDone) {
+      const event = reason === "fork" ? "session_before_fork" : "session_before_switch";
+      const payload = reason === "fork" ? { entryId: "fixture-entry", position: "before" } : { reason };
+      const before = await current.emit(event, payload);
+      if (before.some(value => value?.cancel)) return undefined;
+    }
+    await current.emit("session_shutdown", { reason });
+    current.invalidate();
+    const next = create(`${options.sessionId ?? "pi-session"}-fresh-${++root.replacements}`);
+    root.current = next;
+    await root.factory(next.api);
+    await next.emit("session_start", { reason });
+    return next;
+  };
   return root.current;
 }

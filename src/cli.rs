@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use clap_verbosity_flag::{InfoLevel, Verbosity};
+use color_eyre::eyre::{Result, bail, ensure};
 
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
@@ -11,6 +12,10 @@ pub(crate) struct Cli {
     /// Configuration directory (defaults to $XDG_CONFIG_HOME/mustr or ~/.config/mustr).
     #[arg(long, env = "MUSTR_CONFIG_DIR", global = true)]
     pub config_dir: Option<PathBuf>,
+
+    /// Start with the named profile from profiles.toml (default startup or interactive run only).
+    #[arg(long, global = true)]
+    pub profile: Option<String>,
 
     #[command(flatten)]
     pub verbosity: Verbosity<InfoLevel>,
@@ -71,10 +76,82 @@ pub(crate) enum InstallTarget {
     },
 }
 
+pub(crate) fn validate_profile_command(cli: &Cli) -> Result<()> {
+    let Some(profile) = cli.profile.as_deref() else {
+        return Ok(());
+    };
+    ensure!(
+        !profile.trim().is_empty(),
+        "--profile name must not be blank"
+    );
+
+    match cli.command.as_ref() {
+        None | Some(Command::Run { headless: false }) => Ok(()),
+        Some(Command::Run { headless: true }) => {
+            bail!("--profile cannot be used with `run --headless`")
+        }
+        Some(_) => bail!("--profile is only valid for default startup or `run`"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn profile_option_is_accepted_before_or_after_run() {
+        let default = Cli::try_parse_from(["mustr", "--profile", "feature"]).unwrap();
+        assert_eq!(default.profile.as_deref(), Some("feature"));
+        assert!(default.command.is_none());
+
+        let run = Cli::try_parse_from(["mustr", "run", "--profile", "feature"]).unwrap();
+        assert_eq!(run.profile.as_deref(), Some("feature"));
+        assert!(matches!(
+            run.command,
+            Some(Command::Run { headless: false })
+        ));
+    }
+
+    #[test]
+    fn profile_validation_allows_only_default_or_interactive_run() {
+        for args in [
+            vec!["mustr"],
+            vec!["mustr", "--profile", "feature"],
+            vec!["mustr", "run", "--profile", "feature"],
+            vec!["mustr", "run", "--headless"],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(validate_profile_command(&cli).is_ok());
+        }
+
+        for args in [
+            vec!["mustr", "init", "--profile", "feature"],
+            vec!["mustr", "roles", "--profile", "feature"],
+            vec!["mustr", "install", "pi", "--profile", "feature"],
+            vec!["mustr", "context", "--profile", "feature"],
+            vec!["mustr", "run", "--headless", "--profile", "feature"],
+            vec!["mustr", "--profile", ""],
+            vec!["mustr", "run", "--profile", "   "],
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(validate_profile_command(&cli).is_err());
+        }
+    }
+
+    #[test]
+    fn plain_and_plain_headless_commands_have_no_profile() {
+        let plain = Cli::try_parse_from(["mustr"]).unwrap();
+        assert!(plain.profile.is_none());
+        assert!(plain.command.is_none());
+
+        let headless = Cli::try_parse_from(["mustr", "run", "--headless"]).unwrap();
+        assert!(headless.profile.is_none());
+        assert!(matches!(
+            headless.command,
+            Some(Command::Run { headless: true })
+        ));
+    }
 
     #[test]
     fn cli_is_consistent() {

@@ -215,6 +215,12 @@ async fn accept_loop(
     while clients.join_next().await.is_some() {}
 }
 
+async fn retire_startup_grant(service: &Service, token: &mut Option<StartupGrantToken>) {
+    if let Some(token) = token.take() {
+        let _ = service.retire_startup_grant(token).await;
+    }
+}
+
 async fn connection(
     stream: UnixStream,
     id: u64,
@@ -284,15 +290,65 @@ async fn connection(
                 break;
             }
         };
+        let mut startup_grant_token = None;
+        if let Command::Join {
+            role,
+            pane_id,
+            space_id,
+            reset,
+            startup_grant: Some(grant),
+            ..
+        } = &request.command
+        {
+            let token = grant.token.clone();
+            match service
+                .consume_startup_grant(
+                    grant.clone(),
+                    role.clone(),
+                    pane_id.clone(),
+                    space_id.clone(),
+                )
+                .await
+            {
+                Ok(()) => startup_grant_token = Some(token),
+                Err(error) => {
+                    let response = Response::failure(request.id, error);
+                    write
+                        .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
+                        .await?;
+                    break;
+                }
+            }
+            if reset.is_some() {
+                retire_startup_grant(service, &mut startup_grant_token).await;
+                let response = Response::failure(
+                    request.id,
+                    "startup grants cannot be combined with a reset receipt",
+                );
+                write
+                    .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
+                    .await?;
+                break;
+            }
+        }
         let role_manager = if let Command::Join { role, .. } = &request.command {
             let roles_dir = roles_dir.to_path_buf();
             let role = role.clone();
-            let validation = tokio::task::spawn_blocking(move || roles::resolve(&roles_dir, &role))
-                .await
-                .map_err(|error| eyre!("role validation worker failed: {error}"))?;
+            let validation = match tokio::task::spawn_blocking(move || {
+                roles::resolve(&roles_dir, &role)
+            })
+            .await
+            {
+                Ok(validation) => validation,
+                Err(error) => {
+                    retire_startup_grant(service, &mut startup_grant_token).await;
+                    return Err(eyre!("role validation worker failed: {error}"));
+                }
+            };
             match validation {
                 Ok(resolved) => Some(resolved.manager),
                 Err(error) => {
+                    retire_startup_grant(service, &mut startup_grant_token).await;
                     let response = Response::failure(request.id, error);
                     write
                         .write_all(format!("{}\n", serde_json::to_string(&response)?).as_bytes())
@@ -303,6 +359,7 @@ async fn connection(
         } else {
             None
         };
+        let startup_pi_only = startup_grant_token.is_some();
         let check = match &request.command {
             Command::Join {
                 pane_id, space_id, ..
@@ -321,12 +378,17 @@ async fn connection(
                         && harness.as_ref().is_none_or(|bound| Some(bound) == pane.agent.as_ref()),
                     "pane moved, disappeared, or changed its supported agent (Pi/Claude Code); rejoin explicitly"
                 );
+                ensure!(
+                    !startup_pi_only || pane.agent.as_deref() == Some("pi"),
+                    "startup grants may only join a Pi pane"
+                );
                 Ok::<_, color_eyre::Report>(pane.agent)
             }
             .await;
             match validation {
                 Ok(agent) => checked_harness = agent,
                 Err(error) => {
+                    retire_startup_grant(service, &mut startup_grant_token).await;
                     // Only an already-authenticated connection can survive an
                     // unavailable lookup. No actor request (including sync or
                     // ACK) has executed; every later command validates afresh.

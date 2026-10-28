@@ -3,10 +3,11 @@
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use color_eyre::eyre::{Result, ensure, eyre};
+use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::{
@@ -16,6 +17,8 @@ use crate::{
     store::Store,
     watchers::{PrSnapshot, TodoSnapshot},
 };
+
+mod startup_grants;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PrSelection {
@@ -27,7 +30,30 @@ pub(crate) struct PrSelection {
     pub cwd: PathBuf,
 }
 
+pub(crate) struct IssuedStartupGrant {
+    pub handoff: StartupGrant,
+    pub issued_at: Instant,
+    pub deadline: Instant,
+}
+
 pub(crate) enum Event {
+    IssueStartupGrant {
+        launch_id: LaunchId,
+        role: String,
+        pane_id: String,
+        reply: oneshot::Sender<std::result::Result<IssuedStartupGrant, String>>,
+    },
+    ConsumeStartupGrant {
+        grant: StartupGrant,
+        role: String,
+        pane_id: String,
+        space_id: SpaceId,
+        reply: oneshot::Sender<std::result::Result<(), String>>,
+    },
+    RetireStartupGrant {
+        token: StartupGrantToken,
+        reply: oneshot::Sender<()>,
+    },
     Request {
         connection: u64,
         request: Request,
@@ -122,6 +148,64 @@ impl Service {
         );
         self.request_with_role(connection, request, Some(manager))
             .await
+    }
+
+    pub async fn issue_startup_grant(
+        &self,
+        launch_id: LaunchId,
+        role: String,
+        pane_id: String,
+    ) -> Result<IssuedStartupGrant> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(Event::IssueStartupGrant {
+                launch_id,
+                role,
+                pane_id,
+                reply,
+            })
+            .await
+            .map_err(|_| eyre!("hub stopped before startup grant issuance"))?;
+        response
+            .await
+            .map_err(|_| eyre!("hub stopped before startup grant issuance reply"))?
+            .map_err(|error| eyre!(error))
+    }
+
+    pub async fn consume_startup_grant(
+        &self,
+        grant: StartupGrant,
+        role: String,
+        pane_id: String,
+        space_id: SpaceId,
+    ) -> Result<()> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(Event::ConsumeStartupGrant {
+                grant,
+                role,
+                pane_id,
+                space_id,
+                reply,
+            })
+            .await
+            .map_err(|_| eyre!("hub stopped before startup grant consumption"))?;
+        response
+            .await
+            .map_err(|_| eyre!("hub stopped before startup grant consumption reply"))?
+            .map_err(|error| eyre!(error))
+    }
+
+    pub async fn retire_startup_grant(&self, token: StartupGrantToken) -> Result<()> {
+        let (reply, response) = oneshot::channel();
+        self.tx
+            .send(Event::RetireStartupGrant { token, reply })
+            .await
+            .map_err(|_| eyre!("hub stopped before startup grant retirement"))?;
+        response
+            .await
+            .map_err(|_| eyre!("hub stopped before startup grant retirement reply"))?;
+        Ok(())
     }
 
     async fn request_with_role(
@@ -232,6 +316,7 @@ struct Actor {
     space: Option<Space>,
     error: Option<String>,
     snapshots: watch::Sender<Snapshot>,
+    startup_grants: startup_grants::Ledger,
 }
 
 impl Actor {
@@ -257,6 +342,7 @@ impl Actor {
             space: None,
             error: None,
             snapshots,
+            startup_grants: startup_grants::Ledger::new(),
         })
     }
 
@@ -368,16 +454,98 @@ impl Actor {
     fn run(&mut self, mut rx: mpsc::Receiver<Event>) {
         while let Some(event) = rx.blocking_recv() {
             let now = now();
+            let monotonic_now = Instant::now();
             match event {
+                Event::IssueStartupGrant {
+                    launch_id,
+                    role,
+                    pane_id,
+                    reply,
+                } => {
+                    let result = if self.state.reset_frozen(&self.space_id) {
+                        Err("space is frozen; startup grant cannot be issued".to_owned())
+                    } else {
+                        self.startup_grants
+                            .issue(
+                                launch_id,
+                                role,
+                                pane_id,
+                                self.space_id.clone(),
+                                monotonic_now,
+                            )
+                            .map_err(str::to_owned)
+                    };
+                    let _ = reply.send(result);
+                }
+                Event::ConsumeStartupGrant {
+                    grant,
+                    role,
+                    pane_id,
+                    space_id,
+                    reply,
+                } => {
+                    let reset_frozen = self.state.reset_frozen(&space_id);
+                    let result = self
+                        .startup_grants
+                        .consume(
+                            grant,
+                            &role,
+                            &pane_id,
+                            &space_id,
+                            monotonic_now,
+                            reset_frozen,
+                        )
+                        .map_err(str::to_owned);
+                    let _ = reply.send(result);
+                }
+                Event::RetireStartupGrant { token, reply } => {
+                    self.startup_grants.retire(&token);
+                    let _ = reply.send(());
+                }
                 Event::Request {
                     connection,
                     request,
                     role_manager,
                     reply,
                 } => {
+                    let has_startup_grant = matches!(
+                        &request.command,
+                        Command::Join {
+                            startup_grant: Some(_),
+                            ..
+                        }
+                    );
+                    let startup_authorization = match &request.command {
+                        Command::Join {
+                            role,
+                            pane_id,
+                            space_id,
+                            reset,
+                            startup_grant: Some(grant),
+                            ..
+                        } => self
+                            .startup_grants
+                            .authorize_join(
+                                grant,
+                                role,
+                                pane_id,
+                                space_id,
+                                monotonic_now,
+                                self.state.reset_frozen(space_id),
+                            )
+                            .and_then(|()| {
+                                if reset.is_some() {
+                                    Err("startup grants cannot be combined with a reset receipt")
+                                } else {
+                                    Ok(())
+                                }
+                            })
+                            .map_err(|error| eyre!(error)),
+                        _ => Ok(()),
+                    };
                     let mut next = self.state.clone();
-                    let result = self
-                        .sender(connection)
+                    let result = startup_authorization
+                        .and_then(|()| self.sender(connection))
                         .and_then(|sender| match role_manager {
                             Some(manager) => next.apply_validated_join(
                                 &request,
@@ -407,7 +575,7 @@ impl Actor {
                             Ok(value)
                         });
                     let response = match result {
-                        Ok(value) => {
+                        Ok(mut value) => {
                             if let Command::Join {
                                 agent_id, space_id, ..
                             } = &request.command
@@ -428,6 +596,9 @@ impl Actor {
                                 && self.incarnations.get(&binding.agent) == Some(&connection)
                             {
                                 self.incarnations.remove(&binding.agent);
+                            }
+                            if has_startup_grant && let Some(result) = value.as_object_mut() {
+                                result.insert("startup_grant_protocol".into(), Value::from(1));
                             }
                             Response::success(request.id, value)
                         }
@@ -549,6 +720,9 @@ impl Actor {
                 }
                 Event::ResetStart { preview, reply } => {
                     let result = self.start_reset(preview).map_err(|e| e.to_string());
+                    if result.is_ok() {
+                        self.startup_grants.clear();
+                    }
                     let _ = reply.send(result);
                 }
                 Event::ResetAbandon {
@@ -581,6 +755,7 @@ impl Actor {
                     let _ = reply.send(result);
                 }
                 Event::Stop(reply) => {
+                    self.startup_grants.clear();
                     let mut next = self.state.clone();
                     next.recover();
                     if let Err(error) = self.commit(next) {
@@ -612,6 +787,7 @@ impl Actor {
                     }
                 }
             }
+            self.startup_grants.prune_expired(monotonic_now);
             self.publish_snapshot(now);
         }
     }
@@ -630,6 +806,458 @@ mod tests {
     use serde_json::json;
 
     mod reset;
+
+    #[tokio::test]
+    async fn startup_grant_issuance_is_bound_and_never_persisted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hub.sqlite");
+        let space = SpaceId::new("w1");
+        let service = Service::start(space.clone(), path.clone(), Scheduling::default())
+            .await
+            .unwrap();
+        let issued = service
+            .issue_startup_grant(
+                LaunchId::new("launch-1".into()),
+                "reviewer".into(),
+                "w1:p9".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            issued.deadline - issued.issued_at,
+            std::time::Duration::from_secs(60)
+        );
+        let token = issued.handoff.token.as_str().to_owned();
+        let mismatch = service
+            .consume_startup_grant(
+                issued.handoff.clone(),
+                "researcher".into(),
+                "w1:p9".into(),
+                space.clone(),
+            )
+            .await
+            .unwrap_err();
+        assert!(!mismatch.to_string().contains(&token));
+        assert!(
+            service
+                .consume_startup_grant(issued.handoff, "reviewer".into(), "w1:p9".into(), space,)
+                .await
+                .is_err(),
+            "a mismatched recognized token is burned"
+        );
+        assert!(
+            !serde_json::to_string(&*service.snapshots.borrow())
+                .unwrap()
+                .contains(&token)
+        );
+        assert!(
+            !serde_json::to_string(
+                &Store::open(&path, SpaceId::new("w1"))
+                    .unwrap()
+                    .load()
+                    .unwrap()
+            )
+            .unwrap()
+            .contains(&token)
+        );
+        service.stop().await;
+    }
+
+    #[tokio::test]
+    async fn direct_service_join_rejects_a_matching_but_unconsumed_grant() {
+        let directory = tempfile::tempdir().unwrap();
+        let space = SpaceId::new("w1");
+        let service = Service::start(
+            space.clone(),
+            directory.path().join("hub.sqlite"),
+            Scheduling::default(),
+        )
+        .await
+        .unwrap();
+        let issued = service
+            .issue_startup_grant(
+                LaunchId::new("direct-unconsumed".into()),
+                "reviewer".into(),
+                "w1:p1".into(),
+            )
+            .await
+            .unwrap();
+        let mut snapshots = service.snapshots.clone();
+        snapshots.borrow_and_update();
+        let response = service
+            .join(
+                1,
+                Request {
+                    id: "unconsumed-startup-join".into(),
+                    command: Command::Join {
+                        version: VERSION,
+                        agent_id: AgentId::new("startup-agent"),
+                        name: "startup-agent".into(),
+                        role: "reviewer".into(),
+                        pane_id: "w1:p1".into(),
+                        space_id: space.clone(),
+                        cwd: None,
+                        reset: None,
+                        startup_grant: Some(issued.handoff.clone()),
+                    },
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(!response.ok);
+        assert!(response.result.is_none());
+        assert!(response.error.as_deref().is_some_and(|error| {
+            error.contains("startup grant was not consumed at the Join boundary")
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(1), snapshots.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(snapshots.borrow().members.is_empty());
+        assert!(
+            service
+                .consume_startup_grant(issued.handoff, "reviewer".into(), "w1:p1".into(), space,)
+                .await
+                .is_err(),
+            "direct Join cannot leave a reusable unconsumed grant"
+        );
+        service.stop().await;
+    }
+
+    #[tokio::test]
+    async fn startup_grant_identity_mismatches_burn_recognized_tokens() {
+        let directory = tempfile::tempdir().unwrap();
+        let space = SpaceId::new("w1");
+        let service = Service::start(
+            space.clone(),
+            directory.path().join("hub.sqlite"),
+            Scheduling::default(),
+        )
+        .await
+        .unwrap();
+
+        for (index, mismatch) in ["version", "launch", "role", "pane", "space"]
+            .into_iter()
+            .enumerate()
+        {
+            let issued = service
+                .issue_startup_grant(
+                    LaunchId::new(format!("launch-{index}")),
+                    "reviewer".into(),
+                    "w1:p9".into(),
+                )
+                .await
+                .unwrap();
+            let mut grant = issued.handoff.clone();
+            let mut role = "reviewer".to_owned();
+            let mut pane = "w1:p9".to_owned();
+            let mut presented_space = space.clone();
+            match mismatch {
+                "version" => grant.version = 2,
+                "launch" => grant.launch_id = LaunchId::new("other-launch".into()),
+                "role" => role = "researcher".into(),
+                "pane" => pane = "w1:p8".into(),
+                "space" => presented_space = SpaceId::new("w2"),
+                _ => unreachable!(),
+            }
+            assert!(
+                service
+                    .consume_startup_grant(grant, role, pane, presented_space,)
+                    .await
+                    .is_err(),
+                "{mismatch} mismatch must reject"
+            );
+            assert!(
+                service
+                    .consume_startup_grant(
+                        issued.handoff,
+                        "reviewer".into(),
+                        "w1:p9".into(),
+                        space.clone(),
+                    )
+                    .await
+                    .is_err(),
+                "{mismatch} mismatch must spend the recognized token"
+            );
+        }
+        service.stop().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_startup_grant_claims_have_one_winner() {
+        let directory = tempfile::tempdir().unwrap();
+        let space = SpaceId::new("w1");
+        let service = Service::start(
+            space.clone(),
+            directory.path().join("hub.sqlite"),
+            Scheduling::default(),
+        )
+        .await
+        .unwrap();
+        let issued = service
+            .issue_startup_grant(
+                LaunchId::new("launch-race".into()),
+                "reviewer".into(),
+                "w1:p9".into(),
+            )
+            .await
+            .unwrap();
+        let claim = |grant| {
+            service.consume_startup_grant(grant, "reviewer".into(), "w1:p9".into(), space.clone())
+        };
+        let (first, second) = tokio::join!(claim(issued.handoff.clone()), claim(issued.handoff));
+        assert_ne!(first.is_ok(), second.is_ok());
+        service.stop().await;
+    }
+
+    #[tokio::test]
+    async fn retired_and_previous_run_startup_grants_never_authorize() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hub.sqlite");
+        let space = SpaceId::new("w1");
+        let service = Service::start(space.clone(), path.clone(), Scheduling::default())
+            .await
+            .unwrap();
+        let retired = service
+            .issue_startup_grant(
+                LaunchId::new("launch-retired".into()),
+                "reviewer".into(),
+                "w1:p9".into(),
+            )
+            .await
+            .unwrap();
+        service
+            .retire_startup_grant(retired.handoff.token.clone())
+            .await
+            .unwrap();
+        assert!(
+            service
+                .consume_startup_grant(
+                    retired.handoff,
+                    "reviewer".into(),
+                    "w1:p9".into(),
+                    space.clone(),
+                )
+                .await
+                .is_err()
+        );
+
+        let previous_run = service
+            .issue_startup_grant(
+                LaunchId::new("launch-old-run".into()),
+                "reviewer".into(),
+                "w1:p9".into(),
+            )
+            .await
+            .unwrap();
+        service.stop().await;
+        let next_run = Service::start(space.clone(), path, Scheduling::default())
+            .await
+            .unwrap();
+        assert!(
+            next_run
+                .consume_startup_grant(
+                    previous_run.handoff,
+                    "reviewer".into(),
+                    "w1:p9".into(),
+                    space,
+                )
+                .await
+                .is_err()
+        );
+        next_run.stop().await;
+    }
+
+    #[tokio::test]
+    async fn startup_grants_are_spent_when_normal_join_admission_rejects() {
+        let directory = tempfile::tempdir().unwrap();
+        let space = SpaceId::new("w1");
+        let service = Service::start(
+            space.clone(),
+            directory.path().join("hub.sqlite"),
+            Scheduling::default(),
+        )
+        .await
+        .unwrap();
+        let join = |id: &str, agent: &str, name: &str, pane: &str, startup_grant| Request {
+            id: id.into(),
+            command: Command::Join {
+                version: VERSION,
+                agent_id: AgentId::new(agent),
+                name: name.into(),
+                role: "reviewer".into(),
+                pane_id: pane.into(),
+                space_id: space.clone(),
+                cwd: None,
+                reset: None,
+                startup_grant,
+            },
+        };
+        let existing = service
+            .join(
+                1,
+                join("existing", "existing-agent", "shared", "w1:p1", None),
+                true,
+            )
+            .await
+            .unwrap();
+        assert!(existing.ok);
+
+        for (id, agent, name, pane, manager, expected) in [
+            (
+                "duplicate-name",
+                "name-agent",
+                "shared",
+                "w1:p2",
+                false,
+                "name already",
+            ),
+            (
+                "duplicate-pane",
+                "pane-agent",
+                "new-name",
+                "w1:p1",
+                false,
+                "already occupies",
+            ),
+            (
+                "second-manager",
+                "manager-agent",
+                "manager-two",
+                "w1:p3",
+                true,
+                "another manager",
+            ),
+        ] {
+            let grant = service
+                .issue_startup_grant(
+                    LaunchId::new(format!("launch-{id}")),
+                    "reviewer".into(),
+                    pane.into(),
+                )
+                .await
+                .unwrap()
+                .handoff;
+            service
+                .consume_startup_grant(grant.clone(), "reviewer".into(), pane.into(), space.clone())
+                .await
+                .unwrap();
+            let rejected = service
+                .join(2, join(id, agent, name, pane, Some(grant.clone())), manager)
+                .await
+                .unwrap();
+            assert!(!rejected.ok);
+            assert!(
+                rejected
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains(expected)),
+                "{id}: {:?}",
+                rejected.error
+            );
+            assert!(
+                rejected.result.is_none(),
+                "rejected startup admission has no capability acknowledgement"
+            );
+            assert!(
+                service
+                    .consume_startup_grant(grant, "reviewer".into(), pane.into(), space.clone(),)
+                    .await
+                    .is_err(),
+                "{id} rejection must leave the grant spent"
+            );
+        }
+        assert_eq!(service.snapshots.borrow().members.len(), 1);
+        service.stop().await;
+    }
+
+    #[tokio::test]
+    async fn startup_grant_is_spent_when_participant_capacity_rejects_join() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("hub.sqlite");
+        let space = SpaceId::new("w1");
+        let mut state = State::new(space.clone());
+        for index in 0..256 {
+            let agent_id = AgentId::new(format!("existing-{index}"));
+            state.members.insert(
+                agent_id.clone(),
+                Member {
+                    id: agent_id,
+                    name: format!("member-{index}"),
+                    role: "reviewer".into(),
+                    pane_id: format!("w1:p{index}"),
+                    space_id: space.clone(),
+                    manager: false,
+                    cwd: None,
+                    activity: Activity::Offline,
+                    last_seen: 0,
+                    idle_since: 0,
+                },
+            );
+        }
+        Store::open(&path, space.clone())
+            .unwrap()
+            .save(&state)
+            .unwrap();
+        let service = Service::start(space.clone(), path, Scheduling::default())
+            .await
+            .unwrap();
+        let grant = service
+            .issue_startup_grant(
+                LaunchId::new("capacity-launch".into()),
+                "reviewer".into(),
+                "w1:p257".into(),
+            )
+            .await
+            .unwrap()
+            .handoff;
+        service
+            .consume_startup_grant(
+                grant.clone(),
+                "reviewer".into(),
+                "w1:p257".into(),
+                space.clone(),
+            )
+            .await
+            .unwrap();
+        let response = service
+            .join(
+                1,
+                Request {
+                    id: "capacity-reject".into(),
+                    command: Command::Join {
+                        version: VERSION,
+                        agent_id: AgentId::new("new-agent"),
+                        name: "new-agent".into(),
+                        role: "reviewer".into(),
+                        pane_id: "w1:p257".into(),
+                        space_id: space.clone(),
+                        cwd: None,
+                        reset: None,
+                        startup_grant: Some(grant.clone()),
+                    },
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(!response.ok);
+        assert!(
+            response
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("capacity"))
+        );
+        assert!(response.result.is_none());
+        assert!(
+            service
+                .consume_startup_grant(grant, "reviewer".into(), "w1:p257".into(), space,)
+                .await
+                .is_err()
+        );
+        service.stop().await;
+    }
 
     #[tokio::test]
     async fn dashboard_pr_enable_binds_the_exact_selected_live_member() {
@@ -666,6 +1294,7 @@ mod tests {
                         space_id: space.clone(),
                         cwd: Some(checkout.path().to_path_buf()),
                         reset: None,
+                        startup_grant: None,
                     },
                 },
             )
@@ -747,6 +1376,7 @@ mod tests {
                 space_id: space.clone(),
                 cwd: Some(cwd.to_path_buf()),
                 reset: None,
+                startup_grant: None,
             },
         };
         service
@@ -939,6 +1569,7 @@ mod tests {
                             space_id: SpaceId::new("w1"),
                             cwd: None,
                             reset: None,
+                            startup_grant: None,
                         },
                     },
                 )

@@ -47,6 +47,10 @@ impl Paths {
         self.config.join("roles")
     }
 
+    pub fn profiles(&self) -> PathBuf {
+        self.config.join("profiles.toml")
+    }
+
     pub fn instance_state(&self, server_key: &str, instance_key: &str) -> PathBuf {
         self.state.join(server_key).join(instance_key)
     }

@@ -293,6 +293,7 @@ impl State {
             space_id,
             cwd,
             reset,
+            ..
         } = command
         {
             self.validate_space(space_id)?;

@@ -17,6 +17,7 @@ use ratatui::{
 };
 
 use crate::{
+    profile_startup::{EntryOutcome, EntryState, ProfileProgress},
     protocol::*,
     service::{Service, now},
 };
@@ -79,6 +80,153 @@ impl TaskBrowse {
     }
 }
 
+#[derive(Clone, Default)]
+struct ProfileRow {
+    role: String,
+    outcome: Option<EntryOutcome>,
+}
+
+#[derive(Clone, Default)]
+struct ProfileView {
+    rows: Vec<ProfileRow>,
+    next_finished: usize,
+    scroll: usize,
+    total: usize,
+    visible: std::ops::Range<usize>,
+    cancelling: bool,
+}
+
+impl ProfileView {
+    fn apply(&mut self, progress: ProfileProgress) {
+        match progress {
+            ProfileProgress::Starting { index, total, role } => {
+                self.total = total;
+                self.rows.resize_with(total, ProfileRow::default);
+                if let Some(row) = index
+                    .checked_sub(1)
+                    .and_then(|index| self.rows.get_mut(index))
+                {
+                    row.role = role;
+                    row.outcome = None;
+                }
+            }
+            ProfileProgress::Finished(outcome) => {
+                let index = self.next_finished;
+                if self.rows.len() <= index {
+                    self.rows.resize_with(index + 1, ProfileRow::default);
+                }
+                let row = &mut self.rows[index];
+                if row.role.is_empty() {
+                    row.role = outcome.role.clone();
+                }
+                row.outcome = Some(outcome);
+                self.next_finished = index + 1;
+            }
+        }
+    }
+
+    fn complete_error(&mut self) {
+        for row in &mut self.rows {
+            if row.outcome.is_none() && !row.role.is_empty() {
+                row.outcome = Some(EntryOutcome {
+                    role: row.role.clone(),
+                    pane_id: None,
+                    state: EntryState::Uncertain,
+                    reason: "profile coordinator ended before reporting an outcome".into(),
+                });
+            }
+        }
+        self.total = self.rows.len();
+        self.next_finished = self.rows.len();
+    }
+
+    fn replace_outcomes(&mut self, outcomes: Vec<EntryOutcome>) {
+        self.rows = outcomes
+            .into_iter()
+            .map(|outcome| ProfileRow {
+                role: outcome.role.clone(),
+                outcome: Some(outcome),
+            })
+            .collect();
+        self.total = self.rows.len();
+        self.next_finished = self.rows.len();
+        self.scroll = self.scroll.min(self.rows.len().saturating_sub(1));
+    }
+
+    fn populated_len(&self) -> usize {
+        self.rows
+            .iter()
+            .rposition(|row| !row.role.is_empty())
+            .map_or(0, |index| index + 1)
+    }
+
+    fn row_text(&self, index: usize) -> String {
+        let Some(row) = self.rows.get(index) else {
+            return String::new();
+        };
+        let (state, pane, reason) = match &row.outcome {
+            Some(outcome) => (
+                match outcome.state {
+                    EntryState::Joined => "joined",
+                    EntryState::Failed => "failed",
+                    EntryState::Uncertain => "uncertain",
+                },
+                outcome.pane_id.as_deref().unwrap_or("not created"),
+                outcome.reason.as_str(),
+            ),
+            None if self.cancelling => (
+                "cancel requested",
+                "pending",
+                "waiting for the current Herdr command to finish",
+            ),
+            None => ("starting", "pending", "waiting for hub admission"),
+        };
+        format!(
+            "{}/{} {} · {} · pane {} · {}",
+            index + 1,
+            self.total.max(self.rows.len()),
+            clean(&row.role),
+            state,
+            clean(pane),
+            clean(reason)
+        )
+    }
+
+    fn row_height(&self, index: usize, width: u16) -> usize {
+        let width = usize::from(width.max(1));
+        Line::raw(self.row_text(index))
+            .width()
+            .max(1)
+            .div_ceil(width)
+    }
+
+    fn visible_range(&mut self, width: u16, available_lines: usize) -> std::ops::Range<usize> {
+        let populated = self.populated_len();
+        self.scroll = self.scroll.min(populated.saturating_sub(1));
+        let mut used = 0;
+        let mut end = self.scroll;
+        while end < populated {
+            let height = self.row_height(end, width);
+            if used + height > available_lines {
+                break;
+            }
+            used += height;
+            end += 1;
+        }
+        self.visible = self.scroll..end;
+        self.visible.clone()
+    }
+
+    fn move_scroll(&mut self, forward: bool) {
+        let last = self.populated_len().saturating_sub(1);
+        self.scroll = if forward {
+            self.scroll.saturating_add(1).min(last)
+        } else {
+            self.scroll.saturating_sub(1)
+        };
+    }
+}
+
 #[derive(Clone)]
 struct View {
     space_id: SpaceId,
@@ -89,6 +237,7 @@ struct View {
     pr_dialog: Option<pr_ui::Dialog>,
     help: bool,
     notice: String,
+    profile: Option<ProfileView>,
 }
 
 impl View {
@@ -102,6 +251,7 @@ impl View {
             pr_dialog: None,
             help: false,
             notice: String::new(),
+            profile: None,
         }
     }
 
@@ -166,42 +316,195 @@ impl View {
     }
 }
 
-pub(crate) async fn run(service: Service, color: bool) -> Result<()> {
+pub(crate) struct ProfileUi {
+    pub progress: tokio::sync::mpsc::UnboundedReceiver<ProfileProgress>,
+    pub cancel: tokio::sync::watch::Sender<bool>,
+    pub coordinator: Option<tokio::task::JoinHandle<Result<Vec<EntryOutcome>>>>,
+}
+
+type ProfileCoordinatorResult =
+    std::result::Result<Result<Vec<EntryOutcome>>, tokio::task::JoinError>;
+
+async fn collect_profile_result(
+    profile: &mut Option<ProfileUi>,
+) -> Option<ProfileCoordinatorResult> {
+    let coordinator = profile.as_mut()?.coordinator.take()?;
+    Some(coordinator.await)
+}
+
+async fn cancel_and_collect_profile(
+    profile: &mut Option<ProfileUi>,
+) -> Option<ProfileCoordinatorResult> {
+    if let Some(profile) = profile.as_mut() {
+        profile.cancel.send_replace(true);
+    }
+    collect_profile_result(profile).await
+}
+
+fn attach_profile_result(
+    error: color_eyre::eyre::Report,
+    result: Option<&ProfileCoordinatorResult>,
+) -> color_eyre::eyre::Report {
+    match result {
+        Some(Ok(Ok(outcomes))) => {
+            error.wrap_err(format!("profile coordinator outcomes: {outcomes:?}"))
+        }
+        Some(Ok(Err(coordinator_error))) => {
+            error.wrap_err(format!("profile coordinator failed: {coordinator_error:#}"))
+        }
+        Some(Err(join_error)) => {
+            error.wrap_err(format!("profile coordinator task failed: {join_error}"))
+        }
+        None => error,
+    }
+}
+
+pub(crate) fn ensure_terminal() -> Result<()> {
     ensure!(
         io::stdin().is_terminal() && io::stdout().is_terminal(),
         "dashboard needs a terminal; use mustr run --headless"
     );
-    // color-eyre's panic hook is installed first; Ratatui wraps it to restore terminal state.
-    let mut terminal = ratatui::try_init()?;
-    let result = event_loop(&mut terminal, service, color).await;
-    let restored = ratatui::try_restore();
-    result?;
-    restored?;
     Ok(())
+}
+
+pub(crate) async fn run(
+    service: Service,
+    color: bool,
+    mut profile: Option<ProfileUi>,
+) -> Result<()> {
+    let mut profile_result = None;
+    if let Err(error) = ensure_terminal() {
+        profile_result = cancel_and_collect_profile(&mut profile).await;
+        return Err(attach_profile_result(error, profile_result.as_ref()));
+    }
+    // color-eyre's panic hook is installed first; Ratatui wraps it to restore terminal state.
+    let mut terminal = match ratatui::try_init() {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            profile_result = cancel_and_collect_profile(&mut profile).await;
+            return Err(attach_profile_result(error.into(), profile_result.as_ref()));
+        }
+    };
+    let result = event_loop(
+        &mut terminal,
+        service,
+        color,
+        &mut profile,
+        &mut profile_result,
+    )
+    .await;
+    if result.is_err()
+        && let Some(profile) = &profile
+    {
+        profile.cancel.send_replace(true);
+    }
+    let restored = ratatui::try_restore();
+    if profile_result.is_none() {
+        profile_result = collect_profile_result(&mut profile).await;
+    }
+    result.map_err(|error| attach_profile_result(error, profile_result.as_ref()))?;
+    restored.map_err(|error| attach_profile_result(error.into(), profile_result.as_ref()))?;
+    Ok(())
+}
+
+enum ProfileSignal {
+    Progress(Option<ProfileProgress>),
+    Coordinator(ProfileCoordinatorResult),
+}
+
+async fn next_profile_signal(profile: &mut ProfileUi, progress_open: bool) -> ProfileSignal {
+    let progress = &mut profile.progress;
+    let coordinator = profile.coordinator.as_mut();
+    tokio::select! {
+        event = async {
+            if progress_open {
+                progress.recv().await
+            } else {
+                std::future::pending().await
+            }
+        } => ProfileSignal::Progress(event),
+        result = async {
+            match coordinator {
+                Some(coordinator) => coordinator.await,
+                None => std::future::pending().await,
+            }
+        } => ProfileSignal::Coordinator(result),
+    }
 }
 
 async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     service: Service,
     color: bool,
+    profile: &mut Option<ProfileUi>,
+    profile_result: &mut Option<ProfileCoordinatorResult>,
 ) -> Result<()> {
     let mut events = EventStream::new();
     let mut snapshots = service.snapshots.clone();
     let mut view = View::in_space(snapshots.borrow().space_id.clone());
+    if profile.is_some() {
+        view.profile = Some(ProfileView::default());
+    }
+    let mut profile_complete = profile.is_none();
+    let mut profile_progress_open = true;
+    let mut snapshots_open = true;
+    let mut exit_requested = false;
+    let mut cancel_sent = false;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
+        if exit_requested && !cancel_sent {
+            if !profile_complete && let Some(profile) = profile.as_mut() {
+                profile.cancel.send_replace(true);
+                if let Some(view) = view.profile.as_mut() {
+                    view.cancelling = true;
+                }
+            }
+            cancel_sent = true;
+        }
         let snapshot = snapshots.borrow().clone();
         view.reconcile(&snapshot);
         terminal.draw(|frame| draw(frame, &snapshot, &mut view, color))?;
+        if exit_requested && profile_complete {
+            break;
+        }
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => break,
-            _ = terminate.recv() => break,
+            _ = tokio::signal::ctrl_c(), if !exit_requested => { exit_requested = true; },
+            _ = terminate.recv(), if !exit_requested => { exit_requested = true; },
             _ = tick.tick() => {},
-            changed = snapshots.changed() => { if changed.is_err() { break; } },
-            event = events.next() => match event {
+            changed = snapshots.changed(), if snapshots_open => {
+                if changed.is_err() {
+                    snapshots_open = false;
+                    exit_requested = true;
+                }
+            },
+            signal = async {
+                match profile.as_mut() {
+                    Some(profile) => next_profile_signal(profile, profile_progress_open).await,
+                    None => std::future::pending().await,
+                }
+            }, if !profile_complete => match signal {
+                ProfileSignal::Progress(Some(progress)) => {
+                    if let Some(view) = view.profile.as_mut() { view.apply(progress); }
+                }
+                ProfileSignal::Progress(None) => profile_progress_open = false,
+                ProfileSignal::Coordinator(result) => {
+                    profile_complete = true;
+                    *profile_result = Some(result);
+                    if let Some(view) = view.profile.as_mut() {
+                        match profile_result.as_ref().expect("coordinator result was retained") {
+                            Ok(Ok(outcomes)) => view.replace_outcomes(outcomes.clone()),
+                            Ok(Err(_)) | Err(_) => view.complete_error(),
+                        }
+                    }
+                }
+            },
+            event = events.next(), if !exit_requested => match event {
                 Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
-                    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) { break; }
+                    if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                        exit_requested = true;
+                        continue;
+                    }
                     if let Some(action) = view.reset_key(key.code, &snapshot) {
                         match action {
                             reset_ui::Action::None => {},
@@ -252,7 +555,13 @@ async fn event_loop(
                                 }
                             });
                         },
-                        KeyCode::Char('q') => break,
+                        KeyCode::Char('q') => exit_requested = true,
+                        KeyCode::Char('[') if view.profile.is_some() => {
+                            if let Some(profile) = view.profile.as_mut() { profile.move_scroll(false); }
+                        }
+                        KeyCode::Char(']') if view.profile.is_some() => {
+                            if let Some(profile) = view.profile.as_mut() { profile.move_scroll(true); }
+                        }
                         KeyCode::Char('?') => view.help = !view.help,
                         KeyCode::Esc => view.help = false,
                         code if view.navigate(code, &snapshot) => {},
@@ -306,9 +615,12 @@ async fn event_loop(
                     }
                 }
                 Some(Err(error)) => return Err(error.into()),
-                None => break,
+                None => exit_requested = true,
                 _ => {},
             }
+        }
+        if profile_complete && let Some(profile) = profile.as_mut() {
+            profile.coordinator.take();
         }
     }
     Ok(())
@@ -418,19 +730,47 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, view: &mut View, color: bool) {
     // watcher details before squeezing away the work pane's tabs/count border.
     let reserved = if spacious { 10 } else { 8 } + u16::from(area.height >= 18);
     mode_lines.truncate(usize::from(area.height.saturating_sub(reserved)));
+    let header_height = if spacious { 3 } else { 2 };
+    let top_height = header_height
+        + u16::from(spacious)
+        + height(mode_lines.len())
+        + u16::from(area.height >= 18);
+    let footer_budget = usize::from(area.height.saturating_sub(top_height.saturating_add(1)));
+    let priority = footer_priority_status(snapshot, view, color);
+    let profile_hints = if view.profile.is_some() {
+        profile_footer_hints(snapshot, view, color)
+    } else {
+        Vec::new()
+    };
+    let hint_lines = profile_hints
+        .iter()
+        .map(|hint| hint.width().max(1).div_ceil(usize::from(area.width.max(1))))
+        .sum::<usize>();
+    let footer_height = if let Some(profile) = &mut view.profile {
+        let notice_lines = usize::from(priority.is_none() && !view.notice.is_empty());
+        let base_lines = 1 + usize::from(priority.is_some()) + notice_lines + hint_lines;
+        let available = footer_budget.saturating_sub(base_lines);
+        let visible = profile.visible_range(area.width, available);
+        let result_lines = visible
+            .map(|index| profile.row_height(index, area.width))
+            .sum::<usize>();
+        height((base_lines + result_lines).max(2))
+    } else {
+        2
+    };
     let [header, _, modes, _, body, footer] = Layout::vertical([
-        Constraint::Length(if spacious { 3 } else { 2 }),
+        Constraint::Length(header_height),
         Constraint::Length(u16::from(spacious)),
         Constraint::Length(height(mode_lines.len())),
         Constraint::Length(u16::from(area.height >= 18)),
         Constraint::Min(1),
-        Constraint::Length(2),
+        Constraint::Length(footer_height),
     ])
     .areas(area);
     draw_header(frame, header, snapshot, view, color);
     frame.render_widget(Paragraph::new(mode_lines), modes);
     if view.help {
-        draw_help(frame, body, color);
+        draw_help(frame, body, color, view.profile.is_some());
     } else if view.space(snapshot).is_some() {
         let space = view.space_id.clone();
         draw_space(frame, body, snapshot, &space, automation, view, color);
@@ -1120,11 +1460,16 @@ fn message_preview(text: &str) -> String {
     preview
 }
 
-fn draw_help(frame: &mut Frame, area: Rect, color: bool) {
-    let controls = vec![
+fn draw_help(frame: &mut Frame, area: Rect, color: bool, profile: bool) {
+    let mut controls = vec![
         Line::styled("Keyboard", accent(color).add_modifier(Modifier::BOLD)),
         Line::raw("f               Messages / Tasks"),
         Line::raw("↑ ↓ / k j       scroll active tab"),
+    ];
+    if profile {
+        controls.push(Line::raw("[ / ]           browse profile startup results"));
+    }
+    controls.extend([
         Line::raw("t  TODO / continuation on/off"),
         Line::raw("c  manager check-ins on/off"),
         Line::raw("p  PR watcher on/off or discover"),
@@ -1134,7 +1479,7 @@ fn draw_help(frame: &mut Frame, area: Rect, color: bool) {
         Line::raw(""),
         Line::raw("One dashboard per space;"),
         Line::raw("launch mustr in other spaces."),
-    ];
+    ]);
     let workflow = vec![
         Line::styled(
             "Connect your workflow",
@@ -1175,47 +1520,63 @@ fn draw_help(frame: &mut Frame, area: Rect, color: bool) {
     }
 }
 
-fn draw_footer(frame: &mut Frame, area: Rect, snapshot: &Snapshot, view: &View, color: bool) {
-    let keys = if view.help {
-        "? / Esc close help · q quit"
-    } else if area.width < 64 {
-        "f view r reset ? help q quit"
-    } else if area.width < 96 {
-        "f view · ↑↓/jk scroll · r reset · ? help · q quit"
-    } else {
-        "f Msgs/Tasks  ↑↓/jk scroll  t TODO c Check-ins p PR on/off/discover  r reset  ? help  q quit"
-    };
+fn footer_priority_status(snapshot: &Snapshot, view: &View, color: bool) -> Option<Line<'static>> {
     let error = snapshot.error.as_deref().filter(|s| !s.is_empty());
-    let status = if let Some(error) = error {
-        Line::styled(
+    if let Some(error) = error {
+        Some(Line::styled(
             format!("! {}", clean(error)),
             tone(color, Color::Red).add_modifier(Modifier::BOLD),
-        )
+        ))
     } else if view.space(snapshot).is_none() {
-        Line::styled(
+        Some(Line::styled(
             format!(
                 "! Space {} unavailable; dashboard remains bound",
                 clean(view.space_id.as_str())
             ),
             tone(color, Color::Yellow).add_modifier(Modifier::BOLD),
-        )
+        ))
     } else if view
         .reset(snapshot)
         .is_some_and(|reset| matches!(reset.state, ResetPhase::Prepared | ResetPhase::Incomplete))
     {
-        Line::styled(
+        Some(Line::styled(
             "Reset incomplete · r for status",
             tone(color, Color::Yellow).add_modifier(Modifier::BOLD),
-        )
-    } else if !view.notice.is_empty() {
+        ))
+    } else {
+        None
+    }
+}
+
+fn profile_footer_hints(snapshot: &Snapshot, view: &View, color: bool) -> Vec<Line<'static>> {
+    let mut hints = Vec::new();
+    if snapshot
+        .tasks
+        .iter()
+        .any(|task| task.space_id == view.space_id && task.state == TaskState::Paused)
+    {
+        hints.push(Line::styled(
+            "Paused task: requester must guide/cancel; automation will not resume it",
+            tone(color, Color::Yellow),
+        ));
+    }
+    hints.push(Line::styled(
+        "q cancels unfinished profile startup; launched agents stay open",
+        muted(),
+    ));
+    hints
+}
+
+fn idle_footer_status(snapshot: &Snapshot, view: &View, width: u16, color: bool) -> Line<'static> {
+    if !view.notice.is_empty() {
         Line::raw(clean(&view.notice))
     } else if snapshot
         .tasks
         .iter()
-        .any(|t| t.space_id == view.space_id && t.state == TaskState::Paused)
+        .any(|task| task.space_id == view.space_id && task.state == TaskState::Paused)
     {
         Line::styled(
-            if area.width < 60 {
+            if width < 60 {
                 "Paused task: ask requester to guide"
             } else {
                 "Paused work: requester must reconcile then guide/cancel; automation will not resume it"
@@ -1224,23 +1585,52 @@ fn draw_footer(frame: &mut Frame, area: Rect, snapshot: &Snapshot, view: &View, 
         )
     } else {
         Line::styled(
-            if area.width < 60 {
+            if width < 60 {
                 "Quit leaves agents open."
             } else {
                 "Check-in follows manager · activity is not completion · quit leaves agents open"
             },
             muted(),
         )
+    }
+}
+
+fn draw_footer(frame: &mut Frame, area: Rect, snapshot: &Snapshot, view: &View, color: bool) {
+    let keys = if view.help {
+        "? / Esc close help · q quit"
+    } else if view.profile.is_some() {
+        "f view · [/] profile results · r reset · ? help · q quit"
+    } else if area.width < 64 {
+        "f view r reset ? help q quit"
+    } else if area.width < 96 {
+        "f view · ↑↓/jk scroll · r reset · ? help · q quit"
+    } else {
+        "f Msgs/Tasks  ↑↓/jk scroll  t TODO c Check-ins p PR on/off/discover  r reset  ? help  q quit"
     };
-    frame.render_widget(
-        Paragraph::new(vec![Line::styled(keys, muted()), status]),
-        area,
-    );
+    let mut lines = vec![Line::styled(elide(keys, area.width), muted())];
+    let priority = footer_priority_status(snapshot, view, color);
+    let has_priority = priority.is_some();
+    if let Some(status) = priority {
+        lines.push(status);
+    }
+    if let Some(profile) = &view.profile {
+        lines.extend(profile_footer_hints(snapshot, view, color));
+        for index in profile.visible.clone() {
+            lines.push(Line::raw(profile.row_text(index)));
+        }
+        if !view.notice.is_empty() && !has_priority {
+            lines.push(Line::raw(clean(&view.notice)));
+        }
+    } else if !has_priority {
+        lines.push(idle_footer_status(snapshot, view, area.width, color));
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile_startup::{EntryOutcome, EntryState, ProfileProgress};
     use ratatui::{Terminal, backend::TestBackend, buffer::Buffer};
 
     mod manager;
@@ -1421,6 +1811,312 @@ mod tests {
                     .map(|column| (Line::raw(&line[..column]).width(), row))
             })
             .unwrap_or_else(|| panic!("missing {text:?} in:\n{screen}"))
+    }
+
+    #[test]
+    fn profile_outcomes_are_all_inspectable_in_order_in_the_existing_footer() {
+        let mut snapshot = populated();
+        snapshot.tasks[0].state = TaskState::Paused;
+        let roles = ["reviewer", "researcher", "reviewer", "implementor"];
+        let mut profile = ProfileView::default();
+        for (index, role) in roles.iter().enumerate() {
+            profile.apply(ProfileProgress::Starting {
+                index: index + 1,
+                total: roles.len(),
+                role: (*role).into(),
+            });
+            profile.apply(ProfileProgress::Finished(EntryOutcome {
+                role: (*role).into(),
+                pane_id: Some(format!("w1:p{}", index + 9)),
+                state: if index == 2 {
+                    EntryState::Failed
+                } else {
+                    EntryState::Joined
+                },
+                reason: if index == 2 {
+                    "not attempted after agent rejection"
+                } else {
+                    "new member admitted"
+                }
+                .into(),
+            }));
+        }
+        let mut view = selected_view(&snapshot);
+        view.profile = Some(profile);
+
+        let text = screen(&render(&snapshot, &view, 120, 24, false));
+        let first = text.find("reviewer").expect("first role appears");
+        let second = text.find("researcher").expect("second role appears");
+        let third = text
+            .rfind("reviewer")
+            .expect("repeated role appears independently");
+        let fourth = text.find("implementor").expect("fourth role appears");
+        assert!(first < second && second < third && third < fourth, "{text}");
+        for pane in ["w1:p9", "w1:p10", "w1:p11", "w1:p12"] {
+            assert!(text.contains(pane), "missing pane {pane} in:\\n{text}");
+        }
+        assert!(
+            text.contains("not attempted after agent rejection"),
+            "{text}"
+        );
+        assert!(text.contains("new member admitted"), "{text}");
+        assert!(
+            text.contains("Paused task: requester must guide/cancel"),
+            "{text}"
+        );
+        assert!(
+            text.contains("q cancels unfinished profile startup; launched agents stay open"),
+            "{text}"
+        );
+        assert!(
+            text.contains("["),
+            "profile footer should advertise outcome navigation: {text}"
+        );
+    }
+
+    #[test]
+    fn profile_footer_keeps_rows_and_hints_beside_priority_status() {
+        let mut base = populated();
+        base.tasks[0].state = TaskState::Paused;
+        let mut profile = ProfileView::default();
+        for (index, role) in ["researcher", "reviewer"].iter().enumerate() {
+            profile.apply(ProfileProgress::Starting {
+                index: index + 1,
+                total: 2,
+                role: (*role).into(),
+            });
+            profile.apply(ProfileProgress::Finished(EntryOutcome {
+                role: (*role).into(),
+                pane_id: Some(format!("w1:p{}", index + 9)),
+                state: EntryState::Uncertain,
+                reason: "admission remains uncertain".into(),
+            }));
+        }
+
+        let mut error = base.clone();
+        error.error = Some("fixture connection failed".into());
+        let mut unavailable = base.clone();
+        unavailable.space = None;
+        let mut reset = base;
+        reset.reset = Some(ResetSummary {
+            plan_id: "plan".into(),
+            space_id: SpaceId::new("w1"),
+            state: ResetPhase::Prepared,
+            participants: Vec::new(),
+            note: "waiting for participants".into(),
+        });
+
+        for (snapshot, priority) in [
+            (error, "! fixture connection failed"),
+            (
+                unavailable,
+                "! Space w1 unavailable; dashboard remains bound",
+            ),
+            (reset, "Reset incomplete · r for status"),
+        ] {
+            let mut view = selected_view(&snapshot);
+            view.profile = Some(profile.clone());
+            let text = screen(&render(&snapshot, &view, 120, 30, false));
+            assert!(
+                text.contains(priority),
+                "missing priority {priority:?}:\n{text}"
+            );
+            assert!(
+                text.contains(
+                    "Paused task: requester must guide/cancel; automation will not resume it"
+                ),
+                "{text}"
+            );
+            assert!(
+                text.contains("q cancels unfinished profile startup; launched agents stay open"),
+                "{text}"
+            );
+            assert!(text.contains("[/] profile results"), "{text}");
+            for row in [
+                "researcher",
+                "reviewer",
+                "w1:p9",
+                "w1:p10",
+                "admission remains uncertain",
+            ] {
+                assert!(
+                    text.contains(row),
+                    "missing profile content {row:?}:\n{text}"
+                );
+            }
+            assert!(
+                view.reset_dialog.is_none(),
+                "priority status must not open an overlay"
+            );
+            assert!(
+                !text.contains("Start fresh?"),
+                "reset priority is not a confirmation panel:\n{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn profile_footer_scroll_handler_changes_and_clamps_the_small_terminal_row_range() {
+        let mut base = populated();
+        base.tasks[0].state = TaskState::Paused;
+        base.automation = Automation::default();
+
+        let mut error = base.clone();
+        error.error = Some("fixture connection failed".into());
+        let mut reset = base;
+        reset.reset = Some(ResetSummary {
+            plan_id: "plan".into(),
+            space_id: SpaceId::new("w1"),
+            state: ResetPhase::Prepared,
+            participants: Vec::new(),
+            note: "waiting for participants".into(),
+        });
+
+        let mut profile = ProfileView::default();
+        for index in 0..8 {
+            let role = format!("role-{index}");
+            profile.apply(ProfileProgress::Starting {
+                index: index + 1,
+                total: 8,
+                role: role.clone(),
+            });
+            profile.apply(ProfileProgress::Finished(EntryOutcome {
+                role,
+                pane_id: Some(format!("w1:p{}", index + 90)),
+                state: EntryState::Joined,
+                reason: "admitted".into(),
+            }));
+        }
+
+        for (snapshot, priority) in [
+            (error, "! fixture connection failed"),
+            (reset, "Reset incomplete · r for status"),
+        ] {
+            let assert_footer_context = |text: &str, view: &View| {
+                assert!(text.contains(priority), "{text}");
+                assert!(
+                    text.contains(
+                        "Paused task: requester must guide/cancel; automation will not resume it"
+                    ),
+                    "{text}"
+                );
+                assert!(
+                    text.contains(
+                        "q cancels unfinished profile startup; launched agents stay open"
+                    ),
+                    "{text}"
+                );
+                assert!(text.contains("[/] profile results"), "{text}");
+                assert!(!text.contains("Start fresh?"), "{text}");
+                assert!(view.reset_dialog.is_none() && view.pr_dialog.is_none());
+            };
+            let mut view = selected_view(&snapshot);
+            view.profile = Some(profile.clone());
+            let first_buffer = render_view(&snapshot, &mut view, 80, 12, false);
+            let first_text = screen(&first_buffer);
+            let first_range = view.profile.as_ref().unwrap().visible.clone();
+
+            assert_eq!(
+                first_range.start, 0,
+                "the footer starts at its first result"
+            );
+            assert!(
+                first_range.end < 8,
+                "the small terminal forces footer overflow"
+            );
+            assert!(first_text.contains("role-0"), "{first_text}");
+            assert_footer_context(&first_text, &view);
+
+            // This is the same row-scroll handler dispatched by the event loop's `]` key.
+            view.profile.as_mut().unwrap().move_scroll(true);
+            let next_buffer = render_view(&snapshot, &mut view, 80, 12, false);
+            let next_text = screen(&next_buffer);
+            let next_range = view.profile.as_ref().unwrap().visible.clone();
+            assert_eq!(next_range.start, first_range.start + 1);
+            assert!(next_text.contains("role-1"), "{next_text}");
+            assert!(!next_text.contains("role-0"), "{next_text}");
+            assert_footer_context(&next_text, &view);
+
+            for _ in 0..10 {
+                view.profile.as_mut().unwrap().move_scroll(true);
+            }
+            let bottom_buffer = render_view(&snapshot, &mut view, 80, 12, false);
+            let bottom_text = screen(&bottom_buffer);
+            let bottom_range = view.profile.as_ref().unwrap().visible.clone();
+            assert!(bottom_range.start > 0);
+            assert_eq!(bottom_range.end, 8, "the last result remains reachable");
+            assert!(bottom_text.contains("role-7"), "{bottom_text}");
+            assert_footer_context(&bottom_text, &view);
+
+            view.profile.as_mut().unwrap().move_scroll(true);
+            let clamped_buffer = render_view(&snapshot, &mut view, 80, 12, false);
+            assert_eq!(view.profile.as_ref().unwrap().visible, bottom_range);
+            assert_eq!(
+                screen(&clamped_buffer),
+                bottom_text,
+                "downward scrolling clamps at the last result"
+            );
+            assert_footer_context(&screen(&clamped_buffer), &view);
+
+            for _ in 0..10 {
+                view.profile.as_mut().unwrap().move_scroll(false);
+            }
+            let top_buffer = render_view(&snapshot, &mut view, 80, 12, false);
+            let top_range = view.profile.as_ref().unwrap().visible.clone();
+            assert_eq!(top_range.start, 0);
+            let top_text = screen(&top_buffer);
+            assert!(top_text.contains("role-0"));
+            assert_footer_context(&top_text, &view);
+
+            view.profile.as_mut().unwrap().move_scroll(false);
+            let clamped_top_buffer = render_view(&snapshot, &mut view, 80, 12, false);
+            assert_eq!(view.profile.as_ref().unwrap().visible, top_range);
+            assert_eq!(
+                screen(&clamped_top_buffer),
+                top_text,
+                "upward scrolling clamps at the first result"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_failure_cancels_drains_and_preserves_profile_outcomes() {
+        let (_progress_tx, progress) = tokio::sync::mpsc::unbounded_channel();
+        let (cancel, mut cancelled) = tokio::sync::watch::channel(false);
+        let coordinator = tokio::spawn(async move {
+            cancelled
+                .changed()
+                .await
+                .expect("TUI failure must cancel profile startup");
+            Ok(vec![EntryOutcome {
+                role: "researcher".into(),
+                pane_id: Some("w1:p9".into()),
+                state: EntryState::Uncertain,
+                reason: "agent start remained ambiguous after launch cancellation".into(),
+            }])
+        });
+        let mut profile = Some(ProfileUi {
+            progress,
+            cancel,
+            coordinator: Some(coordinator),
+        });
+
+        let completed = cancel_and_collect_profile(&mut profile)
+            .await
+            .expect("TUI failure drains the owned profile coordinator");
+        let error = attach_profile_result(
+            color_eyre::eyre::eyre!("terminal initialization failed"),
+            Some(&completed),
+        );
+        let diagnostic = format!("{error:#}");
+
+        assert!(profile.as_ref().unwrap().coordinator.is_none());
+        assert!(diagnostic.contains("terminal initialization failed"));
+        assert!(diagnostic.contains("profile coordinator outcomes"));
+        assert!(diagnostic.contains("researcher"));
+        assert!(diagnostic.contains("Uncertain"));
+        assert!(diagnostic.contains("launch cancellation"));
+        assert!(!diagnostic.contains("private-startup-token-marker"));
     }
 
     #[test]

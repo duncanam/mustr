@@ -1,6 +1,11 @@
 //! Read-only herdr socket client. Never reads terminal output or session files.
 
-use std::{env, fmt, fs, io, os::unix::fs::MetadataExt, path::PathBuf, time::Duration};
+use std::{
+    env, fmt, fs, io,
+    os::unix::fs::MetadataExt,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use color_eyre::eyre::{Context, Result, ensure, eyre};
 use serde::{Deserialize, Serialize};
@@ -73,6 +78,8 @@ pub(crate) struct Discovery {
     pub socket: PathBuf,
     pub pane_id: String,
     pub space_id: SpaceId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 impl Herdr {
@@ -92,6 +99,10 @@ impl Herdr {
         let stamp = (meta.dev(), meta.ino(), meta.ctime(), meta.ctime_nsec());
         let key = digest(format!("{}:{stamp:?}", socket.display()));
         Ok(Self { socket, stamp, key })
+    }
+
+    pub(crate) fn socket_path(&self) -> &Path {
+        &self.socket
     }
 
     pub fn instance_key(&self, space: &SpaceId) -> String {
@@ -179,6 +190,7 @@ impl Herdr {
             socket: self.hub_socket(&pane.workspace_id)?,
             pane_id: pane.pane_id,
             space_id: pane.workspace_id,
+            agent: pane.agent,
         })
     }
 

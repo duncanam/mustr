@@ -27,7 +27,9 @@ Open separate Pi sessions in other tabs of the same space, then select **one rol
 | Implementor's tab | `/role implementor` |
 | Optional reviewer's tab | `/role reviewer` |
 
-Roles can be selected before the hub starts. Agents keep their own normal conversations. Closing mustr disconnects coordination; it does **not** kill agents or external jobs.
+Roles can be selected before the hub starts. For a new interactive hub, an ordered Pi profile can start several roles in separate tabs: `mustr --profile team` or `mustr run --profile team`. Profiles are opt-in; plain startup and manual `/role` remain unchanged. Profile startup requires the Herdr 0.9.5 CLI, cannot run headless, and will not attach to a hub already running in that space. Its dashboard shows partial outcomes; `q` cancels unfinished startup but leaves launched agents open. See [profile startup](docs/configuration.md#profile-startup) for the roles-only file format, validation, and recovery guidance.
+
+Agents keep their own normal conversations. Closing mustr disconnects coordination; it does **not** kill agents or external jobs.
 
 | Dashboard key | Action |
 |---|---|
@@ -37,6 +39,7 @@ Roles can be selected before the hub starts. Agents keep their own normal conver
 | `f` | Switch Messages / Tasks tab |
 | `r` | Start fresh in this space / inspect reset status (confirmation required) |
 | `↑` / `↓`, `k` / `j` | Scroll messages or browse tasks in the active tab |
+| `[` / `]` | Scroll profile startup results when shown |
 | `?`, `q` | Help, quit |
 
 Messages and Tasks share a pane with independent scroll positions. The pane border shows total tasks and accepted completions for this space; awaiting-review and cancelled tasks are not counted as completed.

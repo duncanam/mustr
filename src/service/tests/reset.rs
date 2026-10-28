@@ -20,6 +20,7 @@ fn join(agent: &str, name: &str, pane: &str, reset: Option<ResetReceipt>) -> Req
             space_id: SpaceId::new("w1"),
             cwd: None,
             reset,
+            startup_grant: None,
         },
     )
 }
@@ -154,6 +155,204 @@ async fn claim(service: &Service, connection: u64, receipt: &ResetReceipt) -> Re
         )
         .await
         .unwrap()
+}
+
+async fn wait_for_reset_phase(service: &Service, phase: ResetPhase) -> Snapshot {
+    let mut snapshots = service.snapshots.clone();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let snapshot = snapshots.borrow_and_update().clone();
+            if snapshot
+                .reset
+                .as_ref()
+                .is_some_and(|reset| reset.state == phase)
+            {
+                return snapshot;
+            }
+            snapshots.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn reset_start_removes_unconsumed_grants_even_after_abandon_unfreezes_space() {
+    let (mut actor, _directory, snapshots) = fixture();
+    let preview = actor.preview(SpaceId::new("w1")).unwrap();
+    let (service, handle) = spawn(actor, snapshots);
+    let issued = service
+        .issue_startup_grant(
+            LaunchId::new("launch-reset".into()),
+            "reviewer".into(),
+            "w1:p9".into(),
+        )
+        .await
+        .unwrap();
+
+    service.reset_start(preview).await.unwrap();
+    assert!(
+        service
+            .issue_startup_grant(
+                LaunchId::new("launch-frozen".into()),
+                "reviewer".into(),
+                "w1:p9".into(),
+            )
+            .await
+            .is_err(),
+        "a frozen reset cannot mint a usable startup grant"
+    );
+    let prepared = wait_for_reset_phase(&service, ResetPhase::Prepared).await;
+    let plan_id = prepared.reset.unwrap().plan_id;
+    service.reset_abandon(plan_id).await.unwrap();
+    let abandoned = wait_for_reset_phase(&service, ResetPhase::Abandoned).await;
+    assert_eq!(abandoned.reset.unwrap().state, ResetPhase::Abandoned);
+
+    let after_abandon = service
+        .issue_startup_grant(
+            LaunchId::new("launch-after-abandon".into()),
+            "reviewer".into(),
+            "w1:p8".into(),
+        )
+        .await
+        .expect("abandonment must unfreeze ordinary startup coordination");
+    service
+        .retire_startup_grant(after_abandon.handoff.token)
+        .await
+        .unwrap();
+    assert!(
+        service
+            .consume_startup_grant(
+                issued.handoff,
+                "reviewer".into(),
+                "w1:p9".into(),
+                SpaceId::new("w1"),
+            )
+            .await
+            .is_err(),
+        "an unconsumed grant stays invalid after accepted reset and unfreeze"
+    );
+    service.stop().await;
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn consumed_grant_cannot_join_after_reset_abandon() {
+    let (mut actor, _directory, snapshots) = fixture();
+    let preview = actor.preview(SpaceId::new("w1")).unwrap();
+    let (service, handle) = spawn(actor, snapshots);
+    let issued = service
+        .issue_startup_grant(
+            LaunchId::new("launch-consumed-reset".into()),
+            "reviewer".into(),
+            "w1:p9".into(),
+        )
+        .await
+        .unwrap();
+    service
+        .consume_startup_grant(
+            issued.handoff.clone(),
+            "reviewer".into(),
+            "w1:p9".into(),
+            SpaceId::new("w1"),
+        )
+        .await
+        .unwrap();
+
+    service.reset_start(preview).await.unwrap();
+    let prepared = wait_for_reset_phase(&service, ResetPhase::Prepared).await;
+    service
+        .reset_abandon(prepared.reset.unwrap().plan_id)
+        .await
+        .unwrap();
+    let abandoned = wait_for_reset_phase(&service, ResetPhase::Abandoned).await;
+    assert_eq!(
+        abandoned.reset.as_ref().unwrap().state,
+        ResetPhase::Abandoned
+    );
+
+    let mut snapshots = service.snapshots.clone();
+    let before = snapshots.borrow_and_update().clone();
+    assert_eq!(before.reset.as_ref().unwrap().state, ResetPhase::Abandoned);
+    assert!(
+        before
+            .members
+            .iter()
+            .all(|member| { member.name != "startup-agent" && member.pane_id != "w1:p9" })
+    );
+    let otherwise_valid = service
+        .join(
+            10,
+            request(
+                "ordinary-after-abandon",
+                Command::Join {
+                    version: VERSION,
+                    agent_id: AgentId::new("control-agent"),
+                    name: "control-agent".into(),
+                    role: "reviewer".into(),
+                    pane_id: "w1:p8".into(),
+                    space_id: SpaceId::new("w1"),
+                    cwd: None,
+                    reset: None,
+                    startup_grant: None,
+                },
+            ),
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(
+        otherwise_valid.ok,
+        "the reset-abandoned space accepts a normal Join"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(1), snapshots.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    let before_startup_join = snapshots.borrow_and_update().clone();
+    let response = service
+        .join(
+            11,
+            request(
+                "startup-after-abandon",
+                Command::Join {
+                    version: VERSION,
+                    agent_id: AgentId::new("startup-agent"),
+                    name: "startup-agent".into(),
+                    role: "reviewer".into(),
+                    pane_id: "w1:p9".into(),
+                    space_id: SpaceId::new("w1"),
+                    cwd: None,
+                    reset: None,
+                    startup_grant: Some(issued.handoff),
+                },
+            ),
+            false,
+        )
+        .await
+        .unwrap();
+    assert!(!response.ok);
+    assert!(response.result.is_none());
+    assert!(
+        response
+            .error
+            .as_deref()
+            .is_some_and(|error| { error.contains("unknown or expired startup grant") })
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(1), snapshots.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    let after_startup_join = snapshots.borrow().clone();
+    assert_eq!(after_startup_join.members, before_startup_join.members);
+    assert!(
+        after_startup_join
+            .members
+            .iter()
+            .all(|member| member.id.as_str() != "startup-agent")
+    );
+    service.stop().await;
+    handle.await.unwrap();
 }
 
 #[test]

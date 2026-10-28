@@ -161,6 +161,7 @@ impl Fixture {
             space_id: SpaceId::new("w1"),
             cwd: None,
             reset: None,
+            startup_grant: None,
         }
     }
 

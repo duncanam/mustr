@@ -20,6 +20,55 @@ async function join(t, f, id, pane, space = "w1", role = "implementor") {
 }
 const sync = (c, receive = false, activity = "idle") => c.request({ op: "sync", activity, receive });
 
+test("plain headless hub startup succeeds without a Herdr executable on PATH", { timeout: 15000 }, async t => {
+  const f = await fixture(t);
+  const emptyPath = `${f.directory}/empty-path`;
+  await mkdir(emptyPath);
+  const child = spawn(binary, ["-v", "run", "--headless"], {
+    env: { ...f.env, PATH: emptyPath },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  f.track(child);
+  let output = "";
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", chunk => { output += chunk; });
+  child.stderr.on("data", chunk => { output += chunk; });
+  await eventually(async () => {
+    if (child.exitCode !== null || child.signalCode !== null) throw new Error(`headless hub exited without Herdr: ${output}`);
+    return new Promise(resolve => {
+      const socket = net.createConnection(f.discovery.socket);
+      socket.once("connect", () => { socket.destroy(); resolve(true); });
+      socket.once("error", () => resolve(false));
+    });
+  }, 10000);
+  assert.equal(child.exitCode, null, "the plain hub remains available without Herdr");
+  await stop(child);
+});
+
+test("mustr context reports the live optional Pi pane agent", async t => {
+  const f = await fixture(t);
+  assert.equal((await f.discover("w1:p1")).agent, "pi");
+  const noAgent = await f.discover("w1:p0");
+  assert.equal(Object.hasOwn(noAgent, "agent"), false, "absent pane agents stay optional in Discovery");
+});
+
+test("acknowledged Leave retains the participant as offline", { timeout: 15000 }, async t => {
+  const f = await fixture(t);
+  await f.start();
+  const departing = await join(t, f, "startup-leaver", "w1:p1");
+  const observer = await join(t, f, "leave-observer", "w1:p2");
+  const before = await sync(observer);
+  assert.equal(before.members.find(member => member.id === "startup-leaver")?.activity, "idle");
+
+  const leave = await departing.request({ op: "leave" });
+  assert.equal(leave.left, true, "the hub explicitly acknowledges Leave");
+  const after = await sync(observer);
+  const retained = after.members.find(member => member.id === "startup-leaver");
+  assert.ok(retained, "Leave does not delete the participant record");
+  assert.equal(retained.activity, "offline", "the retained member is inactive after acknowledged Leave");
+});
+
 class McpProcess {
   constructor(child) {
     this.child = child; this.buffer = ""; this.nextId = 1; this.pending = new Map(); this.stderr = "";

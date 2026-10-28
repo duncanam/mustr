@@ -126,6 +126,8 @@ async function fixture(t, { cancelOrder, rejectReceipt = false } = {}) {
         handlers.push(handler); extension.handlers.set(name, handlers);
         return () => { const i = handlers.indexOf(handler); if (i >= 0) handlers.splice(i, 1); };
       },
+      registerFlag() {},
+      getFlag() { return undefined; },
       registerTool(definition) { extension.tools.set(definition.name, { definition, sourceInfo }); },
       registerCommand(name, command) {
         extension.commands.set(name, { ...command, name, sourceInfo, async handler(args, ctx) {

@@ -265,6 +265,8 @@ async function fixture(t, { retryDelay = 1 } = {}) {
       handlers.push(handler); extension.handlers.set(name, handlers);
       return () => { const index = handlers.indexOf(handler); if (index >= 0) handlers.splice(index, 1); };
     },
+    registerFlag() {},
+    getFlag() { return undefined; },
     registerTool(definition) { extension.tools.set(definition.name, { definition, sourceInfo }); },
     registerCommand(name, command) { extension.commands.set(name, { ...command, name, sourceInfo }); },
   };

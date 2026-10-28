@@ -225,6 +225,8 @@ test("production mustr adapter preserves real Pi model-context prefixes across t
       handlers.push(handler);
       adapterExtension.handlers.set(name, handlers);
     },
+    registerFlag() {},
+    getFlag() { return undefined; },
     registerTool(definition) {
       adapterExtension.tools.set(definition.name, { definition, sourceInfo: adapterExtension.sourceInfo });
     },

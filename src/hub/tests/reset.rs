@@ -115,6 +115,7 @@ fn fresh_join_with_manager(
                 space_id: member.space_id,
                 cwd: member.cwd,
                 reset: Some(receipt.clone()),
+                startup_grant: None,
             },
         ),
         None,
@@ -147,6 +148,7 @@ fn direct_join_mode_and_reset_apis_reject_foreign_space_ids() {
                         space_id: SpaceId::new("w2"),
                         cwd: None,
                         reset: None,
+                        startup_grant: None,
                     },
                 ),
                 None,
@@ -186,6 +188,7 @@ fn direct_join_mode_and_reset_apis_reject_foreign_space_ids() {
                         space_id: SpaceId::new("w2"),
                         cwd: None,
                         reset: Some(receipt),
+                        startup_grant: None,
                     },
                 ),
                 None,
@@ -367,6 +370,7 @@ fn confirmed_receipt_cannot_overwrite_a_moved_or_renamed_current_identity() {
                     space_id: SpaceId::new(space),
                     cwd: None,
                     reset: None,
+                    startup_grant: None,
                 },
             ),
             None,
@@ -495,7 +499,8 @@ fn frozen_source_identities_cannot_move_away_or_reintroduce_old_context() {
                             pane_id: "w2:p1".into(),
                             space_id: SpaceId::new("w2"),
                             cwd: None,
-                            reset: None
+                            reset: None,
+                            startup_grant: None
                         }
                     ),
                     None,
@@ -632,7 +637,8 @@ fn frozen_space_blocks_cached_and_ordinary_work_but_only_target_sees_its_control
                         pane_id: "w1:p3".into(),
                         space_id: SpaceId::new("w1"),
                         cwd: None,
-                        reset: None
+                        reset: None,
+                        startup_grant: None
                     }
                 ),
                 None,
@@ -678,6 +684,7 @@ fn claim_is_persisted_single_use_and_receipts_validate_all_approved_identity_fie
                     space_id: SpaceId::new("w1"),
                     cwd: None,
                     reset: None,
+                    startup_grant: None,
                 },
             ),
             None,
@@ -707,7 +714,8 @@ fn claim_is_persisted_single_use_and_receipts_validate_all_approved_identity_fie
                             pane_id: pane.into(),
                             space_id: SpaceId::new(space),
                             cwd: None,
-                            reset: Some(receipt.clone())
+                            reset: Some(receipt.clone()),
+                            startup_grant: None
                         }
                     ),
                     None,
@@ -752,6 +760,7 @@ fn confirmed_receipt_reconnect_refreshes_presence_and_checkout() {
                     space_id: SpaceId::new("w1"),
                     cwd: Some(checkout.path().to_path_buf()),
                     reset: Some(receipt),
+                    startup_grant: None,
                 },
             ),
             None,

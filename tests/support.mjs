@@ -16,17 +16,19 @@ export async function eventually(action, ms = 8000) {
   throw error ?? new Error("Condition did not become true");
 }
 
-export async function fixture(t) {
+export const DEFAULT_PANE_TABLE = [
+  ["w1:p0", { pane_id: "w1:p0", workspace_id: "w1", agent: null }],
+  ["w1:p1", { pane_id: "w1:p1", workspace_id: "w1", agent: "pi" }],
+  ["w1:p2", { pane_id: "w1:p2", workspace_id: "w1", agent: "pi" }],
+  ["w2:p0", { pane_id: "w2:p0", workspace_id: "w2", agent: null }],
+  ["w2:p1", { pane_id: "w2:p1", workspace_id: "w2", agent: "pi" }],
+  ["w2:p2", { pane_id: "w2:p2", workspace_id: "w2", agent: "pi" }],
+];
+
+export async function fixture(t, { paneTable = DEFAULT_PANE_TABLE } = {}) {
   const directory = await mkdtemp("/tmp/mustr-test-");
   const socket = `${directory}/herdr.sock`;
-  const panes = new Map([
-    ["w1:p0", { pane_id: "w1:p0", workspace_id: "w1", agent: null }],
-    ["w1:p1", { pane_id: "w1:p1", workspace_id: "w1", agent: "pi" }],
-    ["w1:p2", { pane_id: "w1:p2", workspace_id: "w1", agent: "pi" }],
-    ["w2:p0", { pane_id: "w2:p0", workspace_id: "w2", agent: null }],
-    ["w2:p1", { pane_id: "w2:p1", workspace_id: "w2", agent: "pi" }],
-    ["w2:p2", { pane_id: "w2:p2", workspace_id: "w2", agent: "pi" }],
-  ]);
+  const panes = new Map(paneTable);
   const spaces = new Map([
     ["w1", { workspace_id: "w1", label: "First" }],
     ["w2", { workspace_id: "w2", label: "Second" }],

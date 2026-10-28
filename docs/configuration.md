@@ -6,7 +6,7 @@ Run `mustr init` to create configuration and restore missing shipped role files;
 
 | Purpose | Default | Override |
 |---|---|---|
-| Configuration | `~/.config/mustr` | `--config-dir`, `MUSTR_CONFIG_DIR`, then `XDG_CONFIG_HOME/mustr` |
+| Configuration | `$XDG_CONFIG_HOME/mustr` when set; otherwise `~/.config/mustr` | `--config-dir`, then `MUSTR_CONFIG_DIR` |
 | Persistent state and logs | `~/.local/state/mustr` | `MUSTR_STATE_DIR`, then `XDG_STATE_HOME/mustr` |
 | Local transport | `/tmp/mustr-<uid>/<instance-key>.sock` | Derived from herdr server identity and space ID |
 | Pi adapter | `~/.pi/agent/extensions/mustr` | `mustr install pi --agent-dir /absolute/agent-directory` or `PI_CODING_AGENT_DIR` |
@@ -30,6 +30,28 @@ An instance stores `hub.sqlite` and `mustr.log` under `<state>/<server-key>/<ins
 Logs go to that instance's `mustr.log`, not the dashboard. A log larger than 5 MiB rotates to `mustr.log.1` at startup, after acquiring the instance lock. Logs are not a complete transcript or a security audit trail.
 
 Restart persistence remains enabled. The per-space layout starts with fresh history; old shared multi-space databases are left untouched and are not imported. Reconcile work and any incomplete reset before stopping an old hub, then launch one new instance per intended space.
+
+## Profile startup
+
+Profiles are opt-in lists of Pi roles in `<config>/profiles.toml`, using the same configuration directory and `roles/` files described below. For example:
+
+```toml
+[profiles.team]
+roles = ["architect", "implementor", "reviewer"]
+```
+
+Start a new interactive hub with either command:
+
+```sh
+mustr --profile team
+mustr run --profile team
+```
+
+The profile name selects that exact table. A blank or unknown name, malformed TOML, unknown field, or empty role list is an error. Before any tabs are opened, every listed role must resolve and at most one may have `manager = true`. Entries run one at a time in the order listed. Repeated non-manager roles are allowed. Profile loading does not create or rewrite `profiles.toml`, `config.toml`, or role files.
+
+This is an opt-in way to start a new hub, not to add roles to an existing one. The command requires an interactive terminal and the Herdr 0.9.5 CLI; `--profile` is not supported with `run --headless`. Without it, plain startup and manual `/role NAME` selection are unchanged. A second hub for a space that is already owned is refused rather than attached to or used to launch more agents.
+
+The dashboard reports each entry's outcome and why later entries were not attempted after a failure or cancellation. Startup is serial and has no rollback: tabs and Pi sessions already created remain open. If an outcome is uncertain, inspect the Herdr space before retrying. Press `q` to cancel unfinished profile startup; agents already started stay open. Quitting mustr disconnects coordination but does not stop agents or their external jobs.
 
 ## config.toml
 
