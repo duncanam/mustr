@@ -32,20 +32,31 @@ async fn stale_report_conflict_is_typed_and_does_not_retire_the_connection() {
                 pane_id: pane_id.into(),
                 space_id: space.clone(),
                 cwd: None,
+                context_modes: vec![ContextMode::Reuse, ContextMode::Fresh],
                 reset: None,
             },
         )
     };
     assert!(
         service
-            .join(1, join_request(&requester, "requester", "w1:p1"), true)
+            .join(
+                1,
+                join_request(&requester, "requester", "w1:p1"),
+                true,
+                ClientHarness::Pi,
+            )
             .await
             .unwrap()
             .ok
     );
     assert!(
         service
-            .request(2, join_request(&owner, "owner", "w1:p2"))
+            .join(
+                2,
+                join_request(&owner, "owner", "w1:p2"),
+                false,
+                ClientHarness::Pi,
+            )
             .await
             .unwrap()
             .ok
@@ -76,6 +87,7 @@ async fn stale_report_conflict_is_typed_and_does_not_retire_the_connection() {
                     to: owner,
                     title: "Check stale report handling".into(),
                     text: "The staged report must not be replayed after guidance.".into(),
+                    context: ContextMode::Reuse,
                 },
             ),
         )

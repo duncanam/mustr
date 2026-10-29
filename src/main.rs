@@ -7,7 +7,9 @@ mod delivery;
 mod herdr;
 mod hub;
 mod install;
+mod launcher;
 mod paths;
+mod profiles;
 mod protocol;
 mod roles;
 mod server;
@@ -20,7 +22,7 @@ use clap::Parser;
 use color_eyre::eyre::{Context, Result};
 
 use crate::{
-    cli::{Cli, Command, InstallTarget},
+    cli::{AgentCommand, Cli, Command, InstallTarget},
     config::{Config, initialize, seed_roles},
     herdr::HerdrUnavailable,
     paths::Paths,
@@ -28,20 +30,71 @@ use crate::{
 
 const CONTEXT_UNAVAILABLE_EXIT_CODE: i32 = 75;
 
+fn validate_profile_cli(command: &Command, profile: Option<&str>, jailed: bool) -> Result<()> {
+    match command {
+        Command::Run { .. } => {}
+        Command::Agent {
+            command: AgentCommand::Start { .. } | AgentCommand::List,
+        } => {}
+        Command::Agent {
+            command: AgentCommand::Stop { .. },
+        } if !jailed && profile.is_none() => {}
+        _ if profile.is_some() || jailed => color_eyre::eyre::bail!(
+            "--profile/--jailed are only valid for profile run or agent start/list operations"
+        ),
+        _ => {}
+    }
+    if jailed
+        && !matches!(
+            command,
+            Command::Run { .. }
+                | Command::Agent {
+                    command: AgentCommand::Start { .. }
+                }
+        )
+    {
+        color_eyre::eyre::bail!("--jailed applies only to profile run and agent start");
+    }
+    if matches!(
+        command,
+        Command::Agent {
+            command: AgentCommand::Start { .. }
+        }
+    ) && profile.is_none()
+    {
+        color_eyre::eyre::bail!("agent start requires --profile NAME");
+    }
+    if let Some(name) = profile {
+        ensure_profile_name(name)?;
+    }
+    Ok(())
+}
+
+fn ensure_profile_name(name: &str) -> Result<()> {
+    color_eyre::eyre::ensure!(roles::valid_name(name), "invalid profile name {name:?}");
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     color_eyre::install()?;
     let cli = Cli::parse();
+    let profile_name = cli.profile.clone();
+    let jailed = cli.jailed;
     let paths = Paths::discover(cli.config_dir)?;
     initialize(&paths)?;
     let config = Config::load(&paths)?;
-    match cli.command.unwrap_or(Command::Run { headless: false }) {
+    let command = cli.command.unwrap_or(Command::Run { headless: false });
+    validate_profile_cli(&command, profile_name.as_deref(), jailed)?;
+    match command {
         Command::Init => {
             seed_roles(&paths)?;
+            profiles::seed_default(&paths)?;
             println!(
-                "Configuration: {}\nRoles: {}",
+                "Configuration: {}\nRoles: {}\nProfiles: {} (existing files preserved)",
                 paths.config.display(),
-                paths.roles().display()
+                paths.roles().display(),
+                paths.config.join("profiles.toml").display()
             );
         }
         Command::Roles { name, json } => {
@@ -58,7 +111,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::Install {
-            harness:
+            target:
                 InstallTarget::Pi {
                     agent_dir,
                     overwrite_roles,
@@ -69,45 +122,10 @@ async fn main() -> Result<()> {
             let role_report =
                 apply_role_refresh_after_install(role_plan, &destination, "Pi adapter")?;
             println!(
-                "Installed {}\nRestart Pi or /reload, then /role. Other extensions and settings are unchanged.",
-                destination.display()
+                "Installed {}\nProfiles: {} (existing files preserved)\nRestart Pi or /reload, then /role. Other extensions and settings are unchanged.",
+                destination.display(),
+                paths.config.join("profiles.toml").display()
             );
-            if let Some(report) = role_report {
-                print_role_refresh(&report);
-            }
-        }
-        Command::Install {
-            harness:
-                InstallTarget::Claude {
-                    directory,
-                    config_only,
-                    overwrite_roles,
-                },
-        } => {
-            let role_plan = prepare_role_refresh(&paths, overwrite_roles)?;
-            let installed = if config_only {
-                install::install_claude_config_only(&paths, directory)?
-            } else {
-                install::install_claude(&paths, directory).await?
-            };
-            let install_label = if config_only {
-                "Claude config-only bundle"
-            } else {
-                "Claude adapter"
-            };
-            let role_report =
-                apply_role_refresh_after_install(role_plan, &installed, install_label)?;
-            if config_only {
-                println!(
-                    "Generated {}\nLaunch Claude Code in herdr with --mcp-config pointing to this file.\nAsk Claude to join mustr with a role, then wait for work. Claude settings and permissions are unchanged.",
-                    installed.display()
-                );
-            } else {
-                println!(
-                    "Installed {}\nRegistered the user-scoped mustr MCP server. Restart Claude Code to use it; tool permissions and managed-policy checks are unchanged.",
-                    installed.display()
-                );
-            }
             if let Some(report) = role_report {
                 print_role_refresh(&report);
             }
@@ -125,9 +143,50 @@ async fn main() -> Result<()> {
             }
         },
         Command::Run { headless } => {
-            let server =
-                server::Server::start(herdr::Herdr::from_env()?, &paths, &config, cli.verbosity)
-                    .await?;
+            let profile = profile_name
+                .as_deref()
+                .map(|name| profiles::load(&paths, name))
+                .transpose()?;
+            if let Some(profile) = &profile {
+                launcher::validate_jail_request(&paths, profile, jailed)?;
+            }
+            let herdr = herdr::Herdr::from_env()?;
+            let discovery = herdr.discovery().await?;
+            if let Some(profile) = &profile
+                && server::is_running(&herdr, &discovery.space_id)?
+            {
+                let started = launcher::ensure_profile(&paths, profile, jailed).await?;
+                println!(
+                    "Profile {} ensured; the existing dashboard was left unchanged ({} new agent(s)).",
+                    profile.name,
+                    started.len()
+                );
+                return Ok(());
+            }
+            let server = match server::Server::start(herdr.clone(), &paths, &config, cli.verbosity)
+                .await
+            {
+                Ok(server) => server,
+                Err(_error)
+                    if profile.is_some() && server::is_running(&herdr, &discovery.space_id)? =>
+                {
+                    let profile = profile.as_ref().expect("checked above");
+                    let started = launcher::ensure_profile(&paths, profile, jailed).await?;
+                    println!(
+                        "Profile {} ensured; the existing dashboard was left unchanged ({} new agent(s)).",
+                        profile.name,
+                        started.len()
+                    );
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(profile) = &profile
+                && let Err(error) = launcher::ensure_profile(&paths, profile, jailed).await
+            {
+                server.shutdown().await;
+                return Err(error);
+            }
             let result = if headless {
                 tracing::info!("headless mode; SIGINT/SIGTERM stops the hub, not its participants");
                 wait_for_shutdown().await
@@ -141,6 +200,21 @@ async fn main() -> Result<()> {
             server.shutdown().await;
             result?;
         }
+        Command::Agent { command } => match command {
+            AgentCommand::Start { slot, name } => {
+                let profile_name = profile_name.as_deref().ok_or_else(|| {
+                    color_eyre::eyre::eyre!("agent start requires --profile NAME")
+                })?;
+                let profile = profiles::load(&paths, profile_name)?;
+                let instance =
+                    launcher::start_one_instance(&paths, &profile, &slot, name.as_deref(), jailed)
+                        .await?;
+                println!("Started or confirmed profile instance {instance}.");
+            }
+            AgentCommand::List => launcher::list(&paths, profile_name.as_deref()).await?,
+            AgentCommand::Stop { instance } => launcher::stop(&paths, &instance).await?,
+        },
+        Command::ProfileBootstrap { launch_id } => launcher::bootstrap(&paths, &launch_id).await?,
     }
     Ok(())
 }

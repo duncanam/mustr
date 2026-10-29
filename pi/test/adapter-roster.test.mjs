@@ -77,7 +77,7 @@ test("mustr_roster compacts model output while retaining the full safe snapshot"
 
   const schema = tool.parameters;
   assert.match(h.tools.get("mustr_assign").description, /per-owner FIFO/i);
-  assert.match(h.tools.get("mustr_assign").description, /not executed until the hub dispatches/i);
+  assert.match(h.tools.get("mustr_assign").description, /queued is not executed until dispatch/i);
   assert.equal(schema.type, "object");
   assert.equal(schema.properties.include_finished.type, "boolean");
   assert.equal(schema.required?.includes("include_finished") ?? false, false, "include_finished is optional");

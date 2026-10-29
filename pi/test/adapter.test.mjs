@@ -89,6 +89,12 @@ test("adapter: explicit join before hub, human gating, settled report, policies 
   assert.equal(promptResult.options.forceSystemPrompt, undefined, "role instructions remain a structured prompt section");
   assert.equal(promptResult.options.sections.preamble, "Base policy: protect private files.");
   assert.match(promptResult.options.sections.mustr_role, /Role: implementor/);
+  assert.match(promptResult.options.sections.mustr_role, /When idle awaiting an addressed peer result, finish\/yield this turn and let Pi settle/);
+  assert.match(promptResult.options.sections.mustr_role, /an eligible later turn can be woken by delivery/);
+  assert.match(promptResult.options.sections.mustr_role, /Pi has no mustr_wait tool and cannot preempt a running tool/);
+  assert.match(promptResult.options.sections.mustr_role, /Do not shell-sleep as a substitute for this Mustr coordination wait/);
+  assert.ok(h.tools.get("mustr_roster"), "Pi retains its read-only roster tool");
+  assert.equal(h.tools.get("mustr_wait"), undefined, "Pi does not expose an explicit wait tool");
   assert.ok(prompt.startsWith("Base policy: protect private files.")); assert.match(prompt, /protected-path/);
   const peer = new HubClient(); t.after(() => peer.close());
   await peer.connect(f.discovery.socket, { agent_id: "peer", name: "peer", role: "architect", pane_id: "w1:p2", space_id: "w1" });
@@ -102,7 +108,7 @@ test("adapter: explicit join before hub, human gating, settled report, policies 
   assert.equal(h.messages[0].options.deliverAs, "followUp");
   await h.settle();
   await eventually(async () => (await peer.request({ op: "sync", activity: "idle", receive: false })).members.some(m => m.id === "pi-session" && m.activity === "idle"));
-  const assignment = await peer.request({ op: "assign", to: "pi-session", title: "Mock task", text: "No model or files need changing." });
+  const assignment = await peer.request({ op: "assign", to: "pi-session", title: "Mock task", text: "No model or files need changing.", context: "reuse" });
   await eventually(() => h.messages.length === 2);
   await eventually(async () => (await peer.request({ op: "sync", activity: "idle", receive: false })).tasks[0].state === "active");
   const report = await h.tools.get("mustr_report").execute("report", { task_id: assignment.task_id, revision: 1, kind: "done", text: "Fixture verified." }, undefined);
@@ -301,7 +307,7 @@ for (const gate of ["editor", "pending", "busy", "dialog"]) test(`offer/input ra
     return result;
   };
   t.after(() => { HubClient.prototype.request = original; });
-  const assigned = await peer.request({ op: "assign", to: "pi-session", title: "Input race", text: "No external work" });
+  const assigned = await peer.request({ op: "assign", to: "pi-session", title: "Input race", text: "No external work", context: "reuse" });
   await eventually(() => deferred);
   assert.equal(h.messages.length, 0);
   assert.equal(h.entries.filter(e => e.customType === "mustr-received").length, 0);
@@ -404,7 +410,7 @@ test("terminal reports settle task scope without globally blocking later Pi tool
   await eventually(() => h.tools.get("mustr_roster").execute("roster", {}, undefined));
   const peer = new HubClient(); t.after(() => peer.close());
   await peer.connect(f.discovery.socket, { agent_id: "peer", name: "peer", role: "architect", pane_id: "w1:p2", space_id: "w1" });
-  const task = await peer.request({ op: "assign", to: "pi-session", title: "Terminal scope", text: "No external work" });
+  const task = await peer.request({ op: "assign", to: "pi-session", title: "Terminal scope", text: "No external work", context: "reuse" });
   await h.tools.get("mustr_roster").execute("refresh", {}, undefined);
 
   const report = await h.tools.get("mustr_report").execute("terminal", { task_id: task.task_id, revision: task.revision, kind: "done", text: "Task is complete." }, undefined);
@@ -505,7 +511,7 @@ test("informational receipt does not disconnect or strand the next assignment", 
   const poll = () => peer.request({ op: "sync", activity: "idle", receive: false });
   await peer.request({ op: "send", to: "pi-session", text: "Information before an assignment", wake: false });
   await eventually(() => h.messages.length === 1);
-  const assigned = await peer.request({ op: "assign", to: "pi-session", title: "Must not strand", text: "No external work" });
+  const assigned = await peer.request({ op: "assign", to: "pi-session", title: "Must not strand", text: "No external work", context: "reuse" });
   await eventually(() => h.messages.length === 2, 14000);
   await eventually(async () => (await poll()).tasks.find(t => t.id === assigned.task_id)?.state === "active");
   assert.ok(!h.notifications.some(n => /uncertain|insertion|disconnect/.test(n.message)));

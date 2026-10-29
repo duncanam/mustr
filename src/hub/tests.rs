@@ -1,5 +1,6 @@
 use super::*;
 
+mod context;
 mod delivery;
 mod lease_expiry;
 mod manager_cancel;
@@ -27,7 +28,7 @@ fn setup() -> (State, AgentId, AgentId, Scheduling) {
         (&worker, "worker", "w1:p2", false),
     ] {
         state
-            .apply_validated_join(
+            .apply_validated_join_with_harness(
                 &request(
                     name,
                     Command::Join {
@@ -38,6 +39,7 @@ fn setup() -> (State, AgentId, AgentId, Scheduling) {
                         pane_id: pane.into(),
                         space_id: SpaceId::new("w1"),
                         cwd: None,
+                        context_modes: vec![ContextMode::Reuse, ContextMode::Fresh],
                         reset: None,
                     },
                 ),
@@ -45,6 +47,7 @@ fn setup() -> (State, AgentId, AgentId, Scheduling) {
                 0,
                 &config,
                 manager,
+                ClientHarness::Pi,
             )
             .unwrap();
         state
@@ -77,6 +80,7 @@ fn assign(state: &mut State, architect: &AgentId, worker: &AgentId, config: &Sch
                     to: worker.clone(),
                     title: "Task".into(),
                     text: "Implement and verify scope".into(),
+                    context: ContextMode::Reuse,
                 },
             ),
             Some(architect),
@@ -371,7 +375,8 @@ fn ownership_revision_review_and_idempotency() {
                     Command::Assign {
                         to: architect.clone(),
                         title: "Self assignment".into(),
-                        text: "Not permitted".into()
+                        text: "Not permitted".into(),
+                        context: ContextMode::Reuse,
                     }
                 ),
                 Some(&architect),
@@ -689,6 +694,7 @@ fn manager_checkin_waits_for_availability_coalesces_and_never_falls_back() {
                     pane_id: "w1:p3".into(),
                     space_id: space,
                     cwd: None,
+                    context_modes: vec![],
                     reset: None,
                 },
             ),
@@ -792,6 +798,7 @@ fn manager_slot_is_unique_live_and_reconnect_requires_verified_role_metadata() {
                         pane_id: "w1:p3".into(),
                         space_id: SpaceId::new("w1"),
                         cwd: None,
+                        context_modes: vec![],
                         reset: None,
                     },
                 ),
@@ -823,6 +830,7 @@ fn manager_slot_is_unique_live_and_reconnect_requires_verified_role_metadata() {
                     pane_id: "w1:p1".into(),
                     space_id: SpaceId::new("w1"),
                     cwd: None,
+                    context_modes: vec![],
                     reset: None,
                 },
             ),
@@ -854,6 +862,7 @@ fn manager_slot_is_unique_live_and_reconnect_requires_verified_role_metadata() {
                     pane_id: "w1:p1".into(),
                     space_id: SpaceId::new("w1"),
                     cwd: None,
+                    context_modes: vec![],
                     reset: None,
                 },
             ),
@@ -896,6 +905,7 @@ fn manager_checkin_requires_admission_and_runs_with_no_tasks() {
                     pane_id: "w1:p1".into(),
                     space_id: space.clone(),
                     cwd: None,
+                    context_modes: vec![],
                     reset: None,
                 },
             ),
@@ -1042,6 +1052,7 @@ fn manager_role_only_adds_cancel_authority_for_redirection() {
                     pane_id: "w1:p3".into(),
                     space_id: SpaceId::new("w1"),
                     cwd: None,
+                    context_modes: vec![],
                     reset: None,
                 },
             ),
@@ -1065,7 +1076,10 @@ fn manager_role_only_adds_cancel_authority_for_redirection() {
             &config,
         )
         .unwrap();
-    let task = assign(&mut state, &requester, &worker, &config);
+    let task = assign(&mut state, &manager, &worker, &config);
+    // Model a pre-existing requester-authored task; new assignments are now
+    // created only by the currently admitted manager.
+    state.tasks.get_mut(&task).unwrap().requester = requester.clone();
     state.tasks.get_mut(&task).unwrap().state = TaskState::Review;
     let before = state.tasks[&task].clone();
 
@@ -1145,6 +1159,7 @@ fn recovery_preserves_checkin_choice_but_rejoins_never_replay_old_checkpoints() 
                     pane_id: "w1:p1".into(),
                     space_id: space.clone(),
                     cwd: None,
+                    context_modes: vec![],
                     reset: None,
                 },
             ),
@@ -1189,6 +1204,7 @@ fn recovery_preserves_checkin_choice_but_rejoins_never_replay_old_checkpoints() 
                     pane_id: "w1:p1".into(),
                     space_id: space.clone(),
                     cwd: None,
+                    context_modes: vec![],
                     reset: None,
                 },
             ),

@@ -25,50 +25,49 @@ test("fixture cleanup stops children and removes files even when adapter teardow
   await assert.rejects(stat(f.directory), { code: "ENOENT" }, "fixture files are removed after callback failure");
 });
 
-async function join(t, f, id, pane = "w1:p2") {
+async function join(t, f, id, pane = "w1:p2", role = "implementor") {
   const client = new HubClient();
   t.after(() => client.close());
   await client.connect(f.discovery.socket, {
-    agent_id: id, name: id, role: "implementor", pane_id: pane, space_id: "w1",
+    agent_id: id, name: id, role, pane_id: pane, space_id: "w1",
+    context_modes: ["reuse", "fresh"],
   });
   await client.request({ op: "sync", activity: "idle", receive: false });
   return client;
 }
 
-test("Pi and Claude Code share scoped messages and task ownership", async t => {
+test("Pi participants share scoped messages and task ownership", async t => {
   const f = await fixture(t);
-  f.panes.get("w1:p2").agent = "claude";
   await f.start();
-  const pi = await join(t, f, "pi", "w1:p1");
-  const claude = await join(t, f, "claude");
-  const snapshot = await pi.request({ op: "sync", activity: "idle", receive: false });
-  assert.deepEqual(snapshot.members.map(member => member.id).sort(), ["claude", "pi"]);
-  const task = await pi.request({ op: "assign", to: "claude", title: "Mixed-harness task", text: "Verify the fixture." });
-  const offer = await claude.request({ op: "sync", activity: "idle", receive: true });
+  const requester = await join(t, f, "requester", "w1:p1", "architect");
+  const worker = await join(t, f, "worker");
+  const snapshot = await requester.request({ op: "sync", activity: "idle", receive: false });
+  assert.deepEqual(snapshot.members.map(member => member.id).sort(), ["requester", "worker"]);
+  const task = await requester.request({ op: "assign", to: "worker", title: "Pi-only task", text: "Verify the fixture.", context: "reuse" });
+  const offer = await worker.request({ op: "sync", activity: "idle", receive: true });
   assert.equal(offer.inbox.task_id, task.task_id);
-  await claude.request({ op: "ack", message_id: offer.inbox.id });
-  await claude.request({ op: "report", task_id: task.task_id, revision: 1, kind: "done", text: "Fixture verified." });
-  await pi.request({ op: "accept", task_id: task.task_id, revision: 1, text: "Independently verified." });
-  assert.equal((await pi.request({ op: "sync", activity: "idle", receive: false })).tasks[0].state, "accepted");
+  await worker.request({ op: "ack", message_id: offer.inbox.id });
+  await worker.request({ op: "report", task_id: task.task_id, revision: 1, kind: "done", text: "Fixture verified." });
+  await requester.request({ op: "accept", task_id: task.task_id, revision: 1, text: "Independently verified." });
+  assert.equal((await requester.request({ op: "sync", activity: "idle", receive: false })).tasks[0].state, "accepted");
 });
 
-for (const designation of [null, "unknown", "claude-code"]) {
-  test(`admission rejects unsupported harness ${JSON.stringify(designation)}`, async t => {
+for (const designation of [null, "unknown", "other-agent"]) {
+  test(`admission rejects non-Pi pane designation ${JSON.stringify(designation)}`, async t => {
     const f = await fixture(t);
     f.panes.get("w1:p2").agent = designation;
     await f.start();
-    await assert.rejects(join(t, f, "unsupported"), /supported agent/);
+    await assert.rejects(join(t, f, "unsupported"), /running Pi/);
   });
 }
 
-for (const [before, after] of [["pi", "claude"], ["claude", "pi"], ["claude", null]]) {
-  test(`existing connection cannot survive harness replacement ${before} -> ${after}`, async t => {
+for (const designation of [null, "other-agent"]) {
+  test(`existing Pi connection is retired when its pane stops running Pi (${designation})`, async t => {
     const f = await fixture(t);
-    f.panes.get("w1:p2").agent = before;
     await f.start();
     const client = await join(t, f, "original");
-    f.panes.get("w1:p2").agent = after;
-    await assert.rejects(client.request({ op: "sync", activity: "idle", receive: false }), /supported agent/);
+    f.panes.get("w1:p2").agent = designation;
+    await assert.rejects(client.request({ op: "sync", activity: "idle", receive: false }), /running Pi/);
   });
 }
 

@@ -192,6 +192,7 @@ mod tests {
             delivery,
             created_at: 0,
             pr_ack: None,
+            context: None,
         }
     }
 

@@ -68,7 +68,17 @@ test("shipped role prompts contain the scoped functional contracts", { timeout: 
   for (const name of ["base", "architect", "researcher", "implementor", "reviewer"]) {
     assert.ok(roles[name], `missing shipped role ${name}`);
     assert.ok(roles[name].prompt.includes(sharedBoundary), `${name} must compose the shared boundary`);
+    assert.ok(roles[name].prompt.includes("For peer-only waits"), `${name} must compose the shared wait guidance`);
   }
+
+  assert.match(roles.base.prompt, /For peer-only waits, use your harness's documented wait\/yield path/);
+  assert.match(roles.base.prompt, /not a terminal `Waiting` task report\/state transition or a human-decision pause/);
+  assert.match(roles.base.prompt, /this wait changes no task state and resumes no paused scope/);
+  assert.match(roles.base.prompt, /Do not shell-sleep, poll the roster, or send repeated status\/check-ins as substitutes for peer waiting/);
+  assert.match(roles.base.prompt, /Reserve `Blocked`\/`Waiting` reports for genuine task blockers \(external-job waits require exact job identifiers and an observable resumption condition\)/);
+  assert.match(roles.base.prompt, /existing stop and requester-Guide boundaries/);
+  assert.match(roles.base.prompt, /queue, delivery, or assignment receipts do not prove execution or completion/);
+  assert.doesNotMatch(roles.base.prompt, /mustr_wait|mustr_ack/, "shared wait guidance stays harness-API-neutral");
 
   assert.match(roles.base.prompt, /After blocked, waiting, or done, stop modifying only that assigned scope/);
   assert.match(roles.base.prompt, /separately authorized, addressed child-result or review handoffs, or manager coordination within your selected functional role/);
@@ -78,6 +88,9 @@ test("shipped role prompts contain the scoped functional contracts", { timeout: 
 
   assert.equal(roles.architect.manager, true);
   assert.match(roles.architect.description, /high-level context/);
+  assert.match(roles.architect.prompt, /These manager check-ins are hub-timed; do not emulate their interval with shell `sleep` or repeated roster polling/);
+  assert.match(roles.architect.prompt, /Manager status grants no general task ownership or Guide\/Accept authority/);
+  assert.match(roles.architect.prompt, /Cancel another requester's queued\/current work only to honor explicit user-directed redirection/);
   assert.match(roles.architect.prompt, /Route open questions, root-cause diagnosis, API exploration, and comparisons to a researcher/);
   assert.match(roles.architect.prompt, /do not conduct deep investigation, debugging, implementation, or full-suite verification yourself/);
   assert.doesNotMatch(roles.architect.prompt, /perform explicitly non-overlapping work/);

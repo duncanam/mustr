@@ -13,7 +13,7 @@ fn join_participant(
     scheduling: &Scheduling,
 ) -> Result<Value> {
     let agent_id = AgentId::new(id);
-    state.apply_validated_join(
+    state.apply_validated_join_with_harness(
         &request(
             request_id,
             Command::Join {
@@ -24,6 +24,7 @@ fn join_participant(
                 pane_id: pane.into(),
                 space_id: SpaceId::new("w1"),
                 cwd: None,
+                context_modes: vec![ContextMode::Reuse, ContextMode::Fresh],
                 reset: None,
             },
         ),
@@ -31,6 +32,7 @@ fn join_participant(
         0,
         scheduling,
         manager,
+        ClientHarness::Pi,
     )
 }
 

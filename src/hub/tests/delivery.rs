@@ -176,7 +176,7 @@ fn disconnect_requires_explicit_guidance_even_after_reconnect_with_automation_on
         .unwrap();
     state.disconnect(&worker);
     state
-        .apply(
+        .apply_validated_join_with_harness(
             &request(
                 "rejoin",
                 Command::Join {
@@ -187,12 +187,15 @@ fn disconnect_requires_explicit_guidance_even_after_reconnect_with_automation_on
                     pane_id: "w1:p2".into(),
                     space_id: SpaceId::new("w1"),
                     cwd: None,
+                    context_modes: vec![ContextMode::Reuse, ContextMode::Fresh],
                     reset: None,
                 },
             ),
             None,
             2,
             &config,
+            false,
+            ClientHarness::Pi,
         )
         .unwrap();
     for now in 2..150 {

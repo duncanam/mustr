@@ -66,6 +66,7 @@ impl std::fmt::Display for TaskConflict {
 impl std::error::Error for TaskConflict {}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct State {
     space_id: SpaceId,
     pub members: BTreeMap<AgentId, Member>,
@@ -81,9 +82,13 @@ pub(crate) struct State {
     retired: BTreeSet<AgentId>,
     #[serde(skip)]
     reset_capable: BTreeSet<AgentId>,
+    /// Live, server-validated capabilities; never persisted across a connection or restart.
+    #[serde(skip)]
+    context_capabilities: BTreeMap<AgentId, BTreeSet<ContextMode>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Cached {
     sender: AgentId,
     id: String,
@@ -126,6 +131,7 @@ impl State {
             reset_epoch: 0,
             retired: BTreeSet::new(),
             reset_capable: BTreeSet::new(),
+            context_capabilities: BTreeMap::new(),
         }
     }
 
@@ -163,6 +169,72 @@ impl State {
         );
         Ok(())
     }
+
+    fn validate_context_modes(
+        &self,
+        declared: &[ContextMode],
+        verified_harness: Option<ClientHarness>,
+    ) -> Result<BTreeSet<ContextMode>> {
+        ensure!(declared.len() <= 2, "too many declared context modes");
+        let mut modes = BTreeSet::new();
+        for mode in declared {
+            ensure!(modes.insert(*mode), "duplicate declared context mode");
+            let harness = verified_harness
+                .ok_or_else(|| eyre!("context_modes requires a server-verified pane harness"))?;
+            ensure!(
+                harness.supports(*mode),
+                "context mode '{}' is not supported by the server-verified Pi agent",
+                mode.as_str(),
+            );
+        }
+        Ok(modes)
+    }
+
+    fn supports_context_mode(&self, owner: &AgentId, mode: ContextMode) -> bool {
+        self.context_capabilities
+            .get(owner)
+            .is_some_and(|modes| modes.contains(&mode))
+    }
+
+    fn task_context_message_eligible(&self, message: &Message, recipient: &AgentId) -> bool {
+        if !matches!(message.kind, MessageKind::Assignment | MessageKind::Guide) {
+            return true;
+        }
+        let Some(task) = message.task_id.as_ref().and_then(|id| self.tasks.get(id)) else {
+            return false;
+        };
+        task.owner == *recipient
+            && task.space_id == message.space_id
+            && message.from.as_ref() == Some(&task.requester)
+            && message.revision == Some(task.revision)
+            && task.state == TaskState::Assigned
+            && task.context == message.context
+            && task
+                .context
+                .is_none_or(|mode| self.supports_context_mode(recipient, mode))
+    }
+
+    fn message_eligible(
+        &self,
+        message: &Message,
+        recipient: &AgentId,
+        space: &SpaceId,
+        activity: Activity,
+        now: u64,
+    ) -> bool {
+        Pending::eligible(message, recipient, space, activity, now)
+            && self.task_context_message_eligible(message, recipient)
+    }
+
+    fn context_blocked_reason(&self, task: &Task) -> Option<String> {
+        let mode = task.context?;
+        (!self.supports_context_mode(&task.owner, mode)).then(|| {
+            format!(
+                "Cannot dispatch or guide this task: the owner does not currently advertise '{}' context support; reconcile and rejoin with a supported adapter.",
+                mode.as_str()
+            )
+        })
+    }
 }
 
 impl State {
@@ -175,6 +247,7 @@ impl State {
             .map_or(1, |seq| seq.saturating_add(1));
         self.next_seq = self.next_seq.max(next_after_tasks).max(1);
         self.reset_capable.clear();
+        self.context_capabilities.clear();
         self.recover_resets();
         for member in self.members.values_mut() {
             member.activity = Activity::Offline;
@@ -257,7 +330,13 @@ impl State {
                     self.messages
                         .iter()
                         .find(|m| {
-                            Pending::eligible(m, &member.id, &member.space_id, member.activity, now)
+                            self.message_eligible(
+                                m,
+                                &member.id,
+                                &member.space_id,
+                                member.activity,
+                                now,
+                            )
                         })
                         .map(|m| (member.id.clone(), m.id.clone()))
                 })
@@ -276,10 +355,11 @@ impl State {
         now: u64,
         scheduling: &Scheduling,
     ) -> Result<Value> {
-        self.apply_with_role_manager(request, sender, now, scheduling, false)
+        self.apply_with_role_manager(request, sender, now, scheduling, false, None)
     }
 
     /// Apply a Join after the server resolved the selected root role.
+    #[allow(dead_code)] // Kept as a compatibility helper; socket Joins use the verified harness overload.
     pub fn apply_validated_join(
         &mut self,
         request: &Request,
@@ -288,11 +368,36 @@ impl State {
         scheduling: &Scheduling,
         manager: bool,
     ) -> Result<Value> {
+        self.apply_validated_join_inner(request, sender, now, scheduling, manager, None)
+    }
+
+    /// Apply a Join with the pane harness verified by the socket server.
+    pub fn apply_validated_join_with_harness(
+        &mut self,
+        request: &Request,
+        sender: Option<&AgentId>,
+        now: u64,
+        scheduling: &Scheduling,
+        manager: bool,
+        harness: ClientHarness,
+    ) -> Result<Value> {
+        self.apply_validated_join_inner(request, sender, now, scheduling, manager, Some(harness))
+    }
+
+    fn apply_validated_join_inner(
+        &mut self,
+        request: &Request,
+        sender: Option<&AgentId>,
+        now: u64,
+        scheduling: &Scheduling,
+        manager: bool,
+        verified_harness: Option<ClientHarness>,
+    ) -> Result<Value> {
         ensure!(
             matches!(&request.command, Command::Join { .. }),
             "validated role metadata is only valid for Join"
         );
-        self.apply_with_role_manager(request, sender, now, scheduling, manager)
+        self.apply_with_role_manager(request, sender, now, scheduling, manager, verified_harness)
     }
 
     fn apply_with_role_manager(
@@ -302,6 +407,7 @@ impl State {
         now: u64,
         scheduling: &Scheduling,
         role_manager: bool,
+        verified_harness: Option<ClientHarness>,
     ) -> Result<Value> {
         ensure!(
             !request.id.is_empty() && request.id.len() <= 100,
@@ -335,6 +441,15 @@ impl State {
                     ),
                 "space is frozen for fresh start; ordinary work is blocked"
             );
+            // Manager authority is checked before request-cache replay: only a
+            // currently admitted manager can create work and select its explicit
+            // native-context mode.
+            if matches!(&request.command, Command::Assign { .. }) {
+                ensure!(
+                    member.manager,
+                    "only the current admitted manager may assign work and select context mode"
+                );
+            }
             // Nonrequester cancellation authority must still be current before a
             // successful mutation can be replayed from the idempotency cache.
             match &request.command {
@@ -381,7 +496,14 @@ impl State {
             );
             return Ok(previous.result.clone());
         }
-        let result = self.execute(&request.command, sender, now, scheduling, role_manager)?;
+        let result = self.execute(
+            &request.command,
+            sender,
+            now,
+            scheduling,
+            role_manager,
+            verified_harness,
+        )?;
         if mutation && let Some(sender) = sender {
             self.cache.push(Cached {
                 sender: sender.clone(),
@@ -404,6 +526,7 @@ impl State {
         now: u64,
         scheduling: &Scheduling,
         role_manager: bool,
+        verified_harness: Option<ClientHarness>,
     ) -> Result<Value> {
         if let Command::Join {
             version,
@@ -413,6 +536,7 @@ impl State {
             pane_id,
             space_id,
             cwd,
+            context_modes: declared_context_modes,
             reset,
         } = command
         {
@@ -432,6 +556,8 @@ impl State {
                     "participant checkout must be an absolute directory"
                 );
             }
+            let context_modes =
+                self.validate_context_modes(declared_context_modes, verified_harness)?;
             if let Some(receipt) = reset {
                 ensure!(
                     sender.is_none_or(|id| id == agent_id),
@@ -447,6 +573,7 @@ impl State {
                     receipt,
                     now,
                     role_manager,
+                    context_modes,
                 );
             }
             ensure!(sender.is_none(), "already registered");
@@ -530,9 +657,17 @@ impl State {
                     idle_since: now,
                 },
             );
-            return Ok(
-                json!({"protocol": VERSION, "agent_id": agent_id, "delivery_policy": 1, "inbox_notifications": 1, "reset_protocol": 1}),
-            );
+            self.context_capabilities
+                .insert(agent_id.clone(), context_modes.clone());
+            return Ok(json!({
+                "protocol": VERSION,
+                "agent_id": agent_id,
+                "delivery_policy": 1,
+                "inbox_notifications": 1,
+                "reset_protocol": 1,
+                "context_selection": 1,
+                "context_modes": context_modes,
+            }));
         }
         let sender = sender.ok_or_else(|| eyre!("register before sending commands"))?;
         let member = self
@@ -579,7 +714,7 @@ impl State {
                     .any(|m| &m.to == sender && m.delivery == Delivery::Offered);
                 let position = if *receive && !in_flight {
                     self.messages.iter().position(|m| {
-                        Pending::eligible(m, sender, &member.space_id, *activity, now)
+                        self.message_eligible(m, sender, &member.space_id, *activity, now)
                     })
                 } else {
                     None
@@ -609,10 +744,19 @@ impl State {
                     .filter(|m| m.space_id == member.space_id)
                     .map(|m| {
                         let mut value = serde_json::to_value(m)?;
-                        value
+                        let object = value
                             .as_object_mut()
-                            .ok_or_else(|| eyre!("serialized member is not an object"))?
-                            .insert("task_queue".into(), self.task_queue_summary(&m.id)?);
+                            .ok_or_else(|| eyre!("serialized member is not an object"))?;
+                        object.insert("task_queue".into(), self.task_queue_summary(&m.id)?);
+                        object.insert(
+                            "context_modes".into(),
+                            serde_json::to_value(
+                                self.context_capabilities
+                                    .get(&m.id)
+                                    .cloned()
+                                    .unwrap_or_default(),
+                            )?,
+                        );
                         Ok(value)
                     })
                     .collect::<Result<_>>()?;
@@ -662,6 +806,12 @@ impl State {
                             "revision":task.revision,
                             "note":task.note.chars().take(300).collect::<String>()
                         });
+                        if let Some(context) = task.context {
+                            row["context"] = json!(context);
+                        }
+                        if let Some(reason) = self.context_blocked_reason(task) {
+                            row["context_blocked"] = json!(reason);
+                        }
                         if let Some(position) = self.queue_position(&task.id) {
                             row["queue_position"] = json!(position);
                         }
@@ -697,7 +847,12 @@ impl State {
                 )?;
                 Ok(json!({"message_id":id,"delivery":"queued"}))
             }
-            Command::Assign { to, title, text } => {
+            Command::Assign {
+                to,
+                title,
+                text,
+                context,
+            } => {
                 self.recipient(&member, to)?;
                 validate_text(text)?;
                 ensure!(
@@ -711,6 +866,11 @@ impl State {
                         Activity::Idle | Activity::Working
                     ),
                     "recipient must be idle or working and unpaused"
+                );
+                ensure!(
+                    self.supports_context_mode(to, *context),
+                    "recipient does not currently advertise context_selection v1 support for '{}' assignments",
+                    context.as_str()
                 );
                 ensure!(!self.retired.contains(to), "recipient is retired");
                 ensure!(
@@ -746,6 +906,7 @@ impl State {
                     checkin_at: 0,
                     nudges: 0,
                     note: String::new(),
+                    context: Some(*context),
                 };
                 self.next_seq = next_seq;
                 self.tasks.insert(id.clone(), task);
@@ -755,6 +916,7 @@ impl State {
                     "task_id":id,
                     "revision":task.revision,
                     "state":task.state,
+                    "context":task.context,
                     "queue_position":self.queue_position(&id),
                     "delivery":if task.state == TaskState::Queued { "not_dispatched" } else { "queued" }
                 }))
@@ -784,7 +946,13 @@ impl State {
                 }
                 task.note = text.clone();
                 task.updated_at = now;
-                let wake = matches!(kind, ReportKind::Blocked | ReportKind::Done);
+                let wake = matches!(
+                    kind,
+                    ReportKind::Status
+                        | ReportKind::Progress
+                        | ReportKind::Blocked
+                        | ReportKind::Done
+                );
                 let message_kind = match kind {
                     ReportKind::Done => MessageKind::Done,
                     ReportKind::Blocked | ReportKind::Waiting => MessageKind::Blocked,
@@ -827,6 +995,12 @@ impl State {
                 if guide {
                     ensure!(!queued, "queued task has not been dispatched");
                     self.recipient(&member, &task.owner)?;
+                    if let Some(mode) = task.context {
+                        ensure!(
+                            self.supports_context_mode(&task.owner, mode),
+                            "owner no longer advertises the task's selected context mode; reconcile before guiding"
+                        );
+                    }
                 } else {
                     ensure!(
                         task.state == TaskState::Review,
@@ -1131,6 +1305,7 @@ impl State {
 
     fn disconnect_with_reason(&mut self, id: &AgentId, reason: DisconnectReason) {
         self.reset_capable.remove(id);
+        self.context_capabilities.remove(id);
         self.disconnect_reset(id);
         if let Some(member) = self.members.get_mut(id) {
             member.activity = Activity::Offline;
@@ -1277,19 +1452,39 @@ impl State {
             .filter(|task| &task.owner == owner && task.state.holds_slot())
             .min_by(|left, right| left.id.cmp(&right.id));
         let queued = self.queued_tasks_for(owner);
-        Ok(json!({
-            "holder": holder.map(|task| json!({
+        let holder = holder.map(|task| {
+            let mut row = json!({
                 "id": task.id,
                 "state": task.state,
                 "revision": task.revision,
                 "requester": task.requester,
-            })),
-            "queued_count": queued.len(),
-            "next_queued": queued.first().map(|task| json!({
+            });
+            if let Some(context) = task.context {
+                row["context"] = json!(context);
+            }
+            if let Some(reason) = self.context_blocked_reason(task) {
+                row["context_blocked"] = json!(reason);
+            }
+            row
+        });
+        let next_queued = queued.first().map(|task| {
+            let mut row = json!({
                 "id": task.id,
                 "title": task.title,
                 "requester": task.requester,
-            })),
+            });
+            if let Some(context) = task.context {
+                row["context"] = json!(context);
+            }
+            if let Some(reason) = self.context_blocked_reason(task) {
+                row["context_blocked"] = json!(reason);
+            }
+            row
+        });
+        Ok(json!({
+            "holder": holder,
+            "queued_count": queued.len(),
+            "next_queued": next_queued,
             "cancellation_guards": {
                 "queued_only": self.cancellation_guard(owner, CancelScope::QueuedOnly)?,
                 "all_unfinished": self.cancellation_guard(owner, CancelScope::AllUnfinished)?,
@@ -1369,6 +1564,12 @@ impl State {
         let Some(task) = self.queued_tasks_for(owner).into_iter().next().cloned() else {
             return Ok(false);
         };
+        if task
+            .context
+            .is_some_and(|mode| !self.supports_context_mode(owner, mode))
+        {
+            return Ok(false);
+        }
         if !self.message_capacity_available() {
             return Ok(false);
         }
@@ -1440,6 +1641,7 @@ impl State {
             delivery: Delivery::Pending,
             created_at: now,
             pr_ack: None,
+            context: task.and_then(|task| task.context),
         });
         Ok(id)
     }

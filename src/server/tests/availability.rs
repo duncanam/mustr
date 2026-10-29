@@ -144,6 +144,7 @@ impl Fixture {
                 99,
                 request("join-manager", Self::join("manager", "w1:p2")),
                 true,
+                ClientHarness::Pi,
             )
             .await
             .unwrap();
@@ -160,6 +161,7 @@ impl Fixture {
             pane_id: pane.into(),
             space_id: SpaceId::new("w1"),
             cwd: None,
+            context_modes: vec![ContextMode::Reuse, ContextMode::Fresh],
             reset: None,
         }
     }
@@ -210,6 +212,7 @@ impl Fixture {
                         title: "Retain active work".into(),
                         text: "Synthetic active work; do not pause it on a topology timeout."
                             .into(),
+                        context: ContextMode::Reuse,
                     },
                 ),
             )
@@ -398,7 +401,7 @@ async fn actual_identity_changes_and_invalid_topology_still_close_the_connection
     for result in [
         json!({"pane": {"pane_id": "w1:p1", "workspace_id": "w2", "agent": "pi"}}),
         json!({"pane": {"pane_id": "w1:p9", "workspace_id": "w1", "agent": "pi"}}),
-        json!({"pane": {"pane_id": "w1:p1", "workspace_id": "w1", "agent": "claude"}}),
+        json!({"pane": {"pane_id": "w1:p1", "workspace_id": "w1", "agent": "other"}}),
         json!({"pane": {"pane_id": "w1:p1", "workspace_id": "w1", "agent": null}}),
         json!({"pane": null}),
         json!({"unrecognized": "not a pane"}),

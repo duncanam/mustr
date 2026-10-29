@@ -45,6 +45,41 @@ id_type!(SpaceId);
 id_type!(TaskId);
 id_type!(MessageId);
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ContextMode {
+    Reuse,
+    Fresh,
+}
+
+impl ContextMode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Reuse => "reuse",
+            Self::Fresh => "fresh",
+        }
+    }
+}
+
+/// Agent kind resolved from the live herdr pane by the socket server.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ClientHarness {
+    Pi,
+}
+
+impl ClientHarness {
+    pub(crate) fn from_verified_agent(agent: &str) -> Option<Self> {
+        (agent == "pi").then_some(Self::Pi)
+    }
+
+    pub(crate) fn supports(self, mode: ContextMode) -> bool {
+        matches!(
+            (self, mode),
+            (Self::Pi, ContextMode::Reuse | ContextMode::Fresh)
+        )
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Request {
     pub id: String,
@@ -64,6 +99,9 @@ pub(crate) enum Command {
         space_id: SpaceId,
         #[serde(default)]
         cwd: Option<std::path::PathBuf>,
+        /// Client-declared context modes, accepted only when consistent with the server-verified pane harness.
+        #[serde(default)]
+        context_modes: Vec<ContextMode>,
         #[serde(default)]
         reset: Option<ResetReceipt>,
     },
@@ -94,6 +132,7 @@ pub(crate) enum Command {
         to: AgentId,
         title: String,
         text: String,
+        context: ContextMode,
     },
     Report {
         task_id: TaskId,
@@ -151,6 +190,7 @@ pub(crate) struct ResetReceipt {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ResetParticipant {
     pub agent_id: AgentId,
     pub name: String,
@@ -210,6 +250,7 @@ impl From<ResetReport> for ResetAgentState {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ResetProgress {
     pub participant: ResetParticipant,
     pub state: ResetAgentState,
@@ -328,6 +369,7 @@ impl MessageKind {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Member {
     pub id: AgentId,
     pub name: String,
@@ -347,6 +389,7 @@ pub(crate) struct Member {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Task {
     pub id: TaskId,
     /// Global monotonic ordering key for the owner's FIFO queue.
@@ -363,9 +406,13 @@ pub(crate) struct Task {
     pub checkin_at: u64,
     pub nudges: u32,
     pub note: String,
+    /// `None` is reserved for persisted legacy tasks; new Assign commands require a choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextMode>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Message {
     pub id: MessageId,
     pub space_id: SpaceId,
@@ -380,6 +427,9 @@ pub(crate) struct Message {
     pub created_at: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_ack: Option<crate::watchers::PrBaseline>,
+    /// Task context policy carried with task-related messages; absent only on legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<ContextMode>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -391,6 +441,7 @@ pub(crate) enum Mode {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct Automation {
     pub todo_enabled: bool,
     pub checkin_enabled: bool,

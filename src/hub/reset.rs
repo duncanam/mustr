@@ -7,6 +7,7 @@ use super::*;
 const RECOVERY: &str = "Reset incomplete; old hub history is retained and this space is frozen. Reconcile each pane. Never retry a claimed replacement. The human dashboard can abandon this plan without clearing history; then use manual /new and /role. Already-created sessions cannot be rolled back.";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct ResetPlan {
     plan_id: String,
     space_id: SpaceId,
@@ -18,6 +19,7 @@ pub(super) struct ResetPlan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ResetAgent {
     progress: ResetProgress,
     token: String,
@@ -351,6 +353,7 @@ impl State {
         receipt: &ResetReceipt,
         now: u64,
         role_manager: bool,
+        context_modes: BTreeSet<ContextMode>,
     ) -> Result<Value> {
         self.validate_space(space)?;
         ensure!(
@@ -421,6 +424,8 @@ impl State {
         self.retired.insert(old.clone());
         self.reset_capable.remove(&old);
         self.reset_capable.remove(agent);
+        self.context_capabilities.remove(&old);
+        self.context_capabilities.remove(agent);
         if let Some(member) = self.members.get_mut(&old) {
             member.activity = Activity::Offline;
             member.manager = false;
@@ -443,6 +448,8 @@ impl State {
                 idle_since: now,
             },
         );
+        self.context_capabilities
+            .insert(agent.clone(), context_modes.clone());
         let plan = self.reset.as_mut().expect("validated plan");
         let expected = plan
             .agents
@@ -460,9 +467,16 @@ impl State {
         {
             self.finish_reset();
         }
-        Ok(
-            json!({"protocol":VERSION,"agent_id":agent,"delivery_policy":1,"inbox_notifications":1,"reset_protocol":1,"reset_receipt":true}),
-        )
+        Ok(json!({
+            "protocol": VERSION,
+            "agent_id": agent,
+            "delivery_policy": 1,
+            "inbox_notifications": 1,
+            "reset_protocol": 1,
+            "context_selection": 1,
+            "context_modes": context_modes,
+            "reset_receipt": true,
+        }))
     }
 
     fn finish_reset(&mut self) {
@@ -489,6 +503,8 @@ impl State {
             self.reset_capable.remove(id);
         }
         self.members.retain(|id, _| replacements.contains(id));
+        self.context_capabilities
+            .retain(|id, _| replacements.contains(id));
         self.tasks.clear();
         self.messages.clear();
         self.cache.clear();

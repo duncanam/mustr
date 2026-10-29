@@ -1,0 +1,30 @@
+# Shipped Mustr crew. Existing profiles.toml files are never overwritten or merged.
+# Launch from the project: mustr --profile default
+# Add --jailed explicitly to jail the agents; the hub stays on the host.
+# No cwd is pinned: all slots inherit the launcher's working directory.
+# Models use Pi's OpenAI Codex provider; authentication is configured separately.
+version = 1
+
+[profiles.default.agents.arch]
+tab_name = "arch"
+role = "architect"
+model = "openai-codex/gpt-6.1-sol"
+thinking = "high"
+
+[profiles.default.agents.impl]
+tab_name = "impl"
+role = "implementor"
+model = "openai-codex/gpt-6-luna"
+thinking = "high"
+
+[profiles.default.agents.review]
+tab_name = "review"
+role = "reviewer"
+model = "openai-codex/gpt-6-astra"
+thinking = "high"
+
+[profiles.default.agents.research]
+tab_name = "research"
+role = "researcher"
+model = "openai-codex/gpt-6-luna"
+thinking = "high"

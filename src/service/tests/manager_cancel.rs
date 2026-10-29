@@ -62,6 +62,7 @@ async fn start_cancel_fixture(
             checkin_at: 0,
             nudges: 0,
             note: String::new(),
+            context: None,
         },
         Task {
             id: TaskId::new("task-b"),
@@ -77,6 +78,7 @@ async fn start_cancel_fixture(
             checkin_at: 0,
             nudges: 0,
             note: String::new(),
+            context: None,
         },
         Task {
             id: TaskId::new("task-c"),
@@ -92,6 +94,7 @@ async fn start_cancel_fixture(
             checkin_at: 0,
             nudges: 0,
             note: String::new(),
+            context: None,
         },
     ];
     for task in &tasks {
@@ -114,6 +117,7 @@ async fn start_cancel_fixture(
                 delivery: Delivery::Pending,
                 created_at: 1,
                 pr_ack: None,
+                context: None,
             });
             prompt_number += 1;
         }
@@ -133,6 +137,7 @@ async fn start_cancel_fixture(
             delivery: Delivery::Uncertain,
             created_at: 1,
             pr_ack: None,
+            context: None,
         });
     }
 

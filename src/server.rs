@@ -28,6 +28,25 @@ use crate::{
     watchers,
 };
 
+pub(crate) fn is_running(herdr: &Herdr, space_id: &SpaceId) -> Result<bool> {
+    let lock_is_held = |path: PathBuf| -> Result<bool> {
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+            Ok(_) => check_regular(&path)?,
+        }
+        let lock = OpenOptions::new().read(true).write(true).open(&path)?;
+        check_regular(&path)?;
+        match lock.try_lock() {
+            Ok(()) => Ok(false),
+            Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+            Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
+        }
+    };
+    let current = herdr.hub_socket(space_id)?.with_extension("lock");
+    lock_is_held(current)
+}
+
 pub(crate) struct Server {
     pub service: Service,
     stop: watch::Sender<bool>,
@@ -226,9 +245,6 @@ async fn connection(
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
     let mut identity: Option<(String, SpaceId)> = None;
-    // Bind the live harness as well as pane/space: replacing Pi with Claude (or
-    // vice versa) must not leave the previous participant connection admitted.
-    let mut harness: Option<String> = None;
     let mut recipient: Option<AgentId> = None;
     let mut subscribed = false;
     let mut notified: Option<MessageId> = None;
@@ -312,20 +328,25 @@ async fn connection(
         let mut checked_harness = None;
         if let Some((pane_id, space_id)) = &check {
             let validation = async {
-                ensure!(space_id == bound_space, "wrong mustr endpoint for this herdr space");
+                ensure!(
+                    space_id == bound_space,
+                    "wrong mustr endpoint for this herdr space"
+                );
                 let pane = herdr.pane(pane_id).await?;
                 ensure!(
                     &pane.workspace_id == space_id
                         && pane.pane_id == *pane_id
-                        && matches!(pane.agent.as_deref(), Some("pi" | "claude"))
-                        && harness.as_ref().is_none_or(|bound| Some(bound) == pane.agent.as_ref()),
-                    "pane moved, disappeared, or changed its supported agent (Pi/Claude Code); rejoin explicitly"
+                        && pane.agent.as_deref() == Some("pi"),
+                    "pane moved, disappeared, or is not running Pi; rejoin explicitly"
                 );
                 Ok::<_, color_eyre::Report>(pane.agent)
             }
             .await;
             match validation {
-                Ok(agent) => checked_harness = agent,
+                Ok(agent) => {
+                    checked_harness =
+                        agent.and_then(|agent| ClientHarness::from_verified_agent(&agent))
+                }
                 Err(error) => {
                     // Only an already-authenticated connection can survive an
                     // unavailable lookup. No actor request (including sync or
@@ -359,13 +380,16 @@ async fn connection(
         let subscribing = matches!(request.command, Command::Subscribe);
         let leaving = matches!(request.command, Command::Leave);
         let response = match role_manager {
-            Some(manager) => service.join(id, request, manager).await?,
+            Some(manager) => {
+                let harness = checked_harness
+                    .ok_or_else(|| eyre!("Join has no verified supported pane harness"))?;
+                service.join(id, request, manager, harness).await?
+            }
             None => service.request(id, request).await?,
         };
         if response.ok {
             if let Some(agent) = joining {
                 identity = check;
-                harness = checked_harness;
                 recipient = Some(agent);
             }
             if subscribing {

@@ -9,7 +9,7 @@ fn add_agent(
     config: &Scheduling,
 ) {
     state
-        .apply_validated_join(
+        .apply_validated_join_with_harness(
             &request(
                 &format!("join-{name}"),
                 Command::Join {
@@ -20,6 +20,7 @@ fn add_agent(
                     pane_id: pane.into(),
                     space_id: SpaceId::new("w1"),
                     cwd: None,
+                    context_modes: vec![ContextMode::Reuse, ContextMode::Fresh],
                     reset: None,
                 },
             ),
@@ -27,6 +28,7 @@ fn add_agent(
             now,
             config,
             false,
+            ClientHarness::Pi,
         )
         .unwrap();
     state
@@ -84,11 +86,110 @@ fn submit_assignment(
             to: owner.clone(),
             title: title.into(),
             text: format!("Implement {title}"),
+            context: ContextMode::Reuse,
         },
     );
-    let value = state.apply(&request, Some(requester), now, config).unwrap();
-    let id = serde_json::from_value(value["task_id"].clone()).unwrap();
+    let manager = state
+        .members
+        .values()
+        .find(|member| member.manager)
+        .map(|member| member.id.clone())
+        .expect("queue test fixture has an admitted manager");
+    let value = state.apply(&request, Some(&manager), now, config).unwrap();
+    let id: TaskId = serde_json::from_value(value["task_id"].clone()).unwrap();
+    if requester != &manager {
+        // Retain old multi-requester task cases as pre-existing history while
+        // keeping new assignment creation manager-only.
+        state.tasks.get_mut(&id).unwrap().requester = requester.clone();
+        if let Some(message) = state
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|message| message.task_id.as_ref() == Some(&id))
+        {
+            message.from = Some(requester.clone());
+        }
+    }
     (request, id, value)
+}
+
+#[test]
+fn report_kind_matrix_routes_to_requester_with_expected_wake_and_task_state() {
+    let cases = [
+        (
+            ReportKind::Status,
+            MessageKind::Status,
+            true,
+            TaskState::Assigned,
+            2,
+        ),
+        (
+            ReportKind::Progress,
+            MessageKind::Status,
+            true,
+            TaskState::Active,
+            0,
+        ),
+        (
+            ReportKind::Blocked,
+            MessageKind::Blocked,
+            true,
+            TaskState::Blocked,
+            2,
+        ),
+        (
+            ReportKind::Waiting,
+            MessageKind::Blocked,
+            false,
+            TaskState::Waiting,
+            2,
+        ),
+        (
+            ReportKind::Done,
+            MessageKind::Done,
+            true,
+            TaskState::Review,
+            2,
+        ),
+    ];
+    for (index, (kind, expected_kind, expected_wake, expected_state, expected_nudges)) in
+        cases.into_iter().enumerate()
+    {
+        let (mut state, manager, worker, config) = setup();
+        let task_id = assign(&mut state, &manager, &worker, &config);
+        if kind == ReportKind::Progress {
+            state.tasks.get_mut(&task_id).unwrap().state = TaskState::Active;
+        }
+        state.tasks.get_mut(&task_id).unwrap().nudges = 2;
+        state
+            .apply(
+                &request(
+                    &format!("report-matrix-{index}"),
+                    Command::Report {
+                        task_id: task_id.clone(),
+                        revision: 1,
+                        kind,
+                        text: "evidence for this report".into(),
+                    },
+                ),
+                Some(&worker),
+                2,
+                &config,
+            )
+            .unwrap();
+        let message = state.messages.last().unwrap();
+        assert_eq!(message.to, manager, "report kind {kind:?}");
+        assert_eq!(message.kind, expected_kind, "report kind {kind:?}");
+        assert_eq!(message.wake, expected_wake, "report kind {kind:?}");
+        assert_eq!(
+            state.tasks[&task_id].state, expected_state,
+            "report kind {kind:?}"
+        );
+        assert_eq!(
+            state.tasks[&task_id].nudges, expected_nudges,
+            "report kind {kind:?}"
+        );
+    }
 }
 
 fn roster(
@@ -755,6 +856,7 @@ fn sequence_exhaustion_fails_closed_without_creating_a_task() {
                         to: worker,
                         title: "Never allocated".into(),
                         text: "Sequence space is exhausted".into(),
+                        context: ContextMode::Reuse,
                     },
                 ),
                 Some(&architect),
@@ -784,6 +886,7 @@ fn sequence_exhaustion_fails_closed_without_creating_a_task() {
                         to: worker,
                         title: "Never allocated".into(),
                         text: "Recovered maximum sequence".into(),
+                        context: ContextMode::Reuse,
                     },
                 ),
                 Some(&architect),

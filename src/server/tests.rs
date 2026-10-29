@@ -166,6 +166,7 @@ async fn server_attests_only_the_selected_root_role_as_manager() {
                     pane_id: pane.into(),
                     space_id: space.clone(),
                     cwd: None,
+                    context_modes: vec![ContextMode::Reuse, ContextMode::Fresh],
                     reset: None,
                 },
             ),
@@ -231,10 +232,17 @@ async fn obsolete_report_conflict_keeps_the_same_socket_usable_after_a_guide_rac
             pane_id: "w1:p9".into(),
             space_id: space.clone(),
             cwd: None,
+            context_modes: vec![ContextMode::Reuse, ContextMode::Fresh],
             reset: None,
         },
     );
-    assert!(service.join(100, requester_join, true).await.unwrap().ok);
+    assert!(
+        service
+            .join(100, requester_join, true, ClientHarness::Pi)
+            .await
+            .unwrap()
+            .ok
+    );
     assert!(
         service
             .request(
@@ -285,6 +293,7 @@ async fn obsolete_report_conflict_keeps_the_same_socket_usable_after_a_guide_rac
                 pane_id: "w1:p1".into(),
                 space_id: space.clone(),
                 cwd: None,
+                context_modes: vec![ContextMode::Reuse, ContextMode::Fresh],
                 reset: None,
             },
         ),
@@ -313,6 +322,7 @@ async fn obsolete_report_conflict_keeps_the_same_socket_usable_after_a_guide_rac
                     to: owner.clone(),
                     title: "Reconcile a stale report".into(),
                     text: "A new Guide may race a staged terminal report.".into(),
+                    context: ContextMode::Reuse,
                 },
             ),
         )
@@ -454,6 +464,7 @@ async fn retired_connection_error_is_typed_on_the_wire_before_actor_mutation() {
                 pane_id: "w1:p1".into(),
                 space_id: space.clone(),
                 cwd: None,
+                context_modes: vec![ContextMode::Reuse, ContextMode::Fresh],
                 reset: None,
             },
         ),
@@ -578,6 +589,7 @@ async fn invalid_reset_receipt_join_does_not_consume_valid_admission() {
                     pane_id: "w1:p1".into(),
                     space_id: space.clone(),
                     cwd: None,
+                    context_modes: vec![],
                     reset: None,
                 },
             ),
@@ -663,6 +675,7 @@ async fn invalid_reset_receipt_join_does_not_consume_valid_admission() {
                 pane_id: "w1:p1".into(),
                 space_id: space.clone(),
                 cwd: None,
+                context_modes: vec![ContextMode::Reuse, ContextMode::Fresh],
                 reset: Some(receipt.clone()),
             },
         ),
@@ -689,6 +702,7 @@ async fn invalid_reset_receipt_join_does_not_consume_valid_admission() {
                 pane_id: "w1:p1".into(),
                 space_id: space.clone(),
                 cwd: None,
+                context_modes: vec![ContextMode::Reuse, ContextMode::Fresh],
                 reset: Some(receipt),
             },
         ),

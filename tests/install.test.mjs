@@ -5,19 +5,19 @@ import { access, mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile
 import { pathToFileURL } from "node:url";
 import { binary, exec } from "./support.mjs";
 
-test("install selects an explicit harness and touches only the requested temporary Pi directory", async t => {
+test("install selects an explicit Pi target and touches only the requested temporary directory", async t => {
   const directory = await mkdtemp("/tmp/mustr-install-test-");
   t.after(() => rm(directory, { recursive: true, force: true }));
   const config = `${directory}/config`, agent = `${directory}/agent`, envAgent = `${directory}/env-agent`;
   const env = { ...process.env, MUSTR_CONFIG_DIR: config, MUSTR_STATE_DIR: `${directory}/state`, PI_CODING_AGENT_DIR: envAgent };
 
   const help = (await exec(binary, ["install", "--help"], { env })).stdout;
-  assert.match(help, /<HARNESS>/);
+  assert.match(help, /<TARGET>/);
   assert.match(help, /pi\s+Install the Pi adapter/);
   const piHelp = (await exec(binary, ["install", "pi", "--help"], { env })).stdout.replace(/\s+/g, " ");
   assert.match(piHelp, /--agent-dir/);
   assert.match(piHelp, /--overwrite-roles/);
-  assert.match(piHelp, /all harnesses\/spaces sharing this config directory/);
+  assert.match(piHelp, /all spaces sharing this config directory/);
   assert.match(piHelp, /active prompt snapshots require explicit refresh\/reselection\/rejoin/i);
   await assert.rejects(exec(binary, ["install"], { env }));
   await assert.rejects(exec(binary, ["install", "unknown"], { env }));
@@ -33,6 +33,9 @@ test("install selects an explicit harness and touches only the requested tempora
   const transportName = contents.match(/from "\.\/(transport\.[a-f0-9]{24}\.mjs)"/)?.[1];
   assert.ok(transportName, "installed entry point uses an immutable native module URL");
   await access(`${agent}/extensions/mustr/${transportName}`);
+  const contextWindowName = contents.match(/from "\.\/(context-window\.[a-f0-9]{24}\.ts)"/)?.[1];
+  assert.ok(contextWindowName, "installed entry point uses an immutable context-window dependency");
+  assert.deepEqual(await readFile(`${agent}/extensions/mustr/${contextWindowName}`), await readFile(new URL("../pi/context-window.ts", import.meta.url)));
   await assert.rejects(access(`${agent}/settings.json`), { code: "ENOENT" });
   await assert.rejects(access(envAgent), { code: "ENOENT" }); // explicit flag takes precedence
   await exec(binary, ["install", "pi", "--agent-dir", agent], { env });
@@ -40,6 +43,47 @@ test("install selects an explicit harness and touches only the requested tempora
 
   await exec(binary, ["install", "pi"], { env });
   await access(`${envAgent}/extensions/mustr/index.ts`);
+});
+
+test("fresh setup, init and install seed the default crew only when the profile file is missing", async t => {
+  const directory = await mkdtemp("/tmp/mustr-profile-install-");
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const config = `${directory}/config`, agent = `${directory}/agent`;
+  const env = { ...process.env, MUSTR_CONFIG_DIR: config, MUSTR_STATE_DIR: `${directory}/state` };
+  const path = `${config}/profiles.toml`;
+  const bundled = await readFile(new URL("../profiles/default.toml", import.meta.url));
+  // First ordinary setup seeds; later ordinary commands respect deliberate deletion.
+  await exec(binary, ["roles", "--json"], { env });
+  assert.deepEqual(await readFile(path), bundled);
+  assert.equal((await stat(path)).mode & 0o777, 0o600);
+  await rm(path);
+  await exec(binary, ["roles", "--json"], { env });
+  await assert.rejects(access(path), { code: "ENOENT" });
+  await exec(binary, ["install", "pi", "--agent-dir", agent], { env });
+  assert.deepEqual(await readFile(path), bundled);
+  await rm(path);
+  await exec(binary, ["init"], { env });
+  assert.deepEqual(await readFile(path), bundled);
+
+  // Independently check these exact defaults against Pi's bundled, offline chat catalog.
+  const catalog = JSON.parse(await readFile(new URL("../pi/node_modules/@earendil-works/pi-ai/dist/providers/data/openai-codex.json", import.meta.url), "utf8"));
+  const models = Object.values(catalog).flatMap(group => Object.values(group));
+  const configured = [...bundled.toString().matchAll(/^model = "([^"]+)"$/gm)];
+  assert.equal(configured.length, 4);
+  for (const [, value] of configured) {
+    const separator = value.indexOf("/"), provider = value.slice(0, separator), id = value.slice(separator + 1);
+    assert.ok(models.some(model => model.type === "chat" && model.provider === provider && model.id === id && model.reasoning && model.thinkingLevelMap.high === "high"), `${value} must support high thinking in Pi's catalog`);
+  }
+
+  // Do not parse/merge/repair user-owned profiles, even if temporarily invalid.
+  const custom = Buffer.from("# custom profile work in progress\r\nnot valid TOML\n");
+  await writeFile(path, custom);
+  const before = await stat(path);
+  for (const args of [["init"], ["roles", "--json"], ["install", "pi", "--agent-dir", agent], ["install", "pi", "--agent-dir", agent, "--overwrite-roles"]]) {
+    await exec(binary, args, { env });
+    assert.deepEqual(await readFile(path), custom);
+    assert.equal((await stat(path)).ino, before.ino);
+  }
 });
 
 test("Pi --overwrite-roles refreshes only shipped roles with exact backups and no-op repeats", async t => {
@@ -146,6 +190,9 @@ test("upgrade escapes the native import cache and preserves the old entry point/
   const upgraded = await readFile(`${base}/index.ts`, "utf8");
   const transport = upgraded.match(/from "\.\/(transport\.[a-f0-9]{24}\.mjs)"/)?.[1];
   assert.ok(transport);
+  const contextWindow = upgraded.match(/from "\.\/(context-window\.[a-f0-9]{24}\.ts)"/)?.[1];
+  assert.ok(contextWindow);
+  assert.deepEqual(await readFile(`${base}/${contextWindow}`), await readFile(new URL("../pi/context-window.ts", import.meta.url)));
   const fresh = await import(pathToFileURL(`${base}/${transport}`).href);
   assert.equal(typeof fresh.insertionEvidence, "function");
   assert.equal(await readFile(`${base}/transport.mjs`, "utf8"), oldTransport);

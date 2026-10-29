@@ -739,6 +739,7 @@ dependencies = [
  "color-eyre",
  "crossterm",
  "futures-util",
+ "libc",
  "ratatui",
  "rusqlite",
  "rustix",

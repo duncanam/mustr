@@ -4,11 +4,12 @@ import net from "node:net";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { once } from "node:events";
 import { Agent } from "@earendil-works/pi-agent-core";
-import { InMemoryCredentialStore } from "@earendil-works/pi-ai";
+import { InMemoryCredentialStore, createAssistantMessageEventStream, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
 import {
-  AgentSession, createAgentSessionRuntime, createExtensionRuntime,
+  AgentSession, convertToLlm, createAgentSessionRuntime, createExtensionRuntime,
   ModelRuntime, SessionManager, SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { FRESH_ASSIGNMENT_MARKER_KEY, FRESH_ASSIGNMENT_MARKER_SCHEMA, MUSTR_CONTEXT_CUSTOM_TYPE } from "../context-window.ts";
 
 // Actual production adapter + actual pinned Pi lifecycle and replacement. Only the
 // Unix socket peer and `mustr context/roles` CLI are fixture implementations.
@@ -16,7 +17,7 @@ import {
 const sentinel = "OLD PRODUCTION ADAPTER CONVERSATION SENTINEL";
 const policy = "BASE POLICY: preserve private-path and source-control guards.";
 const model = {
-  id: "unused", name: "unused", provider: "runtime-test-no-provider", api: "unknown",
+  id: "unused", name: "unused", provider: "openai", api: "openai-completions",
   baseUrl: "", reasoning: false, input: ["text"], contextWindow: 100000, maxTokens: 100,
   cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
 };
@@ -34,7 +35,7 @@ async function until(check, description) {
   throw new Error(`Timed out: ${description}`);
 }
 
-async function fixture(t, { cancelOrder, rejectReceipt = false } = {}) {
+async function fixture(t, { cancelOrder, rejectReceipt = false, fakeProvider = false, allowPolicyTool = false, forceCustomTimestampGap = false, compactable = false } = {}) {
   const directory = await mkdtemp("/tmp/mustr-runtime-");
   const socketPath = `${directory}/peer.sock`;
   const identity = { protocol: 1, socket: socketPath, server_key: "fixture-server", space_id: "w1", pane_id: "w1:p1" };
@@ -46,7 +47,8 @@ async function fixture(t, { cancelOrder, rejectReceipt = false } = {}) {
   const { default: adapter } = await import(`../index.ts?runtime=${directory}`);
   const calls = [], sockets = new Set(), peerErrors = [];
   const freshAttempt = deferred(), releaseReceipt = deferred();
-  let oldId, freshId, control, claimed = false, complete = false, streamCalls = 0, snapshotRevision = 0, runtime;
+  let oldId, freshId, control, claimed = false, complete = false, streamCalls = 0, snapshotRevision = 0, runtime, tasks = [], inboxMessage, offeredMessage, policyToolCalls = 0, timestampGapApplied = false;
+  const providerRequests = [], fakeResponses = [];
   const token = "FIXTURE-PRIVATE-RESET-TICKET";
   const server = net.createServer(socket => {
     sockets.add(socket); socket.on("close", () => sockets.delete(socket)); socket.on("error", () => {});
@@ -68,7 +70,7 @@ async function fixture(t, { cancelOrder, rejectReceipt = false } = {}) {
               assert.equal(oldId, undefined, "no automatic ordinary old-ID reconnect");
               oldId = request.agent_id; joined = oldId;
               assert.equal(request.role, "researcher"); assert.equal(request.name, "runtime-researcher");
-              result = { delivery_policy: 1, inbox_notifications: 1, reset_protocol: 1 };
+              result = { delivery_policy: 1, inbox_notifications: 1, reset_protocol: 1, context_selection: 1, context_modes: ["reuse", "fresh"] };
             } else {
               assert.equal(claimed, true, "fresh Join follows durable claim");
               assert.notEqual(request.agent_id, oldId);
@@ -81,18 +83,25 @@ async function fixture(t, { cancelOrder, rejectReceipt = false } = {}) {
                 return;
               }
               complete = true;
-              result = { reset_receipt: true, agent_id: freshId, reset_protocol: 1, delivery_policy: 1, inbox_notifications: 1 };
+              result = { reset_receipt: true, agent_id: freshId, reset_protocol: 1, delivery_policy: 1, inbox_notifications: 1, context_selection: 1, context_modes: ["reuse", "fresh"] };
             }
             break;
           case "reset_capability": result = { reset_protocol: 1 }; break;
           case "subscribe": result = { subscribed: true }; break;
-          case "sync":
-            result = { members: [{ id: joined, activity: "working", last_seen: ++snapshotRevision }], tasks: [], automation: {}, inbox: null };
+          case "sync": {
+            const inbox = request.receive && inboxMessage ? inboxMessage : null;
+            if (inbox) { offeredMessage = inboxMessage; inboxMessage = undefined; }
+            result = { members: [{ id: joined, activity: "working", last_seen: ++snapshotRevision }], tasks: structuredClone(tasks), automation: {}, inbox: inbox ? structuredClone(inbox) : null, ...(inbox ? { insertion_policy: "idle_only" } : {}) };
             if (control && !complete) {
               result.reset_summary = { state: "incomplete", note: "Fixture history retained" };
               result.reset_control = { ...control };
             } else if (complete) result.reset_summary = { state: "completed" };
             break;
+          }
+          case "ack":
+            assert.equal(offeredMessage?.id, request.message_id, "ACK follows the one actual insertion offer"); offeredMessage = undefined; result = { acked: true }; break;
+          case "defer":
+            assert.equal(offeredMessage?.id, request.message_id); inboxMessage = offeredMessage; offeredMessage = undefined; result = { deferred: true }; break;
           case "reset_claim":
             assert.equal(joined, oldId); assert.equal(claimed, false);
             assert.equal(request.plan_id, control.plan_id); assert.equal(request.token, token);
@@ -108,7 +117,9 @@ async function fixture(t, { cancelOrder, rejectReceipt = false } = {}) {
     }
   });
   server.listen(socketPath); await once(server, "listening");
-  const modelRuntime = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(), modelsPath: null, allowModelNetwork: false, refreshOnCreate: false });
+  const credentials = new InMemoryCredentialStore();
+  if (fakeProvider) await credentials.modify(model.provider, async () => ({ type: "api_key", key: "fixture-only-not-sent" }));
+  const modelRuntime = await ModelRuntime.create({ credentials, modelsPath: null, allowModelNetwork: false, refreshOnCreate: false });
   const states = [], errors = [];
 
   async function createRuntime({ sessionManager, sessionStartEvent }) {
@@ -116,7 +127,7 @@ async function fixture(t, { cancelOrder, rejectReceipt = false } = {}) {
     const path = "<inline:production-mustr-runtime-test>";
     const sourceInfo = { path, source: "inline", scope: "temporary", origin: "top-level" };
     const extension = { path, resolvedPath: path, sourceInfo, commands: new Map(), handlers: new Map(), tools: new Map(), flags: new Map(), shortcuts: new Map(), messageRenderers: new Map() };
-    const state = { actions, extension, notifications: [], dispatches: [], invocations: [], starts: [], statuses: [], contexts: [], disposed: false };
+    const state = { actions, extension, notifications: [], dispatches: [], invocations: [], starts: [], statuses: [], contexts: [], contextInputs: [], messageStarts: [], disposed: false };
     states.push(state);
     // Public typed registration proxy: production chooses every handler/tool/command.
     // Action methods delegate to Pi's REAL runtime, not a simulated send/newSession.
@@ -126,6 +137,8 @@ async function fixture(t, { cancelOrder, rejectReceipt = false } = {}) {
         handlers.push(handler); extension.handlers.set(name, handlers);
         return () => { const i = handlers.indexOf(handler); if (i >= 0) handlers.splice(i, 1); };
       },
+      registerFlag(name, options) { extension.flags.set(name, options); },
+      getFlag() { return undefined; },
       registerTool(definition) { extension.tools.set(definition.name, { definition, sourceInfo }); },
       registerCommand(name, command) {
         extension.commands.set(name, { ...command, name, sourceInfo, async handler(args, ctx) {
@@ -133,11 +146,22 @@ async function fixture(t, { cancelOrder, rejectReceipt = false } = {}) {
         } });
       },
     };
+    if (fakeProvider) {
+      registration.on("context", event => state.contextInputs.push(structuredClone(event.messages)));
+      registration.on("message_start", event => state.messageStarts.push(structuredClone(event.message)));
+    }
     const api = new Proxy(registration, { get(target, key) {
       if (key in target) return target[key];
       return (...args) => {
         actions.assertActive();
         if (key === "sendUserMessage") state.dispatches.push(args[0]);
+        if (key === "sendMessage" && forceCustomTimestampGap && args[0]?.customType === MUSTR_CONTEXT_CUSTOM_TYPE) {
+          const realNow = Date.now;
+          Date.now = () => realNow() - 60_000;
+          timestampGapApplied = true;
+          try { return actions[key](...args); }
+          finally { Date.now = realNow; }
+        }
         return actions[key](...args);
       };
     } });
@@ -170,12 +194,39 @@ async function fixture(t, { cancelOrder, rejectReceipt = false } = {}) {
       getAppendSystemPrompt: () => [], getAppendSystemPromptSources: () => [],
       extendResources() { throw new Error("Unexpected discovery"); }, async reload() { throw new Error("Unexpected discovery"); },
     };
-    const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false }, retry: { enabled: false }, cacheWarming: "off" });
-    const agent = new Agent({ initialState: { model }, prepareRequest() { throw new Error("Provider requests forbidden"); }, streamFn() { streamCalls++; throw new Error("No model calls"); } });
+    const settingsManager = SettingsManager.inMemory({ compaction: { enabled: false, ...(compactable ? { keepRecentTokens: 1 } : {}) }, retry: { enabled: false }, cacheWarming: "off" });
+    const extensionRunnerRef = { current: undefined };
+    const agent = new Agent({
+      initialState: { model },
+      convertToLlm,
+      prepareRequest() {
+        if (!fakeProvider) throw new Error("Provider requests forbidden");
+      },
+      transformContext: async messages => {
+        const runner = extensionRunnerRef.current;
+        return runner ? runner.emitContext(messages) : messages;
+      },
+      streamFn(_model, context) {
+        streamCalls++;
+        if (!fakeProvider) throw new Error("No model calls");
+        providerRequests.push({
+          messages: structuredClone(context.messages),
+          tools: context.messages.flatMap(message => message.role === "system" ? (message.toolsAdded ?? []).map(tool => tool.name) : []),
+        });
+        const stream = createAssistantMessageEventStream();
+        const response = fakeResponses.shift() ?? fauxAssistantMessage("Fixture provider response.");
+        setTimeout(() => stream.end(response), 0);
+        return stream;
+      },
+    });
     const session = new AgentSession({
-      agent, sessionManager, settingsManager, resourceLoader, modelRuntime, cwd: directory,
+      agent, sessionManager, settingsManager, resourceLoader, modelRuntime, cwd: directory, extensionRunnerRef,
       sessionStartEvent, initialActiveToolNames: ["policy-tool"], baseToolsOverride: {
-        "policy-tool": { name: "policy-tool", label: "policy-tool", description: "Preserved policy guard", parameters: { type: "object", properties: {} }, async execute() { throw new Error("No policy tool execution"); } },
+        "policy-tool": { name: "policy-tool", label: "policy-tool", description: "Preserved policy guard", parameters: { type: "object", properties: {} }, async execute() {
+          if (!allowPolicyTool) throw new Error("No policy tool execution");
+          policyToolCalls++;
+          return { content: [{ type: "text", text: "Host policy tool ran." }], details: {} };
+        } },
       },
     });
     session.refreshContext(); state.session = session;
@@ -205,12 +256,26 @@ async function fixture(t, { cancelOrder, rejectReceipt = false } = {}) {
     await new Promise(resolve => server.close(resolve));
     for (const [key, value] of previousEnv) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
     await rm(directory, { recursive: true, force: true });
-    assert.equal(streamCalls, 0); assert.deepEqual(peerErrors, []); assert.deepEqual(errors, []);
+    if (!fakeProvider) assert.equal(streamCalls, 0);
+    assert.deepEqual(peerErrors, []); assert.deepEqual(errors, []);
   });
   await runtime.session.sendUserMessage("/role researcher runtime-researcher", { expandPromptTemplates: true });
   await until(() => calls.some(call => call.op === "sync"), "production adapter initial sync");
   return {
-    runtime, states, manager, calls, token, errors, peerErrors,
+    runtime, states, manager, calls, token, errors, peerErrors, providerRequests, modelRuntime,
+    async setTasks(value) { tasks = structuredClone(value); await states.at(-1).roster(); },
+    async deliverFresh(taskId = "fresh-delivered-task") {
+      const owner = runtime.session.sessionManager.getSessionId();
+      tasks = [{ id: taskId, requester: "fixture-manager", owner, space_id: "w1", state: "assigned", revision: 1, title: taskId, context: "fresh" }];
+      await states.at(-1).roster();
+      inboxMessage = { id: `message-${taskId}`, kind: "assignment", from: "fixture-manager", to: owner, task_id: taskId, revision: 1, space_id: "w1", context: "fresh", wake: true, text: `Fresh assignment body ${taskId}.` };
+      for (const socket of sockets) socket.write('{"event":"inbox_ready"}\n');
+      await until(() => calls.some(call => call.op === "ack" && call.message_id === `message-${taskId}`), "actual Fresh assignment insertion ACK");
+      return { owner, entry: runtime.session.sessionManager.getBranch().find(entry => entry.type === "custom_message" && entry.details?.id === `message-${taskId}`) };
+    },
+    enqueueFakeResponse(response) { fakeResponses.push(response); },
+    policyToolCalls: () => policyToolCalls,
+    timestampGapApplied: () => timestampGapApplied,
     async start() {
       control = { plan_id: "fixture-plan", token, old_agent_id: oldId, name: "runtime-researcher", role: "researcher", space_id: "w1", pane_id: "w1:p1", state: "pending" };
       const roster = await states[0].roster();
@@ -285,6 +350,151 @@ test("production adapter + real Pi runtime: receipt-gated fresh factory restores
   assert.equal(JSON.stringify(visible).includes(f.token), false);
   assert.equal(JSON.stringify(visible).includes(sentinel), false);
   assert.deepEqual(f.errors, []);
+});
+
+test("production adapter + real Pi runtime: Fresh replaces the native prefix, Reuse retains that window, and later Fresh replaces it", { timeout: 15000 }, async t => {
+  const f = await fixture(t);
+  const session = f.runtime.session, manager = session.sessionManager, owner = manager.getSessionId();
+  manager.appendMessage({ role: "user", content: "PRIVATE BEFORE FRESH ASSIGNMENT", timestamp: Date.now() });
+  const addFresh = (taskId, messageId) => {
+    const marker = {
+      schema: FRESH_ASSIGNMENT_MARKER_SCHEMA, authority: "authenticated-hub-assignment", kind: "assignment", mode: "fresh",
+      taskId, revision: 1, messageId, nativeOwnerId: owner, nativeSessionId: owner, originSpaceId: "w1",
+    };
+    manager.appendCustomMessageEntry(MUSTR_CONTEXT_CUSTOM_TYPE, `Fresh assignment ${taskId}`, true, {
+      id: messageId, kind: "assignment", task_id: taskId, revision: 1, context: "fresh",
+      [FRESH_ASSIGNMENT_MARKER_KEY]: marker,
+    });
+  };
+  const task = (id, context) => ({ id, requester: "fixture-manager", owner, space_id: "w1", state: "active", revision: 1, title: id, context });
+
+  await f.setTasks([task("fresh-A", "fresh")]);
+  addFresh("fresh-A", "message-A"); session.refreshContext();
+  const freshA = await session.extensionRunner.emitContext(session.messages);
+  assert.doesNotMatch(JSON.stringify(freshA), /OLD PRODUCTION ADAPTER|PRIVATE BEFORE FRESH ASSIGNMENT/);
+  assert.match(JSON.stringify(freshA), /Fresh assignment fresh-A/);
+
+  await f.setTasks([task("reuse-B", "reuse")]);
+  manager.appendCustomMessageEntry(MUSTR_CONTEXT_CUSTOM_TYPE, "Reuse assignment reuse-B", true, {
+    id: "message-B", kind: "assignment", task_id: "reuse-B", revision: 1, context: "reuse",
+  });
+  session.refreshContext();
+  const reuseB = await session.extensionRunner.emitContext(session.messages);
+  assert.doesNotMatch(JSON.stringify(reuseB), /OLD PRODUCTION ADAPTER|PRIVATE BEFORE FRESH ASSIGNMENT/);
+  assert.match(JSON.stringify(reuseB), /Fresh assignment fresh-A/);
+  assert.match(JSON.stringify(reuseB), /Reuse assignment reuse-B/);
+
+  await f.setTasks([task("fresh-C", "fresh")]);
+  addFresh("fresh-C", "message-C"); session.refreshContext();
+  const freshC = await session.extensionRunner.emitContext(session.messages);
+  assert.doesNotMatch(JSON.stringify(freshC), /OLD PRODUCTION ADAPTER|PRIVATE BEFORE FRESH ASSIGNMENT|Fresh assignment fresh-A|Reuse assignment reuse-B/);
+  assert.match(JSON.stringify(freshC), /Fresh assignment fresh-C/);
+});
+
+test("production adapter + real Pi runtime: actual Fresh delivery exercises Pi's live/persisted custom timestamps", { timeout: 20000 }, async t => {
+  const f = await fixture(t, { fakeProvider: true, forceCustomTimestampGap: true });
+  const session = f.runtime.session, manager = session.sessionManager;
+  manager.appendMessage({ role: "user", content: "PRIVATE_BEFORE_ACTUAL_FRESH_DELIVERY", timestamp: Date.now() });
+  session.refreshContext();
+  const delivered = await f.deliverFresh("actual-fresh-delivery");
+  assert.ok(delivered.entry, "actual adapter insertion is present in the native branch");
+  await session.waitForIdle();
+  assert.equal(f.timestampGapApplied(), true, "test deterministically delayed the SDK AppMessage timestamp");
+  assert.equal(f.calls.filter(call => call.op === "ack" && call.message_id === "message-actual-fresh-delivery").length, 1);
+  assert.ok(f.providerRequests.length >= 1, "the actionable Fresh assignment reached the fake provider stream");
+  const initial = f.providerRequests[0];
+  assert.ok(Array.isArray(initial.messages));
+  const persistedTimestamp = Date.parse(delivered.entry.timestamp);
+  assert.ok(Number.isFinite(persistedTimestamp));
+  const observed = f.states[0].contextInputs.find(messages => messages.some(message => message.role === "custom" && message.details?.id === "message-actual-fresh-delivery"));
+  assert.ok(observed, "the real registered context hook ran on the actual provider path");
+  const canonicalAssignment = observed.find(message => message.role === "custom" && message.details?.id === "message-actual-fresh-delivery");
+  assert.equal(canonicalAssignment.timestamp, persistedTimestamp, "AgentSession request projection reaches context with the canonical persisted timestamp");
+  const liveEventMessage = f.states[0].messageStarts.find(message => message.role === "custom" && message.details?.id === "message-actual-fresh-delivery");
+  assert.ok(liveEventMessage, "the real AgentSession emitted message_start for the delivered Fresh message");
+  assert.ok(Math.abs(liveEventMessage.timestamp - persistedTimestamp) >= 55_000, "the actual pre-persistence AppMessage timestamp differs, but is not the projected context source");
+  const finalInput = JSON.stringify(initial.messages);
+  assert.doesNotMatch(finalInput, /PRIVATE_BEFORE_ACTUAL_FRESH_DELIVERY/, "old conversation is excluded from the final fake-provider input");
+  assert.match(finalInput, /Fresh assignment body actual-fresh-delivery/);
+  assert.ok(finalInput.includes("BASE POLICY"), "current host system prompt remains in the final request");
+  assert.ok(initial.tools.includes("policy-tool"), "host tools remain available in the final request");
+  assert.ok(initial.tools.includes("mustr_roster"), "the selected Mustr role tools remain available");
+  assert.equal(session.sessionManager.getSessionId(), delivered.owner, "Fresh preserves native session identity");
+  assert.match(JSON.stringify(session.sessionManager.getEntries()), /PRIVATE_BEFORE_ACTUAL_FRESH_DELIVERY/, "raw native archive remains intact");
+  assert.match(JSON.stringify(session.messages), /Fixture provider response/);
+  assert.equal(f.providerRequests.length, 1, "one legitimate task turn executed without a retry/provider request");
+});
+
+test("production adapter + real Pi runtime: idle manual Fresh compaction failure cancels without poisoning retry or host tools", { timeout: 25000 }, async t => {
+  const f = await fixture(t, { fakeProvider: true, allowPolicyTool: true, compactable: true });
+  const session = f.runtime.session;
+  session.sessionManager.appendMessage({ role: "user", content: "PRIVATE_BEFORE_MANUAL_COMPACT", timestamp: Date.now() });
+  session.refreshContext();
+  await f.deliverFresh("manual-compact-fresh");
+  await session.waitForIdle();
+  const initialCompactions = session.sessionManager.getBranch().filter(entry => entry.type === "compaction").length;
+
+  await assert.rejects(session.compact(), /Compaction cancelled/);
+  assert.equal(session.sessionManager.getBranch().filter(entry => entry.type === "compaction").length, initialCompactions,
+    "a failed scoped manual summary is cancelled rather than falling through to native full-history compaction");
+  assert.ok(f.states[0].notifications.some(note => /Fresh-scoped compaction was cancelled/.test(note)), "idle cancellation is visible without a staged task report");
+  assert.equal(f.calls.some(call => call.op === "report"), false, "idle manual compaction does not fabricate a blocked report");
+  const contextEventsBeforeRetry = f.states[0].contextInputs.length;
+  f.enqueueFakeResponse(fauxAssistantMessage("Fresh context re-evaluated after cancelled idle compaction."));
+  await session.sendUserMessage("Re-evaluate the active Fresh task after the cancelled manual compaction.");
+  await session.waitForIdle();
+  assert.ok(f.states[0].contextInputs.length > contextEventsBeforeRetry, "the actual public context hook reruns for the new provider request");
+  const reevaluated = f.providerRequests.at(-1);
+  assert.doesNotMatch(JSON.stringify(reevaluated.messages), /PRIVATE_BEFORE_MANUAL_COMPACT/);
+  assert.match(JSON.stringify(reevaluated.messages), /Fresh assignment body manual-compact-fresh/);
+  assert.match(JSON.stringify(reevaluated.messages), /Re-evaluate the active Fresh task/);
+  assert.match(JSON.stringify(session.messages), /Fresh context re-evaluated after cancelled idle compaction/);
+
+  // Retry the real public manual entry point with a deterministic local summary stream.
+  f.modelRuntime.streamSimple = () => {
+    const stream = createAssistantMessageEventStream();
+    setTimeout(() => stream.end(fauxAssistantMessage("Fresh-scoped retry summary.")), 0);
+    return stream;
+  };
+  await session.compact();
+  assert.equal(session.sessionManager.getBranch().filter(entry => entry.type === "compaction").length, initialCompactions + 1,
+    "valid re-evaluation can retry and commit a boundary-tagged scoped summary");
+  const compactEntry = session.sessionManager.getBranch().find(entry => entry.type === "compaction");
+  assert.match(JSON.stringify(compactEntry?.details), /mustrContextWindow/);
+
+  await session.sendUserMessage("/mustr leave", { expandPromptTemplates: true });
+  assert.equal(session.getActiveToolNames().includes("mustr_roster"), false);
+  f.enqueueFakeResponse(fauxAssistantMessage(fauxToolCall("policy-tool", {})));
+  f.enqueueFakeResponse(fauxAssistantMessage("Host turn completed after Mustr leave."));
+  const requestsBeforeHost = f.providerRequests.length;
+  await session.sendUserMessage("HOST request after Mustr leave");
+  await session.waitForIdle();
+  assert.equal(f.policyToolCalls(), 1, "ordinary host tools remain available after idle Fresh-compaction failure and leave");
+  assert.ok(f.providerRequests.length >= requestsBeforeHost + 2, "the actual host turn and tool-result continuation reached the fake provider");
+  assert.ok(f.providerRequests.slice(requestsBeforeHost).every(request => request.tools.includes("policy-tool")));
+  assert.match(JSON.stringify(session.messages), /Host turn completed after Mustr leave/);
+});
+
+test("production adapter + real Pi runtime: missing Fresh marker stays fail-closed through leave until native settlement", { timeout: 15000 }, async t => {
+  const f = await fixture(t);
+  const session = f.runtime.session, manager = session.sessionManager, owner = manager.getSessionId();
+  await f.setTasks([{ id: "fresh-without-marker", requester: "fixture-manager", owner, space_id: "w1", state: "active", revision: 1, title: "Missing marker", context: "fresh" }]);
+  const runner = session.extensionRunner;
+  await runner.emit({ type: "agent_start" });
+  const blocked = await runner.emitContext(session.messages);
+  assert.equal(blocked.length, 1);
+  assert.match(JSON.stringify(blocked), /could not safely select this assignment context/);
+  assert.doesNotMatch(JSON.stringify(blocked), /OLD PRODUCTION ADAPTER/);
+
+  await session.sendUserMessage("/mustr leave", { expandPromptTemplates: true });
+  const stillBlocked = await runner.emitContext(session.messages);
+  assert.match(JSON.stringify(stillBlocked), /could not safely select this assignment context/);
+  const toolCall = await runner.emitToolCall({ type: "tool_call", toolCallId: "fresh-fence", toolName: "read", input: { path: "unused" } });
+  assert.equal(toolCall?.block, true);
+  assert.equal(toolCall?.terminate, true);
+
+  await runner.emit({ type: "agent_settled", aborted: false });
+  assert.equal(await runner.emitToolCall({ type: "tool_call", toolCallId: "after-settlement", toolName: "read", input: { path: "unused" } }), undefined);
 });
 
 for (const cancelOrder of ["before", "after"]) test(`production adapter + real Pi runtime: ${cancelOrder}-ordered veto preserves original context`, { timeout: 15000 }, async t => {

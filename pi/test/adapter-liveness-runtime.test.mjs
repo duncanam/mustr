@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
 import { once } from "node:events";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { Agent } from "@earendil-works/pi-agent-core";
@@ -152,17 +152,35 @@ function gatedProvider(content) {
   };
 }
 
-async function fixture(t, { retryDelay = 1 } = {}) {
+async function fixture(t, { retryDelay = 1, profileLaunch = false, profileModel = model, requestedModel = `${profileModel.provider}/${profileModel.id}`, requestedThinking = "off", expectRefusal = false } = {}) {
   const directory = await mkdtemp(join(tmpdir(), "mustr-liveness-"));
   const identity = {
     protocol: 1, socket: join(directory, "peer.sock"), server_key: "synthetic-server",
     space_id: "fixture-space", pane_id: "fixture-pane",
   };
+  let launchDescriptorPath, launchReadyPath;
+  if (profileLaunch) {
+    const launchDir = join(directory, "launch");
+    await mkdir(launchDir, { mode: 0o700 });
+    launchDescriptorPath = join(launchDir, "descriptor.json");
+    launchReadyPath = join(launchDir, "ready.json");
+    const descriptor = {
+      version: 1, launch_id: "00000000-0000-4000-8000-000000000001", server_key: identity.server_key,
+      space_id: identity.space_id, pane_id: identity.pane_id, tab_id: "fixture-tab", socket: identity.socket,
+      profile: "team", slot: "researcher", instance: "team/researcher", tab_name: "Researcher",
+      role: { name: "researcher", description: "Synthetic role", prompt: "Use only the synthetic fixture.", manager: false },
+      model: requestedModel, thinking: requestedThinking, cwd: directory, config_dir: directory,
+      state_dir: join(directory, "state"), binary: join(directory, "mustr"), descriptor_path: launchDescriptorPath,
+      ready_path: launchReadyPath, spec_digest: "0123456789abcdef01234567",
+    };
+    await writeFile(launchDescriptorPath, JSON.stringify(descriptor), { mode: 0o400 });
+  }
   const cli = join(directory, "mustr-fixture.mjs");
   await writeFile(cli, `#!${process.execPath}\nconst args = process.argv.slice(2);\nif (args.includes('context')) console.log(${JSON.stringify(JSON.stringify(identity))});\nelse if (args.includes('roles')) console.log(JSON.stringify([{ name: 'researcher', description: 'Isolated fixture', prompt: 'Operate only this synthetic fixture.' }]));\nelse process.exit(2);\n`, { mode: 0o700 });
-  const envKeys = ["MUSTR_BIN", "MUSTR_CONFIG_DIR", "HERDR_ENV"];
+  const envKeys = ["MUSTR_BIN", "MUSTR_CONFIG_DIR", "HERDR_ENV", "MUSTR_LAUNCH_DESCRIPTOR"];
   const previousEnv = new Map(envKeys.map(key => [key, process.env[key]]));
   Object.assign(process.env, { MUSTR_BIN: cli, MUSTR_CONFIG_DIR: directory, HERDR_ENV: "1" });
+  if (launchDescriptorPath) process.env.MUSTR_LAUNCH_DESCRIPTOR = launchDescriptorPath;
   const calls = new Journal(), events = new Journal(), statuses = new Journal(), modelRequests = new Journal();
   const peerErrors = [], extensionErrors = [], unexpectedRequests = [], streamErrors = [], notices = [], operations = [];
   calls.diagnostics = () => ({ streamErrors, events: events.entries, status: statuses.entries.at(-1) });
@@ -195,7 +213,7 @@ async function fixture(t, { retryDelay = 1 } = {}) {
           switch (request.op) {
             case "join":
               agentId = request.agent_id; joined = agentId;
-              result = { delivery_policy: 1, inbox_notifications: 1 };
+              result = { delivery_policy: 1, inbox_notifications: 1, context_selection: 1, context_modes: ["reuse", "fresh"] };
               break;
             case "subscribe": result = { subscribed: true }; break;
             case "sync": {
@@ -299,6 +317,8 @@ async function fixture(t, { retryDelay = 1 } = {}) {
     },
     registerTool(definition) { extension.tools.set(definition.name, { definition, sourceInfo }); },
     registerCommand(name, command) { extension.commands.set(name, { ...command, name, sourceInfo }); },
+    registerFlag(name, options) { extension.flags.set(name, options); },
+    getFlag(name) { return name === "mustr-launch" ? launchDescriptorPath : undefined; },
   };
   const api = new Proxy(registration, { get(target, key) {
     if (key in target) return target[key];
@@ -364,11 +384,16 @@ async function fixture(t, { retryDelay = 1 } = {}) {
   // Auth is preflight-only. This value is never sent; streamFn is the only provider path.
   await credentials.modify("anthropic", async () => ({ type: "api_key", key: "synthetic-never-sent" }));
   const modelRuntime = await ModelRuntime.create({ credentials, modelsPath: null, allowModelNetwork: false, refreshOnCreate: false });
+  if (profileLaunch) modelRuntime.registerNativeProvider({
+    id: profileModel.provider, name: "Synthetic provider", auth: { apiKey: { name: "Synthetic key", resolve: async () => undefined } },
+    getModels: () => [profileModel], stream: () => { throw new Error("Profile startup must not call a provider"); },
+    streamSimple: () => { throw new Error("Profile startup must not call a provider"); },
+  });
   const sessionManager = SessionManager.inMemory(directory);
   // Mirror createAgentSession's coding-agent message conversion. Agent-core's
   // default drops custom messages, which would make addressed wakes invisible
   // to the synthetic model despite a real SDK insertion/receipt.
-  const agent = new Agent({ initialState: { model }, sessionId: sessionManager.getSessionId(), convertToLlm, streamFn(_model, context, options) {
+  const agent = new Agent({ initialState: { model: profileModel }, sessionId: sessionManager.getSessionId(), convertToLlm, streamFn(_model, context, options) {
     const request = { index: modelRequests.entries.length, messages: structuredClone(context.messages) };
     modelRequests.push(request);
     const step = steps.shift();
@@ -419,13 +444,14 @@ async function fixture(t, { retryDelay = 1 } = {}) {
     if (event.type === "agent_settled") events.push({ type: event.type, aborted: event.aborted });
     if (event.type === "auto_retry_start" || event.type === "auto_retry_end") events.push({ ...event });
   });
-  await session.sendUserMessage("/role researcher fixture-participant", { expandPromptTemplates: true });
-  await calls.waitFor(call => call.op === "sync", "production adapter admission").catch(error => {
+  if (!profileLaunch) await session.sendUserMessage("/role researcher fixture-participant", { expandPromptTemplates: true });
+  if (!expectRefusal) await calls.waitFor(call => call.op === "sync", "production adapter admission").catch(error => {
     error.message += `\nAdapter diagnostics: ${JSON.stringify({ notices, statuses: statuses.entries, extensionErrors })}`;
     throw error;
   });
   return {
     session, calls, events, statuses, modelRequests, notices, operations, tasks, control,
+    launchDescriptorPath, launchReadyPath,
     get id() { return agentId; },
     plan(...next) { steps.push(...next); },
     rejectOnceBeforeExecution(op) {
@@ -461,8 +487,8 @@ async function fixture(t, { retryDelay = 1 } = {}) {
     },
     abortNextReportResult() { nextAbortToolResult = true; },
     async finishAbort() { if (abortPromise) await abortPromise; },
-    ownTask(id, state = "active") {
-      const task = { id, requester: "fixture-manager", owner: agentId, state, revision: 1, title: id };
+    ownTask(id, state = "active", context = undefined) {
+      const task = { id, requester: "fixture-manager", owner: agentId, space_id: identity.space_id, state, revision: 1, title: id, ...(context ? { context } : {}) };
       tasks.set(id, task); return task;
     },
     enqueue(value) {
@@ -501,8 +527,48 @@ function timedTrace(f, t) {
   return trace;
 }
 
+test("real Pi SDK profile startup joins from an explicit descriptor and writes a readiness receipt", { timeout: 15000 }, async t => {
+  const f = await fixture(t, { profileLaunch: true });
+  const join = await f.calls.waitFor(call => call.op === "join", "profile startup join");
+  assert.equal(join.role, "researcher");
+  assert.equal(join.pane_id, "fixture-pane");
+  assert.equal(join.space_id, "fixture-space");
+  assert.equal(f.calls.entries.some(call => call.op === "context"), false, "profile identity comes only from the validated launch descriptor");
+  assert.equal(f.modelRequests.entries.length, 0, "startup/join makes no model/provider request");
+  await f.calls.waitFor(call => call.op === "sync", "first profile roster sync after admission");
+  const ready = JSON.parse(await readFile(f.launchReadyPath, "utf8"));
+  assert.deepEqual(ready, {
+    version: 1, launch_id: "00000000-0000-4000-8000-000000000001", server_key: "synthetic-server",
+    space_id: "fixture-space", pane_id: "fixture-pane", agent_id: f.session.sessionManager.getSessionId(),
+    role: "researcher", model: "anthropic/mustr-liveness-fixture", thinking: "off",
+  });
+});
+
+for (const id of ["vendor/claude-sonnet-4", "us.anthropic.claude-sonnet-4-v1:0", "region/vendor/claude:0"]) {
+  test(`profile startup preserves exact model suffix ${id}`, { timeout: 15000 }, async t => {
+    const f = await fixture(t, { profileLaunch: true, profileModel: { ...model, id } });
+    const ready = JSON.parse(await readFile(f.launchReadyPath, "utf8"));
+    assert.equal(ready.model, `anthropic/${id}`);
+    assert.equal(f.session.model.id, id);
+    assert.equal(f.modelRequests.entries.length, 0);
+  });
+}
+
+for (const mismatch of [
+  { requestedModel: "anthropic/mustr-liveness-fixture/nested:0", error: /exact requested model/ },
+  { requestedThinking: "high", error: /thinking .*not requested high/ },
+]) {
+  test(`profile startup refuses a mismatched ${mismatch.requestedModel ? "model" : "thinking level"}`, { timeout: 15000 }, async t => {
+    const f = await fixture(t, { profileLaunch: true, expectRefusal: true, ...mismatch });
+    assert.ok(f.notices.some(notice => notice.level === "error" && mismatch.error.test(notice.text)));
+    assert.equal(f.calls.entries.some(call => call.op === "join"), false);
+    await assert.rejects(readFile(f.launchReadyPath), { code: "ENOENT" });
+    assert.equal(f.modelRequests.entries.length, 0);
+  });
+}
+
 // Publication must cross REAL Pi settlement, not a hand-written settle(false).
-test("real SDK: terminal report publishes once after settlement without pausing", { timeout: 15000 }, async t => {
+test("real SDK: terminal report publishes once after settlement without pausing",  { timeout: 15000 }, async t => {
   const f = await fixture(t);
   f.ownTask("first-task");
   f.plan(report("first-task"));

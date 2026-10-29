@@ -14,40 +14,11 @@ import { installFakePrTools } from "./fake-pr-tools.mjs";
 async function join(t, f, id, pane, space = "w1", role = "implementor") {
   const client = new HubClient(); t.after(() => client.close());
   const discovery = await f.discover(pane);
-  await client.connect(discovery.socket, { agent_id: id, name: id, role, pane_id: pane, space_id: space });
+  await client.connect(discovery.socket, { agent_id: id, name: id, role, pane_id: pane, space_id: space, context_modes: ["reuse", "fresh"] });
   await client.request({ op: "sync", activity: "idle", receive: false });
   return client;
 }
 const sync = (c, receive = false, activity = "idle") => c.request({ op: "sync", activity, receive });
-
-class McpProcess {
-  constructor(child) {
-    this.child = child; this.buffer = ""; this.nextId = 1; this.pending = new Map(); this.stderr = "";
-    child.stdout.setEncoding("utf8");
-    child.stdout.on("data", chunk => {
-      this.buffer += chunk;
-      while (this.buffer.includes("\n")) {
-        const end = this.buffer.indexOf("\n"), line = this.buffer.slice(0, end); this.buffer = this.buffer.slice(end + 1);
-        const message = JSON.parse(line), pending = this.pending.get(message.id);
-        if (pending) { clearTimeout(pending.timer); this.pending.delete(message.id); pending.resolve(message); }
-      }
-    });
-    child.stderr.setEncoding("utf8"); child.stderr.on("data", chunk => { this.stderr += chunk; });
-    child.on("exit", (code, signal) => {
-      for (const pending of this.pending.values()) { clearTimeout(pending.timer); pending.reject(new Error(`MCP exited (${code ?? signal}): ${this.stderr}`)); }
-      this.pending.clear();
-    });
-  }
-  request(method, params = {}) {
-    const id = this.nextId++;
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => { this.pending.delete(id); reject(new Error(`Timed out waiting for ${method}`)); }, 10000);
-      this.pending.set(id, { resolve, reject, timer });
-      this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
-    });
-  }
-  notify(method, params = {}) { this.child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`); }
-}
 
 async function receive(client) {
   const snapshot = await sync(client, true);
@@ -58,7 +29,7 @@ async function receive(client) {
 async function joinCheckout(t, f, id, pane, cwd) {
   const client = new HubClient(); t.after(() => client.close());
   await client.connect(f.discovery.socket, {
-    agent_id: id, name: id, role: "implementor", pane_id: pane, space_id: "w1", cwd,
+    agent_id: id, name: id, role: "implementor", pane_id: pane, space_id: "w1", cwd, context_modes: ["reuse", "fresh"],
   });
   await client.request({ op: "sync", activity: "working", receive: false });
   return client;
@@ -103,17 +74,17 @@ test("socket admission rejects invalid initial/reset joins and resolves shared c
 
   const staleSelection = new HubClient(); t.after(() => staleSelection.close());
   await assert.rejects(staleSelection.connect(f.discovery.socket, {
-    agent_id: "stale-selection", name: "stale-selection", role: "late", pane_id: "w1:p1", space_id: "w1",
+    agent_id: "stale-selection", name: "stale-selection", role: "late", pane_id: "w1:p1", space_id: "w1", context_modes: ["reuse", "fresh"],
   }), /late -> late-component -> absent-after-selection/);
 
   const rejectedInitial = new HubClient(); t.after(() => rejectedInitial.close());
   await assert.rejects(rejectedInitial.connect(f.discovery.socket, {
-    agent_id: "unadmitted", name: "unadmitted", role: "missing", pane_id: "w1:p1", space_id: "w1",
+    agent_id: "unadmitted", name: "unadmitted", role: "missing", pane_id: "w1:p1", space_id: "w1", context_modes: ["reuse", "fresh"],
   }), /missing -> absent/);
   const rejectedReset = new HubClient(); t.after(() => rejectedReset.close());
   await assert.rejects(rejectedReset.connect(f.discovery.socket, {
     agent_id: "retryable", name: "retryable", role: "missing", pane_id: "w1:p1", space_id: "w1",
-    reset: { plan_id: "not-a-real-plan", token: "not-a-real-token" },
+    context_modes: ["reuse", "fresh"], reset: { plan_id: "not-a-real-plan", token: "not-a-real-token" },
   }), /missing -> absent/);
 
   // A valid join with the same identity/pane after the rejected reset variant
@@ -155,12 +126,12 @@ test("real hub admits duplicate non-manager roles with distinct identities and n
 test("real socket hub: isolated spaces, task exchange, rollback and restart reconciliation", { timeout: 20000 }, async t => {
   const f = await fixture(t);
   let hub = await f.start();
-  const architect = await join(t, f, "architect", "w1:p1");
+  const architect = await join(t, f, "architect", "w1:p1", "w1", "architect");
   const worker = await join(t, f, "worker", "w1:p2");
   assert.equal((await stat(f.discovery.socket)).mode & 0o777, 0o600);
   assert.equal((await sync(architect)).members.length, 2);
   await assert.rejects(exec(binary, ["run", "--headless"], { env: f.env, timeout: 3000 }), /hub|running|lock/);
-  const { task_id } = await architect.request({ op: "assign", to: "worker", title: "Verify fixture", text: "Change nothing; verify the fixture and report evidence." });
+  const { task_id } = await architect.request({ op: "assign", to: "worker", title: "Verify fixture", text: "Change nothing; verify the fixture and report evidence.", context: "reuse" });
   const assignment = await receive(worker);
   assert.equal(assignment.task_id, task_id); assert.equal(assignment.kind, "assignment");
   await assert.rejects(architect.request({ op: "report", task_id, revision: 1, kind: "done", text: "False" }), /owner/);
@@ -175,7 +146,7 @@ test("real socket hub: isolated spaces, task exchange, rollback and restart reco
   await architect.request({ op: "accept", task_id, revision: 2, text: "Evidence reviewed." });
   assert.equal((await sync(worker)).tasks[0].state, "accepted");
   await receive(worker); // acceptance information, not a new turn
-  const second = await architect.request({ op: "assign", to: "worker", title: "Uncertain fixture", text: "Do not blindly replay." });
+  const second = await architect.request({ op: "assign", to: "worker", title: "Uncertain fixture", text: "Do not blindly replay.", context: "reuse" });
   assert.equal((await sync(worker, true)).inbox.kind, "assignment"); // offered, deliberately unacknowledged
   await architect.request({ op: "mode", mode: "todo", enabled: true });
   await stop(hub);
@@ -213,12 +184,12 @@ test("per-space hubs isolate endpoints, locks, durable state, restart and shutdo
   assert.notEqual(firstHub.discovery.socket, secondHub.discovery.socket);
   const firstRequester = await join(t, f, "first-requester", "w1:p1", "w1", "architect");
   const firstWorker = await join(t, f, "first-worker", "w1:p2");
-  const secondRequester = await join(t, f, "second-requester", "w2:p1", "w2");
+  const secondRequester = await join(t, f, "second-requester", "w2:p1", "w2", "architect");
   const secondWorker = await join(t, f, "second-worker", "w2:p2", "w2");
 
-  const firstTask = await firstRequester.request({ op: "assign", to: "first-worker", title: "w1 task", text: "Persist only in w1." });
-  const secondTask = await secondRequester.request({ op: "assign", to: "second-worker", title: "w2 task", text: "Persist only in w2." });
-  assert.equal((await sync(secondRequester)).automation.checkin_enabled, true, "fresh spaces default check-ins on even without a manager");
+  const firstTask = await firstRequester.request({ op: "assign", to: "first-worker", title: "w1 task", text: "Persist only in w1.", context: "reuse" });
+  const secondTask = await secondRequester.request({ op: "assign", to: "second-worker", title: "w2 task", text: "Persist only in w2.", context: "reuse" });
+  assert.equal((await sync(secondRequester)).automation.checkin_enabled, true, "fresh spaces default check-ins on");
   await firstRequester.request({ op: "mode", mode: "checkin", enabled: true });
   await secondRequester.request({ op: "mode", mode: "checkin", enabled: false });
   await secondRequester.request({ op: "mode", mode: "todo", enabled: true });
@@ -227,7 +198,7 @@ test("per-space hubs isolate endpoints, locks, durable state, restart and shutdo
   assert.equal(firstState.members.length, 2);
   assert.equal(firstState.members.find(member => member.id === "first-requester").manager, true);
   assert.equal(secondState.members.length, 2);
-  assert.equal(secondState.members.some(member => member.manager), false);
+  assert.equal(secondState.members.find(member => member.id === "second-requester").manager, true);
   assert.deepEqual(firstState.tasks.map(task => task.id), [firstTask.task_id]);
   assert.deepEqual(secondState.tasks.map(task => task.id), [secondTask.task_id]);
   assert.equal(firstState.automation.checkin_enabled, true);
@@ -237,7 +208,7 @@ test("per-space hubs isolate endpoints, locks, durable state, restart and shutdo
 
   const wrongEndpoint = new HubClient(); t.after(() => wrongEndpoint.close());
   await assert.rejects(wrongEndpoint.connect(first.socket, {
-    agent_id: "wrong-endpoint", name: "wrong-endpoint", role: "implementor", pane_id: "w2:p1", space_id: "w2",
+    agent_id: "wrong-endpoint", name: "wrong-endpoint", role: "implementor", pane_id: "w2:p1", space_id: "w2", context_modes: ["reuse", "fresh"],
   }), /wrong mustr endpoint|space/);
   assert.equal((await sync(firstRequester)).members.length, 2, "foreign join was not admitted to w1");
 
@@ -289,16 +260,15 @@ test("symlinked server-key state parent is rejected before writes and releases t
   assert.deepEqual(await readdir(redirected), [], "recovery wrote only under the validated state path");
 });
 
-test("Pi and Claude adapters follow their live per-space context endpoints", { timeout: 30000 }, async t => {
+test("Pi adapters and peers remain scoped to their live per-space hub endpoints", { timeout: 30000 }, async t => {
   const f = await fixture(t);
-  f.panes.set("w2:p1", { pane_id: "w2:p1", workspace_id: "w2", agent: "claude" });
   await f.start();
   await f.start({ paneId: "w2:p0" });
-  const piContext = await f.discover("w1:p1"), claudeContext = await f.discover("w2:p1");
-  assert.equal(piContext.space_id, "w1"); assert.equal(claudeContext.space_id, "w2");
-  assert.notEqual(piContext.socket, claudeContext.socket);
-  const piObserver = await join(t, f, "pi-observer", "w1:p2");
-  const claudeObserver = await join(t, f, "claude-observer", "w2:p2", "w2");
+  const firstContext = await f.discover("w1:p1"), secondContext = await f.discover("w2:p1");
+  assert.equal(firstContext.space_id, "w1"); assert.equal(secondContext.space_id, "w2");
+  assert.notEqual(firstContext.socket, secondContext.socket);
+  const firstObserver = await join(t, f, "first-observer", "w1:p2");
+  const secondObserver = await join(t, f, "second-observer", "w2:p2", "w2");
 
   const envKeys = ["HERDR_ENV", "HERDR_SOCKET_PATH", "HERDR_PANE_ID", "MUSTR_CONFIG_DIR", "MUSTR_STATE_DIR", "MUSTR_BIN"];
   const previousEnv = new Map(envKeys.map(key => [key, process.env[key]]));
@@ -313,40 +283,20 @@ test("Pi and Claude adapters follow their live per-space context endpoints", { t
     }
   });
   await pi.commands.get("role").handler("implementor pi-space-owner", pi.context);
-  const piMembers = await eventually(async () => {
-    const snapshot = await sync(piObserver);
+  const firstMembers = await eventually(async () => {
+    const snapshot = await sync(firstObserver);
     return snapshot.members.some(member => member.id === "pi-session") ? snapshot.members : undefined;
-  }, 8000, "Pi adapter to join w1 context endpoint");
-  assert.equal(piMembers.some(member => member.id === "pi-session"), true);
-  assert.equal((await sync(claudeObserver)).members.some(member => member.id === "pi-session"), false);
+  }, 8000, "Pi adapter to join the first space");
+  assert.equal(firstMembers.some(member => member.id === "pi-session"), true);
+  assert.equal((await sync(secondObserver)).members.some(member => member.id === "pi-session"), false);
 
-  const claudeEntry = fileURLToPath(new URL("../claude/index.mjs", import.meta.url));
-  const child = spawn(process.execPath, [claudeEntry], {
-    env: { ...f.env, HERDR_PANE_ID: "w2:p1", MUSTR_BIN: binary },
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-  const mcp = new McpProcess(child), exited = once(child, "exit");
-  t.after(async () => {
-    if (child.exitCode === null && child.signalCode === null) {
-      child.stdin.end();
-      await Promise.race([exited, delay(3000).then(() => { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); })]);
-    }
-  });
-  const initialized = await mcp.request("initialize", {
-    protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "space-runtime-test", version: "1" },
-  });
-  assert.equal(initialized.result.serverInfo.name, "mustr");
-  mcp.notify("notifications/initialized");
-  const joined = await mcp.request("tools/call", { name: "mustr_join", arguments: { role: "implementor", name: "claude-space-owner" } });
-  assert.equal(joined.result.isError, false, joined.result.content?.[0]?.text);
-  const claudeAgent = JSON.parse(joined.result.content[0].text).agent_id;
-  assert.ok(claudeAgent);
-  const claudeMembers = await eventually(async () => {
-    const snapshot = await sync(claudeObserver);
-    return snapshot.members.some(member => member.id === claudeAgent) ? snapshot.members : undefined;
-  }, 8000, "Claude adapter to join w2 context endpoint");
-  assert.equal(claudeMembers.some(member => member.id === claudeAgent), true);
-  assert.equal((await sync(piObserver)).members.some(member => member.id === claudeAgent), false);
+  await join(t, f, "second-space-pi", "w2:p1", "w2");
+  const secondMembers = await eventually(async () => {
+    const snapshot = await sync(secondObserver);
+    return snapshot.members.some(member => member.id === "second-space-pi") ? snapshot.members : undefined;
+  }, 8000, "second Pi participant to join the second space");
+  assert.equal(secondMembers.some(member => member.id === "second-space-pi"), true);
+  assert.equal((await sync(firstObserver)).members.some(member => member.id === "second-space-pi"), false);
 });
 
 test("push hints are opt-in, scoped, coalesced, and preserve partial request frames", { timeout: 12000 }, async t => {
@@ -395,12 +345,13 @@ test("push hints are opt-in, scoped, coalesced, and preserve partial request fra
 
 test("TODO waits for delegated work; disabling cancels pending automation", { timeout: 15000 }, async t => {
   const f = await fixture(t); await f.start();
-  const driver = await join(t, f, "driver", "w1:p1");
+  const driver = await join(t, f, "driver", "w1:p1", "w1", "architect");
   const worker = await join(t, f, "worker", "w1:p2");
+  await driver.request({ op: "mode", mode: "checkin", enabled: false });
   const path = `${f.directory}/TODO.md`; await writeFile(path, "- [ ] Verify the fixture\n");
   await driver.request({ op: "configure_todo", path });
   await driver.request({ op: "mode", mode: "todo", enabled: true });
-  const assignment = await driver.request({ op: "assign", to: "worker", title: "Delegation", text: "Verify without duplication." });
+  const assignment = await driver.request({ op: "assign", to: "worker", title: "Delegation", text: "Verify without duplication.", context: "reuse" });
   await receive(worker); await delay(2200);
   assert.equal(await receive(driver), null);
   await worker.request({ op: "report", task_id: assignment.task_id, revision: 1, kind: "done", text: "Verified." });

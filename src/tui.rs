@@ -285,7 +285,7 @@ async fn event_loop(
                                 let candidates = pr_ui::eligible(&snapshot, &view.space_id);
                                 match candidates.len() {
                                     0 => view.pr_dialog = Some(pr_ui::Dialog::error(
-                                        "No connected, unpaused participant has advertised an absolute checkout path. Join Pi with /role NAME or Claude with mustr_join from the repository checkout, then press p.".into(),
+                                        "No connected, unpaused Pi participant has advertised an absolute checkout path. Join Pi with /role NAME from the repository checkout, then press p.".into(),
                                     )),
                                     1 => {
                                         let selection = candidates.into_iter().next().expect("one candidate");
@@ -762,7 +762,6 @@ fn draw_members(frame: &mut Frame, area: Rect, members: &[&Member], color: bool)
             Paragraph::new(vec![
                 Line::styled("No connected participants.", muted()),
                 Line::raw("/role NAME in Pi to join."),
-                Line::raw("Claude: mustr_join + mustr_wait."),
             ]),
             inner,
         );
@@ -1158,10 +1157,7 @@ fn draw_messages(
     }
     if messages.is_empty() {
         lines.push(Line::styled("No addressed messages yet.", bold()));
-        lines.push(Line::styled(
-            "Join with /role NAME in Pi or mustr_join in Claude; Claude receives during mustr_wait.",
-            muted(),
-        ));
+        lines.push(Line::styled("Join with /role NAME in Pi.", muted()));
     }
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
     // Use the renderer's actual wrapping (including Unicode), not byte counts.
@@ -1204,7 +1200,7 @@ fn draw_help(frame: &mut Frame, area: Rect, color: bool) {
             "Connect your workflow",
             accent(color).add_modifier(Modifier::BOLD),
         ),
-        Line::raw("Join: Pi /role NAME; Claude mustr_join."),
+        Line::raw("Join: Pi /role NAME."),
         Line::raw("p discovers from current checkout when no PR is attached."),
         Line::raw("Explicit attach (Pi recipient):"),
         Line::raw("/mustr-todo [path/to/TODO.md]"),
@@ -1367,6 +1363,7 @@ mod tests {
                 checkin_at: 0,
                 nudges: 0,
                 note: String::new(),
+                context: None,
             },
             Task {
                 id: TaskId::new("e5f6a7b8-2222"),
@@ -1382,6 +1379,7 @@ mod tests {
                 checkin_at: 0,
                 nudges: 0,
                 note: String::new(),
+                context: None,
             },
         ];
         snapshot.messages = vec![
@@ -1398,6 +1396,7 @@ mod tests {
                 delivery: Delivery::Received,
                 created_at: 0,
                 pr_ack: None,
+                context: None,
             },
             Message {
                 id: MessageId::new("message-2"),
@@ -1412,6 +1411,7 @@ mod tests {
                 delivery: Delivery::Pending,
                 created_at: 0,
                 pr_ack: None,
+                context: None,
             },
         ];
         snapshot.automation = Automation {
@@ -1498,7 +1498,6 @@ mod tests {
         assert!(text.contains("Orchard · w1"));
         assert!(text.contains("[t] TODO: off   │   [c] Check-in: ON    │   [p] PR: off"));
         assert!(text.contains("/role NAME in Pi to join."));
-        assert!(text.contains("Claude: mustr_join"));
         assert!(text.contains("No addressed messages yet."));
         assert!(!text.contains("No tasks assigned."));
         let (_, roster_row) = position(&text, "Participants 0");

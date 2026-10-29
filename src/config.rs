@@ -101,12 +101,13 @@ impl Config {
     }
 }
 
-/// Implicit setup seeds roles only when it creates the initial configuration.
+/// Implicit setup seeds roles/profiles only when it creates the initial configuration.
 pub(crate) fn initialize(paths: &Paths) -> Result<()> {
     private_dir(&paths.config)?;
     private_dir(&paths.roles())?;
     if create_file(&paths.config.join("config.toml"), DEFAULT_CONFIG.as_bytes())? {
         seed_roles(paths)?;
+        crate::profiles::seed_default(paths)?;
     }
     Ok(())
 }

@@ -8,10 +8,10 @@ import { harness } from "./adapter-harness.mjs";
 
 const role = { name: "implementor", description: "isolated fixture", prompt: "No external work." };
 const finishedTaskStates = new Set(["accepted", "cancelled"]);
-const task = (id, requester, owner, state = "active", revision = 1) => ({ id, requester, owner, state, revision, title: id });
+const task = (id, requester, owner, state = "active", revision = 1, context = undefined) => ({ id, requester, owner, space_id: "w1", state, revision, title: id, ...(context ? { context } : {}) });
 const userStart = text => ({ message: { role: "user", content: [{ type: "text", text }] } });
 const connectionRetiredError = () => new HubRemoteError("connection is retired; rejoin explicitly from the correct session", "connection_retired");
-const envelope = fields => ({ id: "message", from: "peer", to: "pi-session", task_id: null, revision: null, kind: "request", text: "Authorized fixture input.", wake: true, ...fields });
+const envelope = fields => ({ id: "message", space_id: "w1", from: "peer", to: "pi-session", task_id: null, revision: null, kind: "request", text: "Authorized fixture input.", wake: true, ...fields });
 
 function deferred() {
   let resolve;
@@ -32,7 +32,7 @@ function mockHub(seedTasks = []) {
     this.__mustrAgentId = hello.agent_id;
     this.connected = true;
     state.clients.push(this);
-    return { delivery_policy: 1, inbox_notifications: 1, reset_protocol: 1 };
+    return { delivery_policy: 1, inbox_notifications: 1, reset_protocol: 1, context_selection: 1, context_modes: ["reuse", "fresh"] };
   };
   HubClient.prototype.request = async function (command) {
     const agentId = this.__mustrAgentId;
@@ -107,7 +107,7 @@ function mockHub(seedTasks = []) {
     }
     if (command.op === "assign") {
       const id = `assigned-${state.nextTask++}`;
-      state.tasks.push(task(id, agentId, command.to, "assigned", 1));
+      state.tasks.push(task(id, agentId, command.to, "assigned", 1, command.context));
       return finish({ task_id: id });
     }
     if (["accept", "guide", "cancel"].includes(command.op)) {
@@ -455,7 +455,7 @@ test("child/manager messages retain scoped status while ordinary tools run and o
   hub.deliver(envelope({ id: "manager-checkin", kind: "checkin", from: null, to: "pi-session", task_id: null, revision: null, text: "Reconcile approved coordination goals.", wake: true }));
   await eventually(() => h.entries.some(entry => entry.type === "custom_message" && entry.customType === "mustr" && entry.details?.id === "manager-checkin"));
   assert.equal((await h.emit("tool_call", { toolName: "read" }))[0], undefined, "taskless authoritative check-in permits local reconciliation");
-  await h.tools.get("mustr_assign").execute("delegate", { to: "child-agent", title: "Follow-up", text: "Verify the fixture follow-up." }, undefined);
+  await h.tools.get("mustr_assign").execute("delegate", { to: "child-agent", title: "Follow-up", text: "Verify the fixture follow-up.", context: "reuse" }, undefined);
   await h.tools.get("mustr_report").execute("parent-status", { task_id: parent.id, revision: 1, kind: "status", text: "Parent remains under review." }, undefined);
   const afterStatus = hub.reports.length;
   await assert.rejects(h.tools.get("mustr_report").execute("parent-progress-again", { task_id: parent.id, revision: 1, kind: "progress", text: "Still forbidden." }, undefined), /prior task report|already has a terminal report/);

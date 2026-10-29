@@ -40,10 +40,10 @@ export async function resetFixture(t, options = {}) {
         || (hub.freshId && hub.freshId !== hello.agent_id)) throw new HubRemoteError("Invalid or revoked fresh receipt");
       hub.freshId = hello.agent_id; hub.completed = true; hub.phase = "completed";
       if (hub.failReceipt-- > 0) throw new Error("Hub disconnected after storing receipt");
-      return { protocol: 1, agent_id: hello.agent_id, delivery_policy: 1, inbox_notifications: 1, reset_protocol: 1, reset_receipt: true };
+      return { protocol: 1, agent_id: hello.agent_id, delivery_policy: 1, inbox_notifications: 1, reset_protocol: 1, reset_receipt: true, context_selection: 1, context_modes: ["reuse", "fresh"] };
     }
     if (hub.claimed && hello.agent_id === hub.control.old_agent_id) throw new HubRemoteError("Old session identity is retired");
-    return { protocol: 1, agent_id: hello.agent_id, delivery_policy: 1, inbox_notifications: 1, ...(options.oldHub ? {} : { reset_protocol: 1 }) };
+    return { protocol: 1, agent_id: hello.agent_id, delivery_policy: 1, inbox_notifications: 1, context_selection: 1, context_modes: ["reuse", "fresh"], ...(options.oldHub ? {} : { reset_protocol: 1 }) };
   };
   HubClient.prototype.request = async function(command) {
     if (!this.connected) throw new Error("Hub disconnected");

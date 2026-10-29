@@ -18,6 +18,7 @@ fn join() -> Request {
             pane_id: "w1:p1".into(),
             space_id: SpaceId::new("w1"),
             cwd: None,
+            context_modes: vec![],
             reset: None,
         },
     )

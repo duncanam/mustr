@@ -3,7 +3,7 @@ use super::*;
 fn join_peer(state: &mut State, id: &str, config: &Scheduling) -> AgentId {
     let agent = AgentId::new(id);
     state
-        .apply_validated_join(
+        .apply_validated_join_with_harness(
             &request(
                 &format!("join-{id}"),
                 Command::Join {
@@ -14,6 +14,7 @@ fn join_peer(state: &mut State, id: &str, config: &Scheduling) -> AgentId {
                     pane_id: format!("w1:{id}"),
                     space_id: SpaceId::new("w1"),
                     cwd: None,
+                    context_modes: vec![ContextMode::Reuse, ContextMode::Fresh],
                     reset: None,
                 },
             ),
@@ -21,6 +22,7 @@ fn join_peer(state: &mut State, id: &str, config: &Scheduling) -> AgentId {
             1,
             config,
             false,
+            ClientHarness::Pi,
         )
         .unwrap();
     state
@@ -48,6 +50,12 @@ fn assign_as(
     now: u64,
     config: &Scheduling,
 ) -> TaskId {
+    let admitted_manager = state
+        .members
+        .values()
+        .find(|member| member.manager)
+        .map(|member| member.id.clone())
+        .expect("manager test fixture has an admitted manager");
     let result = state
         .apply(
             &request(
@@ -56,14 +64,29 @@ fn assign_as(
                     to: owner.clone(),
                     title: format!("Task {request_id}"),
                     text: "Implement and verify this bounded task".into(),
+                    context: ContextMode::Reuse,
                 },
             ),
-            Some(requester),
+            Some(&admitted_manager),
             now,
             config,
         )
         .unwrap();
-    serde_json::from_value(result["task_id"].clone()).unwrap()
+    let task_id: TaskId = serde_json::from_value(result["task_id"].clone()).unwrap();
+    if requester != &admitted_manager {
+        // Preserve legacy requester-authored task fixtures without granting
+        // nonmanagers authority to create new assignments.
+        state.tasks.get_mut(&task_id).unwrap().requester = requester.clone();
+        if let Some(message) = state
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|message| message.task_id.as_ref() == Some(&task_id))
+        {
+            message.from = Some(requester.clone());
+        }
+    }
+    task_id
 }
 
 fn sync_activity(
@@ -375,11 +398,22 @@ fn manager_single_cancel_requires_exact_same_space_task_and_allows_self_target()
     let manager_owned = assign_as(
         &mut state,
         &requester,
-        &manager,
+        &owner,
         "manager-is-owner",
         5,
         &config,
     );
+    // Existing work may be owned by the manager even though new self-targeted
+    // assignments are forbidden; model that persisted history directly.
+    state.tasks.get_mut(&manager_owned).unwrap().owner = manager.clone();
+    if let Some(message) = state
+        .messages
+        .iter_mut()
+        .rev()
+        .find(|message| message.task_id.as_ref() == Some(&manager_owned))
+    {
+        message.to = manager.clone();
+    }
     let result = state
         .apply(
             &request(

@@ -35,6 +35,8 @@ pub(crate) enum Event {
         request: Request,
         /// Server-resolved role metadata; never decoded from the public Join.
         role_manager: Option<bool>,
+        /// Agent kind verified from the selected live herdr pane.
+        verified_harness: Option<ClientHarness>,
         reply: oneshot::Sender<Response>,
     },
     Disconnect(u64),
@@ -112,17 +114,24 @@ impl Service {
     }
 
     pub async fn request(&self, connection: u64, request: Request) -> Result<Response> {
-        self.request_with_role(connection, request, None).await
+        self.request_with_role(connection, request, None, None)
+            .await
     }
 
     /// Submit a Join with the manager flag resolved by the server from the
     /// selected root role. This metadata never appears in the public protocol.
-    pub async fn join(&self, connection: u64, request: Request, manager: bool) -> Result<Response> {
+    pub async fn join(
+        &self,
+        connection: u64,
+        request: Request,
+        manager: bool,
+        harness: ClientHarness,
+    ) -> Result<Response> {
         ensure!(
             matches!(&request.command, Command::Join { .. }),
             "validated role metadata is only valid for Join"
         );
-        self.request_with_role(connection, request, Some(manager))
+        self.request_with_role(connection, request, Some(manager), Some(harness))
             .await
     }
 
@@ -131,6 +140,7 @@ impl Service {
         connection: u64,
         request: Request,
         role_manager: Option<bool>,
+        verified_harness: Option<ClientHarness>,
     ) -> Result<Response> {
         let (reply, response) = oneshot::channel();
         self.tx
@@ -138,6 +148,7 @@ impl Service {
                 connection,
                 request,
                 role_manager,
+                verified_harness,
                 reply,
             })
             .await?;
@@ -385,18 +396,21 @@ impl Actor {
                     connection,
                     request,
                     role_manager,
+                    verified_harness,
                     reply,
                 } => {
                     let mut next = self.state.clone();
                     let result = self
                         .sender(connection)
                         .and_then(|sender| match role_manager {
-                            Some(manager) => next.apply_validated_join(
+                            Some(manager) => next.apply_validated_join_with_harness(
                                 &request,
                                 sender.as_ref(),
                                 now,
                                 &self.scheduling,
                                 manager,
+                                verified_harness
+                                    .expect("validated Join requires the verified harness"),
                             ),
                             None => next.apply(&request, sender.as_ref(), now, &self.scheduling),
                         })
@@ -686,6 +700,7 @@ mod tests {
                         pane_id: "w1:p1".into(),
                         space_id: space.clone(),
                         cwd: Some(checkout.path().to_path_buf()),
+                        context_modes: vec![],
                         reset: None,
                     },
                 },
@@ -767,6 +782,7 @@ mod tests {
                 pane_id: "w1:p1".into(),
                 space_id: space.clone(),
                 cwd: Some(cwd.to_path_buf()),
+                context_modes: vec![],
                 reset: None,
             },
         };
@@ -882,6 +898,7 @@ mod tests {
             delivery: Delivery::Pending,
             created_at: 0,
             pr_ack: None,
+            context: None,
         });
         actor.store.save(&actor.state).unwrap();
         let (tx, rx) = mpsc::channel(8);
@@ -936,6 +953,7 @@ mod tests {
                 delivery: Delivery::Uncertain,
                 created_at: 0,
                 pr_ack: None,
+                context: None,
             });
         }
         Store::open(&path, SpaceId::new("w1"))
@@ -945,9 +963,9 @@ mod tests {
         let service = Service::start(SpaceId::new("w1"), path.clone(), Scheduling::default())
             .await
             .unwrap();
-        for (connection, name) in [(1, "requester"), (2, "worker")] {
+        for (connection, name, manager) in [(1, "requester", true), (2, "worker", false)] {
             let response = service
-                .request(
+                .join(
                     connection,
                     Request {
                         id: "join".into(),
@@ -959,9 +977,12 @@ mod tests {
                             pane_id: format!("p{connection}"),
                             space_id: SpaceId::new("w1"),
                             cwd: None,
+                            context_modes: vec![ContextMode::Reuse, ContextMode::Fresh],
                             reset: None,
                         },
                     },
+                    manager,
+                    ClientHarness::Pi,
                 )
                 .await
                 .unwrap();
@@ -996,6 +1017,7 @@ mod tests {
                         to: worker,
                         title: "Persist in queue".into(),
                         text: "Message queue is full".into(),
+                        context: ContextMode::Reuse,
                     },
                 },
             )

@@ -152,7 +152,7 @@ test("production mustr adapter preserves real Pi model-context prefixes across t
         let result;
         switch (request.op) {
           case "join":
-            result = { delivery_policy: 1, inbox_notifications: 1 };
+            result = { delivery_policy: 1, inbox_notifications: 1, context_selection: 1, context_modes: ["reuse", "fresh"] };
             break;
           case "subscribe":
             result = { subscribed: true };
@@ -232,6 +232,10 @@ test("production mustr adapter preserves real Pi model-context prefixes across t
     registerCommand(name, command) {
       adapterExtension.commands.set(name, { ...command, name, sourceInfo: adapterExtension.sourceInfo });
     },
+    registerFlag(name, options) {
+      adapterExtension.flags.set(name, options);
+    },
+    getFlag() { return undefined; },
   };
   adapterApi = new Proxy(registration, {
     get(target, key) {
@@ -245,7 +249,7 @@ test("production mustr adapter preserves real Pi model-context prefixes across t
     },
   });
   await mustrAdapter(adapterApi);
-  assert.equal((adapterExtension.handlers.get("context") ?? []).length, 0, "production adapter has no per-request snapshot hook");
+  assert.equal((adapterExtension.handlers.get("context") ?? []).length, 1, "production adapter projects only the task-authorized native context window");
 
   const observerExtension = makeExtension("<inline:cache-context-observer>");
   observerExtension.handlers.set("before_agent_start", [event => {

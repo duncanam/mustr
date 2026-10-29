@@ -19,9 +19,18 @@ fn join(agent: &str, name: &str, pane: &str, reset: Option<ResetReceipt>) -> Req
             pane_id: pane.into(),
             space_id: SpaceId::new("w1"),
             cwd: None,
+            context_modes: vec![],
             reset,
         },
     )
+}
+
+fn supported_join(agent: &str, name: &str, pane: &str, reset: Option<ResetReceipt>) -> Request {
+    let mut request = join(agent, name, pane, reset);
+    if let Command::Join { context_modes, .. } = &mut request.command {
+        *context_modes = vec![ContextMode::Reuse, ContextMode::Fresh];
+    }
+    request
 }
 
 fn fixture() -> (Actor, tempfile::TempDir, watch::Receiver<Snapshot>) {
@@ -46,12 +55,13 @@ fn fixture() -> (Actor, tempfile::TempDir, watch::Receiver<Snapshot>) {
         let agent_id = AgentId::new(agent);
         actor
             .state
-            .apply_validated_join(
-                &join(agent, agent, pane, None),
+            .apply_validated_join_with_harness(
+                &supported_join(agent, agent, pane, None),
                 None,
                 now(),
                 &actor.scheduling,
                 manager,
+                ClientHarness::Pi,
             )
             .unwrap();
         actor
@@ -355,6 +365,7 @@ async fn failed_abandon_preserves_freeze_history_and_live_control_binding() {
                     to: AgentId::new("worker"),
                     title: "Retain task".into(),
                     text: "Retain details".into(),
+                    context: ContextMode::Reuse,
                 },
             ),
             Some(&AgentId::new("architect")),
@@ -509,6 +520,7 @@ async fn abandon_revokes_old_connections_but_keeps_verified_fresh_connections_an
                     to: AgentId::new("worker"),
                     title: "Retain".into(),
                     text: "Reconcile me".into(),
+                    context: ContextMode::Reuse,
                 },
             ),
             Some(&AgentId::new("architect")),
@@ -588,6 +600,7 @@ async fn failed_final_receipt_keeps_history_claim_and_fence_durable() {
                     to: AgentId::new("worker"),
                     title: "Must not disappear".into(),
                     text: "Retain until durable final receipt".into(),
+                    context: ContextMode::Reuse,
                 },
             ),
             Some(&AgentId::new("architect")),

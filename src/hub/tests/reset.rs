@@ -103,7 +103,7 @@ fn fresh_join_with_manager(
             idle_since: 0,
         }
     });
-    state.apply_validated_join(
+    state.apply_validated_join_with_harness(
         &request(
             "fresh",
             Command::Join {
@@ -114,6 +114,7 @@ fn fresh_join_with_manager(
                 pane_id: member.pane_id,
                 space_id: member.space_id,
                 cwd: member.cwd,
+                context_modes: vec![ContextMode::Reuse, ContextMode::Fresh],
                 reset: Some(receipt.clone()),
             },
         ),
@@ -121,6 +122,7 @@ fn fresh_join_with_manager(
         2,
         config,
         manager,
+        ClientHarness::Pi,
     )
 }
 
@@ -146,6 +148,7 @@ fn direct_join_mode_and_reset_apis_reject_foreign_space_ids() {
                         pane_id: "w2:p1".into(),
                         space_id: SpaceId::new("w2"),
                         cwd: None,
+                        context_modes: vec![],
                         reset: None,
                     },
                 ),
@@ -185,6 +188,7 @@ fn direct_join_mode_and_reset_apis_reject_foreign_space_ids() {
                         pane_id: "w1:p1".into(),
                         space_id: SpaceId::new("w2"),
                         cwd: None,
+                        context_modes: vec![],
                         reset: Some(receipt),
                     },
                 ),
@@ -324,7 +328,8 @@ fn completion_clears_single_space_history_and_retains_safe_reset_fences() {
                     Command::Assign {
                         to: AgentId::new("worker-fresh"),
                         title: "Task".into(),
-                        text: "Implement and verify scope".into()
+                        text: "Implement and verify scope".into(),
+                        context: ContextMode::Reuse
                     }
                 ),
                 Some(&AgentId::new("architect-fresh")),
@@ -371,6 +376,7 @@ fn confirmed_receipt_cannot_overwrite_a_moved_or_renamed_current_identity() {
                     pane_id: pane.into(),
                     space_id: SpaceId::new(space),
                     cwd: None,
+                    context_modes: vec![],
                     reset: None,
                 },
             ),
@@ -500,6 +506,7 @@ fn frozen_source_identities_cannot_move_away_or_reintroduce_old_context() {
                             pane_id: "w2:p1".into(),
                             space_id: SpaceId::new("w2"),
                             cwd: None,
+                            context_modes: vec![],
                             reset: None
                         }
                     ),
@@ -565,6 +572,7 @@ fn frozen_space_blocks_cached_and_ordinary_work_but_only_target_sees_its_control
             to: worker.clone(),
             title: "Task".into(),
             text: "Implement and verify scope".into(),
+            context: ContextMode::Reuse,
         },
         Command::Send {
             to: worker.clone(),
@@ -637,6 +645,7 @@ fn frozen_space_blocks_cached_and_ordinary_work_but_only_target_sees_its_control
                         pane_id: "w1:p3".into(),
                         space_id: SpaceId::new("w1"),
                         cwd: None,
+                        context_modes: vec![],
                         reset: None
                     }
                 ),
@@ -682,6 +691,7 @@ fn claim_is_persisted_single_use_and_receipts_validate_all_approved_identity_fie
                     pane_id: "w1:p1".into(),
                     space_id: SpaceId::new("w1"),
                     cwd: None,
+                    context_modes: vec![],
                     reset: None,
                 },
             ),
@@ -712,6 +722,7 @@ fn claim_is_persisted_single_use_and_receipts_validate_all_approved_identity_fie
                             pane_id: pane.into(),
                             space_id: SpaceId::new(space),
                             cwd: None,
+                            context_modes: vec![],
                             reset: Some(receipt.clone())
                         }
                     ),
@@ -756,6 +767,7 @@ fn confirmed_receipt_reconnect_refreshes_presence_and_checkout() {
                     pane_id: "w1:p1".into(),
                     space_id: SpaceId::new("w1"),
                     cwd: Some(checkout.path().to_path_buf()),
+                    context_modes: vec![],
                     reset: Some(receipt),
                 },
             ),

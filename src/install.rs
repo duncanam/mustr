@@ -1,9 +1,4 @@
-//! Explicit harness installers; Claude registration is delegated to Claude Code's CLI.
-
-mod claude;
-pub(crate) use claude::{
-    install_config_only as install_claude_config_only, install_registered as install_claude,
-};
+//! Install the Pi adapter into its auto-discovered extensions directory.
 
 use std::{
     env, fs,
@@ -16,6 +11,7 @@ use crate::paths::{Paths, check_regular, create_file, private_dir, replace_file}
 
 const ADAPTER: &str = include_str!("../pi/index.ts");
 const TRANSPORT: &str = include_str!("../pi/transport.mjs");
+const CONTEXT_WINDOW: &str = include_str!("../pi/context-window.ts");
 const MARKER: &str = "mustr-managed adapter v1";
 
 pub(crate) fn install(paths: &Paths, agent_dir: Option<PathBuf>) -> Result<PathBuf> {
@@ -38,12 +34,17 @@ pub(crate) fn install(paths: &Paths, agent_dir: Option<PathBuf>) -> Result<PathB
     // Native ESM imports can remain cached across Pi /reload. A changed transport
     // must get a new URL, and old entry points must keep their original module.
     let transport_name = format!("transport.{}.mjs", crate::paths::digest(TRANSPORT));
+    let context_window_name = format!("context-window.{}.ts", crate::paths::digest(CONTEXT_WINDOW));
     let adapter = ADAPTER
         .replace("\"__MUSTR_BINARY__\"", &serde_json::to_string(binary)?)
         .replace("\"__MUSTR_CONFIG__\"", &serde_json::to_string(config)?)
         .replace(
             "\"./transport.mjs\"",
             &serde_json::to_string(&format!("./{transport_name}"))?,
+        )
+        .replace(
+            "\"./context-window.ts\"",
+            &serde_json::to_string(&format!("./{context_window_name}"))?,
         );
     let index = directory.join("index.ts");
     if fs::symlink_metadata(&index).is_ok() {
@@ -71,6 +72,14 @@ pub(crate) fn install(paths: &Paths, agent_dir: Option<PathBuf>) -> Result<PathB
         "immutable transport contents do not match; refusing to overwrite {}",
         transport.display()
     );
+    let context_window = directory.join(context_window_name);
+    create_file(&context_window, CONTEXT_WINDOW.as_bytes())?;
+    check_regular(&context_window)?;
+    ensure!(
+        fs::read(&context_window)? == CONTEXT_WINDOW.as_bytes(),
+        "immutable context window contents do not match; refusing to overwrite {}",
+        context_window.display()
+    );
     // Install the immutable dependency first, then atomically switch the entry
     // point. Keep old transports and back up changed entry points for rollback.
     if index.exists() {
@@ -84,7 +93,54 @@ pub(crate) fn install(paths: &Paths, agent_dir: Option<PathBuf>) -> Result<PathB
     } else {
         create_file(&index, adapter.as_bytes())?;
     }
+    crate::profiles::seed_default(paths).wrap_err_with(|| {
+        format!(
+            "Pi adapter installed at {}, but default profile setup failed",
+            index.display()
+        )
+    })?;
     Ok(index)
+}
+
+pub(crate) fn validate_profile_adapter(agent_dir: &Path) -> Result<()> {
+    let directory = agent_dir.join("extensions/mustr");
+    let index = directory.join("index.ts");
+    check_regular(&index).wrap_err(
+        "install the current Pi adapter with `mustr install pi` before starting profiles",
+    )?;
+    let contents = fs::read_to_string(&index)?;
+    ensure!(
+        contents.contains(MARKER) && contents.contains("registerFlag?.(\"mustr-launch\""),
+        "the installed Pi adapter does not support profile startup; run `mustr install pi` explicitly"
+    );
+    for (prefix, extension) in [("transport.", ".mjs"), ("context-window.", ".ts")] {
+        let marker = format!("./{prefix}");
+        let relative = contents
+            .split(&marker)
+            .nth(1)
+            .and_then(|suffix| {
+                suffix
+                    .split_once(extension)
+                    .map(|(name, _)| format!("{prefix}{name}{extension}"))
+            })
+            .ok_or_else(|| {
+                eyre!("installed Pi adapter is missing immutable dependency {prefix}*{extension}")
+            })?;
+        let path = directory.join(relative);
+        check_regular(&path)?;
+        let bytes = fs::read(&path)?;
+        let expected = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| eyre!("invalid immutable dependency filename"))?;
+        let content_hash = crate::paths::digest(&bytes);
+        ensure!(
+            expected.contains(&content_hash),
+            "installed immutable Pi dependency hash does not match {}",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 fn replace(path: &Path, contents: &str) -> Result<()> {
@@ -118,6 +174,7 @@ mod tests {
             "index.ts".to_owned(),
             "transport.mjs".to_owned(),
             format!("transport.{}.mjs", crate::paths::digest(TRANSPORT)),
+            format!("context-window.{}.ts", crate::paths::digest(CONTEXT_WINDOW)),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let paths = Paths {
@@ -146,6 +203,16 @@ mod tests {
         let content = fs::read_to_string(&path).unwrap();
         assert!(content.contains(MARKER));
         assert!(!content.contains("\"__MUSTR_BINARY__\""));
+        let context_window_name = content
+            .split("from \"")
+            .filter_map(|part| part.split_once("\"").map(|(name, _)| name))
+            .find(|name| name.starts_with("./context-window."))
+            .unwrap()
+            .trim_start_matches("./");
+        assert_eq!(
+            fs::read(agent.join("extensions/mustr").join(context_window_name)).unwrap(),
+            CONTEXT_WINDOW.as_bytes()
+        );
         install(&paths, Some(agent.clone())).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), content);
         assert!(!agent.join("settings.json").exists());

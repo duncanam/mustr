@@ -27,7 +27,10 @@ async function prompt(h) {
   const result = await h.prompt("User policy");
   return result.options.sections.mustr_role ? result.text : undefined;
 }
-async function ready(h) { return eventually(() => h.tools.get("mustr_roster").execute("ready", {}, undefined)); }
+async function ready(h) {
+  try { return await eventually(() => h.tools.get("mustr_roster").execute("ready", {}, undefined)); }
+  catch (error) { throw new Error(`${error.message}; status=${JSON.stringify(h.statuses)}; notifications=${JSON.stringify(h.notifications)}`); }
+}
 
 // These use the production targeted CLI and real hub admission, not a role stub.
 test("targeted selection reports a broken graph while an unrelated composed role remains usable", async t => {

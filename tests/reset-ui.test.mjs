@@ -109,9 +109,9 @@ test("fixed-space TUI: switch keys are inert, reset affects only this instance, 
     }
     await screen("f", ["First · w1", "No tasks assigned."], ["No addressed messages yet."]);
     await screen("f", ["First · w1", "No addressed messages yet."], ["No tasks assigned."]);
-    async function join(id, pane, space) {
+    async function join(id, pane, space, role = "implementor") {
       const client = new HubClient(); t.after(() => client.close());
-      await client.connect(space === "w1" ? f.discovery.socket : otherDiscovery.socket, { agent_id: id, name: id, role: "implementor", pane_id: pane, space_id: space });
+      await client.connect(space === "w1" ? f.discovery.socket : otherDiscovery.socket, { agent_id: id, name: id, role, pane_id: pane, space_id: space, context_modes: ["reuse", "fresh"] });
       await client.request({ op: "sync", activity: "idle", receive: false });
       return client;
     }
@@ -119,13 +119,13 @@ test("fixed-space TUI: switch keys are inert, reset affects only this instance, 
     const todoText = "# Fixture only\n\n- [ ] Keep this file byte-for-byte\n";
     await writeFile(todo, todoText); await writeFile(otherTodo, todoText);
     for (const [space, prefix, path] of [["w1", "target", todo], ["w2", "other", otherTodo]]) {
-      const a = await join(`${prefix}-requester`, `${space}:p1`, space);
+      const a = await join(`${prefix}-requester`, `${space}:p1`, space, "architect");
       const b = await join(`${prefix}-worker`, `${space}:p2`, space);
-      await a.request({ op: "assign", to: `${prefix}-worker`, title: `${prefix} task history`, text: "Fixture data, not real work." });
+      await a.request({ op: "assign", to: `${prefix}-worker`, title: `${prefix} task history`, text: "Fixture data, not real work.", context: "reuse" });
       await a.request({ op: "send", to: `${prefix}-worker`, text: `${prefix} addressed history`, wake: false });
       await a.request({ op: "configure_todo", path });
-      // Fresh check-ins are on, waiting for a manager. Keep these ordinary roles
-      // so no watchdog message changes the reset fixture's exact history count.
+      // Fresh check-ins are on. Leave the manager immediately so no watchdog
+      // message changes the reset fixture's exact history count.
       assert.equal((await a.request({ op: "sync", activity: "idle", receive: false })).automation.checkin_enabled, true);
       await a.request({ op: "leave" }); await b.request({ op: "leave" });
       a.close(); b.close();

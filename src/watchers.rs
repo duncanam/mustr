@@ -12,11 +12,16 @@ use std::{
 use color_eyre::eyre::{Context, Result, bail, ensure, eyre};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::{io::AsyncReadExt, process::Command, time::timeout};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt},
+    process::Command,
+    time::timeout,
+};
 
 use crate::{paths::digest, protocol::AgentId};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct TodoWatch {
     pub path: PathBuf,
     pub driver: AgentId,
@@ -87,12 +92,14 @@ fn parse_todo(text: &str) -> TodoSnapshot {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PrBaseline {
     pub feedback: BTreeMap<String, String>,
     pub failures: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct PrWatch {
     #[serde(default)]
     pub url: Option<String>,
@@ -175,7 +182,7 @@ async fn run_command(program: &str, args: &[&str], cwd: &Path) -> Result<String>
             .env("GIT_PAGER", "cat")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .wrap_err_with(|| {
@@ -185,23 +192,107 @@ async fn run_command(program: &str, args: &[&str], cwd: &Path) -> Result<String>
             .stdout
             .take()
             .ok_or_else(|| eyre!("missing subprocess stdout"))?;
-        let mut bytes = Vec::new();
-        stdout
-            .take(16 * 1024 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .await?;
-        if bytes.len() > 16 * 1024 * 1024 {
-            child.kill().await?;
-            bail!("{program} output exceeded 16 MiB");
-        }
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| eyre!("missing subprocess stderr"))?;
+        // Drain both pipes concurrently: gh can fill stderr before closing
+        // stdout. Bound both streams and never persist/echo raw diagnostics,
+        // which can contain credential-bearing URLs or private file paths.
+        let output = tokio::try_join!(
+            read_command_output(stdout, 16 * 1024 * 1024),
+            read_command_output(stderr, 64 * 1024),
+        );
+        let (bytes, errors) = match output {
+            Ok(output) => output,
+            Err(error) => {
+                child.kill().await?;
+                return Err(error).wrap_err(command_stage(program, args).to_owned());
+            }
+        };
+        let status = child.wait().await?;
         ensure!(
-            child.wait().await?.success(),
-            "{program} failed; check authentication and the selected checkout/PR"
+            status.success(),
+            "{} failed ({}): {}",
+            command_stage(program, args),
+            status,
+            command_failure_reason(&errors),
         );
         String::from_utf8(bytes).wrap_err("subprocess output was not UTF-8")
     })
     .await
-    .wrap_err_with(|| format!("{program} timed out"))?
+    .wrap_err_with(|| format!("{} timed out", command_stage(program, args)))?
+}
+
+async fn read_command_output(reader: impl AsyncRead + Unpin, maximum: usize) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader
+        .take(maximum as u64 + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    ensure!(
+        bytes.len() <= maximum,
+        "subprocess output exceeded {maximum} bytes"
+    );
+    Ok(bytes)
+}
+
+fn command_stage<'a>(program: &'a str, args: &[&str]) -> &'a str {
+    match (program, args) {
+        ("gh", ["pr", "view", "--json", ..]) => "gh pr view (branch discovery)",
+        ("gh", ["pr", "view", _, "--json", "headRefOid,headRefName,state"]) => {
+            "gh pr view (HEAD recheck)"
+        }
+        ("gh", ["pr", "view", ..]) => "gh pr view (PR/checks/reviews)",
+        ("gh", ["api", ..]) => "gh api (inline review comments)",
+        ("git", _) => "git (checkout identity)",
+        _ => program,
+    }
+}
+
+fn command_failure_reason(stderr: &[u8]) -> &'static str {
+    let text = String::from_utf8_lossy(stderr).to_ascii_lowercase();
+    if text.contains("rate limit") {
+        "GitHub rate limit; retry after the limit resets"
+    } else if [
+        "no pull requests found",
+        "no pull request associated",
+        "no pr associated",
+    ]
+    .iter()
+    .any(|s| text.contains(s))
+    {
+        "no PR found for this branch; select its PR checkout or attach /mustr-pr URL"
+    } else if [
+        "gh auth login",
+        "authentication failed",
+        "http 401",
+        "bad credentials",
+    ]
+    .iter()
+    .any(|s| text.contains(s))
+    {
+        "GitHub authentication unavailable; check gh auth status in the hub's launch environment"
+    } else if text.contains("http 403") || text.contains("resource not accessible") {
+        "GitHub denied access; check the hub token's repository and API permissions"
+    } else if text.contains("http 404") {
+        "GitHub resource not found or inaccessible to the hub's credentials"
+    } else if [
+        "error connecting",
+        "could not resolve",
+        "dial tcp",
+        "network is unreachable",
+        "connection refused",
+        "i/o timeout",
+        "tls handshake timeout",
+    ]
+    .iter()
+    .any(|s| text.contains(s))
+    {
+        "GitHub network/DNS/TLS connection failed; check connectivity in the hub's launch environment"
+    } else {
+        "unclassified command failure; check this read-only operation in the hub's launch environment (raw stderr withheld)"
+    }
 }
 
 pub(crate) async fn collect_pr(watch: &PrWatch) -> Result<PrSnapshot> {
@@ -296,7 +387,13 @@ async fn discover_pr<R: PrCommandRunner>(
                 &["pr", "view", "--json", "url,headRefName,state"],
                 cwd,
             )
-            .await?,
+            .await
+            .map_err(|error| {
+                let reason = error.to_string();
+                error.wrap_err(format!(
+                    "PR discovery for branch {branch:?}: {reason}. Check gh pr view in that checkout using the hub's launch environment; /mustr-pr URL requires a matching checkout"
+                ))
+            })?,
     )?;
     let url = text(&raw, "url")?.to_owned();
     pr_target(&url)?;
@@ -620,6 +717,101 @@ mod tests {
     }
 
     #[test]
+    fn subprocess_diagnostics_identify_stage_without_exposing_raw_stderr() {
+        for (stderr, expected) in [
+            ("no pull requests found for branch feature", "no PR found"),
+            (
+                "HTTP 401: Bad credentials ghp_SYNTHETIC",
+                "authentication unavailable",
+            ),
+            (
+                "HTTP 403: Resource not accessible by integration",
+                "denied access",
+            ),
+            ("HTTP 403: API rate limit exceeded", "rate limit"),
+            ("HTTP 404: Not Found", "not found or inaccessible"),
+            (
+                "error connecting to api.github.com: dial tcp",
+                "network/DNS/TLS",
+            ),
+            (
+                "unexpected https://ghp_SYNTHETIC@example.invalid/private",
+                "unclassified",
+            ),
+        ] {
+            let reason = command_failure_reason(stderr.as_bytes());
+            assert!(reason.contains(expected), "{reason}");
+            assert!(!reason.contains("ghp_SYNTHETIC"));
+            assert!(!reason.contains("example.invalid"));
+        }
+        assert_eq!(
+            command_stage(
+                "gh",
+                &[
+                    "api",
+                    "repos/owner/repo/pulls/1/comments",
+                    "--paginate",
+                    "--slurp"
+                ]
+            ),
+            "gh api (inline review comments)"
+        );
+        assert_eq!(
+            command_stage("gh", &["pr", "view", "--json", "url,headRefName,state"]),
+            "gh pr view (branch discovery)"
+        );
+        assert_eq!(
+            command_stage(
+                "gh",
+                &["pr", "view", URL, "--json", "headRefOid,headRefName,state"]
+            ),
+            "gh pr view (HEAD recheck)"
+        );
+    }
+
+    #[tokio::test]
+    async fn subprocess_drains_both_pipes_and_returns_only_safe_diagnostics() {
+        let cwd = tempfile::tempdir().unwrap();
+        let failure = run_command("/bin/sh", &["-c", "printf 'PRIVATE_STDOUT'; i=0; while [ \"$i\" -lt 32 ]; do printf '%01024d' 0 >&2; i=$((i+1)); done; printf '\\nHTTP 403: Resource not accessible ghp_SYNTHETIC\\n' >&2; exit 1"], cwd.path()).await.unwrap_err().to_string();
+        assert!(failure.contains("exit status: 1"));
+        assert!(failure.contains("denied access"));
+        assert!(!failure.contains("PRIVATE_STDOUT"));
+        assert!(!failure.contains("ghp_SYNTHETIC"));
+        let success = run_command(
+            "/bin/sh",
+            &["-c", "printf 'ignored warning' >&2; printf '[]'"],
+            cwd.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(success, "[]");
+    }
+
+    #[tokio::test]
+    async fn subprocess_output_caps_fail_without_returning_partial_data() {
+        assert_eq!(read_command_output(&b"1234"[..], 4).await.unwrap(), b"1234");
+        assert!(
+            read_command_output(&b"12345"[..], 4)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("exceeded 4 bytes")
+        );
+        let cwd = tempfile::tempdir().unwrap();
+        let error = run_command(
+            "/bin/sh",
+            &[
+                "-c",
+                "i=0; while [ \"$i\" -lt 128 ]; do printf '%01024d' 0 >&2; i=$((i+1)); done",
+            ],
+            cwd.path(),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:?}").contains("exceeded 65536 bytes"));
+    }
+
+    #[test]
     fn todo_counts_nested_criteria_but_not_code_examples() {
         let value =
             parse_todo("- [ ] parent\n  - [X] checked\n  - [ ] child\n```\n- [ ] example\n```\n");
@@ -707,11 +899,19 @@ mod tests {
             "gh executable unavailable",
         ] {
             let mut runner = FakeRunner::new([Err(failure.into())]);
+            let error = discover_pr(&mut runner, checkout.path(), "feature")
+                .await
+                .unwrap_err();
+            let message = error.to_string();
+            assert!(message.contains("PR discovery for branch \"feature\""));
+            assert!(message.contains("gh pr view in that checkout"));
+            assert!(message.contains("/mustr-pr URL"));
             assert!(
-                discover_pr(&mut runner, checkout.path(), "feature")
-                    .await
-                    .is_err()
+                message.contains(failure),
+                "preserve the command-stage diagnosis"
             );
+            assert_eq!(error.root_cause().to_string(), failure);
+            assert_eq!(runner.calls.len(), 1, "no fallback or automatic replay");
         }
         for (raw, branch, expected) in [
             (
