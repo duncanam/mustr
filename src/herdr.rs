@@ -182,6 +182,29 @@ impl Herdr {
         })
     }
 
+    /// A new Pi process can run extensions before Herdr recognizes its harness.
+    /// Wait only at explicit profile startup, without weakening hub admission or
+    /// replaying a join. The caller must still compare this discovery to its pin.
+    pub async fn discovery_wait_for_pi(&self) -> Result<Discovery> {
+        timeout(Duration::from_secs(4), async {
+            let discovery = self.discovery().await?;
+            loop {
+                let pane = self.pane(&discovery.pane_id).await?;
+                ensure!(
+                    pane.pane_id == discovery.pane_id && pane.workspace_id == discovery.space_id,
+                    "profile startup pane identity changed; restart explicitly"
+                );
+                match pane.agent.as_deref() {
+                    Some("pi") => return Ok(discovery),
+                    None => tokio::time::sleep(Duration::from_millis(100)).await,
+                    Some(_) => return Err(eyre!("profile startup pane is running another agent")),
+                }
+            }
+        })
+        .await
+        .wrap_err("Pi was not recognized in its launch pane within 4 seconds")?
+    }
+
     pub async fn space(&self, space_id: &SpaceId) -> Result<Space> {
         let result = self.request("workspace.list", json!({})).await?;
         let spaces = result
