@@ -26,6 +26,12 @@ async function denied(destination) {
 }
 for (const path of isolation.forbiddenSockets) await denied(path);
 await denied({ host: "127.0.0.1", port: isolation.unforwardedPort });
+const agentDir = process.env.PI_CODING_AGENT_DIR ?? join(process.env.HOME, ".pi/agent");
+assert.deepEqual(JSON.parse(await readFile(join(agentDir, "auth.json"), "utf8")), {});
+assert.equal(await readFile(join(agentDir, "sessions/prior-fixture.jsonl"), "utf8"), "synthetic prior session\n");
+await writeFile(join(agentDir, "state-sharing-result.txt"), "persisted from jail");
+assert.equal(await readFile(join(process.env.HOME, ".pi-lens/state-sentinel"), "utf8"), "synthetic lens state");
+await writeFile(join(process.env.HOME, ".pi-lens/state-sharing-result.txt"), "persisted lens state");
 const hello = { agent_id: "native-probe", name: "probe", role: descriptor.role.name, pane_id: descriptor.pane_id, space_id: descriptor.space_id, cwd: descriptor.cwd };
 const unauthenticated = new HubClient();
 await assert.rejects(unauthenticated.connect({ port: descriptor.gateway.port, token: "0".repeat(64) }, hello));
@@ -72,7 +78,7 @@ try {
   assert.ok(state, `Pi CLI returned no state: ${stderr}`);
   await writeFile(join(descriptor.cwd, "native-cli-result.json"), JSON.stringify({
     nativePiCli: true, model: descriptor.model, thinking: state.thinkingLevel,
-    modelMessages: state.messageCount, isolated: true, cliPid: child.pid, exited: true,
+    modelMessages: state.messageCount, isolated: true, sharedPiState: true, cliPid: child.pid, exited: true,
   }));
 } finally {
   clearTimeout(deadline); clearTimeout(shutdownTimer); clearInterval(polling); lines.close();

@@ -2,7 +2,8 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
 import { once } from "node:events";
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import { chmod, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, execFile } from "node:child_process";
@@ -13,10 +14,10 @@ import { binary, delay } from "./support.mjs";
 const exec = promisify(execFile);
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 
-async function fixture(t, { laterSlot = false, holdFirst = false, jailFailure = false, nativeJail = false, shippedProfile = false } = {}) {
+async function fixture(t, { laterSlot = false, holdFirst = false, jailFailure = false, acknowledgeFailure = false, nativeJail = false, shippedProfile = false, resourceSymlinks = false, customAgentDir = false } = {}) {
   const root = await mkdtemp("/tmp/mustr-profile-launch-");
   const config = join(root, "config"), state = join(root, "state"), home = join(root, "home");
-  const agentDir = join(root, "pi-agent"), cwd = join(root, "project"), bin = join(root, "bin");
+  const agentDir = customAgentDir ? join(root, "pi-agent") : join(home, ".pi/agent"), cwd = join(root, "project"), bin = join(root, "bin");
   const herdrSocket = join(root, "herdr.sock"), herdrState = join(root, "herdr-state.json");
   await Promise.all([config, state, home, cwd, bin].map(path => mkdir(path, { recursive: true, mode: 0o700 })));
   await writeFile(herdrState, JSON.stringify({ tabs: [], creates: [], runs: [], closes: [] }), { mode: 0o600 });
@@ -28,12 +29,13 @@ async function fixture(t, { laterSlot = false, holdFirst = false, jailFailure = 
     HERDR_ENV: "1",
     HERDR_SOCKET_PATH: herdrSocket,
     HERDR_PANE_ID: "host-pane",
-    PI_CODING_AGENT_DIR: agentDir,
     MUSTR_TEST_HERDR_STATE: herdrState,
     MUSTR_TEST_SDK_DRIVER: join(repoRoot, "pi/test/profile-sdk-driver.mjs"),
     MUSTR_TEST_HOLD: holdFirst ? join(root, "release-first") : "",
     PATH: `${bin}:${process.env.PATH}`,
   };
+  delete env.PI_CODING_AGENT_DIR;
+  if (customAgentDir) env.PI_CODING_AGENT_DIR = agentDir;
   let hub;
   let herdrServer;
   t.after(async () => {
@@ -55,7 +57,10 @@ const save = value => writeFileSync(statePath, JSON.stringify(value));
 const args = process.argv.slice(2);
 const value = (flag, fallback) => { const index = args.indexOf(flag); return index < 0 ? fallback : args[index + 1]; };
 if (args[0] === "tab" && args[1] === "list") {
-  console.log(JSON.stringify({ tabs: read().tabs }));
+  const current = read();
+  if (current.failTabList) { console.error("synthetic Herdr unavailable"); process.exit(1); }
+  const workspace = value("--workspace", null);
+  console.log(JSON.stringify(current.tabListReply ?? { id: "fixture", result: { type: "tab_list", tabs: current.tabs.filter(tab => workspace === null || tab.workspace_id === workspace) } }));
 } else if (args[0] === "tab" && args[1] === "create") {
   const current = read();
   const number = current.creates.length + 1;
@@ -78,7 +83,8 @@ if (args[0] === "tab" && args[1] === "list") {
   }
   const child = spawnSync("/bin/sh", ["-c", command], { stdio: "inherit", env: { ...process.env, ...tab.env, HERDR_ENV: "1", HERDR_PANE_ID: pane } });
   if (child.error) throw child.error;
-  process.exit(child.status ?? 1);
+  // Real pane.run acknowledges dispatch, not the eventual bootstrap exit.
+  process.exit(${acknowledgeFailure} ? 0 : (child.status ?? 1));
 } else if (args[0] === "tab" && args[1] === "close") {
   const current = read(); current.closes.push(args[2]); current.tabs = current.tabs.filter(tab => tab.tab_id !== args[2]); save(current);
   console.log(JSON.stringify({ closed: args[2] }));
@@ -101,8 +107,12 @@ writeFileSync(${JSON.stringify(join(root, "jail-invocation.json"))}, JSON.string
 if (${jailFailure}) process.exit(37);
 if (${nativeJail}) {
   const separator = args.indexOf("--");
-  args.splice(separator, 0, "--map", ${JSON.stringify(join(repoRoot, "pi"))}, "--map", ${JSON.stringify(process.execPath)}, "--map", ${JSON.stringify(join(root, "isolation.json"))});
-  const result = spawnSync("/opt/homebrew/bin/ai-jail", args, { stdio: "inherit", env: { HOME: process.env.HOME, PATH: process.env.PATH, LANG: "C", TMPDIR: ${JSON.stringify(root)} } });
+  // Hermetic test policy only; production Mustr delegates these choices.
+  args.splice(separator, 0, "--no-network", "--no-toolchains", "--no-mise", "--map", ${JSON.stringify(join(repoRoot, "pi"))}, "--map", ${JSON.stringify(process.execPath)}, "--map", ${JSON.stringify(join(root, "isolation.json"))});
+  const usePty = ${process.env.MUSTR_NATIVE_JAIL_PTY === "1"};
+  const command = usePty ? "uv" : "/opt/homebrew/bin/ai-jail";
+  const commandArgs = usePty ? ["run", "--offline", "--project", ${JSON.stringify(join(root, "jail-pty"))}, ${JSON.stringify(join(repoRoot, "tests/jail-launch-pty.py"))}, "/opt/homebrew/bin/ai-jail", ...args] : args;
+  const result = spawnSync(command, commandArgs, { stdio: "inherit", env: { HOME: process.env.HOME, PATH: process.env.PATH, LANG: "C", TMPDIR: ${JSON.stringify(root)} } });
   if (result.error) throw result.error;
   process.exit(result.status ?? 1);
 }
@@ -113,6 +123,11 @@ const result = spawnSync(command[0], command.slice(1), { stdio: "inherit", env }
 if (result.error) throw result.error;
 process.exit(result.status ?? 1);
 `, { mode: 0o700 });
+
+  if (nativeJail && process.env.MUSTR_NATIVE_JAIL_PTY === "1") {
+    await mkdir(join(root, "jail-pty"));
+    await writeFile(join(root, "jail-pty/pyproject.toml"), '[project]\nname = "mustr-jail-pty-test"\nversion = "0.0.0"\nrequires-python = ">=3.9"\ndependencies = []\n');
+  }
 
   herdrServer = net.createServer(connection => {
     let buffer = "";
@@ -137,6 +152,22 @@ process.exit(result.status ?? 1);
   await symlink(join(repoRoot, "pi/node_modules/typebox"), join(runtimeModules, "typebox"));
   if (!shippedProfile) await writeFile(join(config, "profiles.toml"), `version = 1\n\n[profiles.team]\ncwd = ${JSON.stringify(cwd)}\n\n[profiles.team.agents.architect]\ntab_name = "Architect"\nrole = "architect"\nmodel = "anthropic/vendor/mustr-profile-fixture:0"\nthinking = "off"\n${laterSlot ? '\n[profiles.team.agents.implementor]\ntab_name = "Implementor"\nrole = "implementor"\nmodel = "anthropic/vendor/mustr-profile-fixture:0"\nthinking = "off"\n' : ''}`, { mode: 0o600 });
 
+  if (resourceSymlinks) {
+    const dotfiles = join(home, "dotfiles");
+    await mkdir(dotfiles);
+    const target = join(dotfiles, "extensions");
+    await rename(join(agentDir, "extensions"), target);
+    await symlink(target, join(agentDir, "extensions"));
+    // External symlink access is ai-jail policy, not a Mustr allowlist.
+    await writeFile(join(home, ".ai-jail"), '[commands.pi]\nro_maps = ["~/dotfiles/extensions"]\n', { mode: 0o600 });
+  }
+
+  await writeFile(join(agentDir, "auth.json"), "{}", { mode: 0o600 });
+  await mkdir(join(agentDir, "sessions"), { recursive: true });
+  await writeFile(join(agentDir, "sessions/prior-fixture.jsonl"), "synthetic prior session\n");
+  await mkdir(join(home, ".pi-lens"));
+  await writeFile(join(home, ".pi-lens/state-sentinel"), "synthetic lens state");
+
   hub = spawn(binary, ["--config-dir", config, "run", "--headless"], { env, stdio: ["ignore", "ignore", "pipe"] });
   let hubError = "";
   hub.stderr.setEncoding("utf8"); hub.stderr.on("data", chunk => { hubError += chunk; });
@@ -158,6 +189,7 @@ process.exit(result.status ?? 1);
   assert.ok(connected, `synthetic hub did not become ready: ${hubError}`);
   if (nativeJail) {
     const forbiddenFiles = [join(home, "credential-sentinel"), join(config, "host-sentinel"), join(state, "host-sentinel")];
+    if (resourceSymlinks) forbiddenFiles.push(join(home, "dotfiles/private-sentinel"));
     for (const path of forbiddenFiles) await writeFile(path, "synthetic forbidden sentinel", { mode: 0o600 });
     let unexpectedConnections = 0;
     const unforwarded = net.createServer(socket => { unexpectedConnections++; socket.destroy(); });
@@ -169,6 +201,21 @@ process.exit(result.status ?? 1);
 
   return {
     root, env, config, herdrState, agentDir, cwd,
+    ledgerPath: async () => {
+      const launches = join(state, "profile-launches");
+      const [server] = await readdir(launches);
+      const [space] = await readdir(join(launches, server));
+      return join(launches, server, space, "ownership.json");
+    },
+    stopHub: async () => {
+      const ownedHub = hub;
+      if (ownedHub && ownedHub.exitCode === null) {
+        const exited = once(ownedHub, "exit");
+        ownedHub.kill("SIGTERM");
+        await exited;
+      }
+      hub = undefined;
+    },
     run: (...args) => exec(binary, ["--config-dir", config, ...args], { env, cwd, timeout: 30000 }),
     owned: async () => JSON.parse(await readFile(herdrState, "utf8")),
     releaseFirst: () => writeFile(env.MUSTR_TEST_HOLD, "released"),
@@ -218,7 +265,7 @@ test("profile ensure and individual start use only returned Herdr IDs and join t
   const startedExtra = await exec(binary, ["--config-dir", config, "agent", "start", "architect", "--profile", "team", "--name", "extra"], { env, timeout: 30000 });
   assert.match(startedExtra.stdout, /team\/architect\/extra/);
   await assert.rejects(run("agent", "start", "architect", "--profile", "team", "--name", "extra"), /already exists/);
-  await assert.rejects(run("agent", "stop", "unrelated"), /no profile-owned instance/);
+  assert.match((await run("agent", "stop", "unrelated")).stdout, /not managed.*nothing to stop/);
   const listed = await exec(binary, ["--config-dir", config, "agent", "list", "--profile", "team"], { env, timeout: 10000 });
   assert.match(listed.stdout, /team\/architect\s+ready\s+synthetic-tab-1\s+synthetic-space:p1/);
   assert.match(listed.stdout, /team\/architect\/extra\s+ready\s+synthetic-tab-2\s+synthetic-space:p2/);
@@ -261,6 +308,78 @@ test("profile ensure and individual start use only returned Herdr IDs and join t
   assert.match(closed.output, /did not stop external jobs/);
   assert.deepEqual((await readOwned()).closes, ["synthetic-tab-1"]);
   assert.ok((await readOwned()).tabs.some(tab => tab.tab_id === "unrelated-tab"));
+  assert.doesNotMatch((await run("agent", "list")).stdout, /team\/architect\s/);
+  assert.match((await run("agent", "stop", "team/architect")).stdout, /nothing to stop/);
+  assert.deepEqual((await readOwned()).closes, ["synthetic-tab-1"]);
+});
+
+for (const cleanup of ["list", "stop", "start"]) {
+test(`agent ${cleanup} automatically prunes absent duplicate tabs and preserves unresolved creates`, { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  await f.run("agent", "start", "architect", "--profile", "team");
+  const file = await f.ledgerPath();
+  const ledger = JSON.parse(await readFile(file, "utf8"));
+  const original = ledger.records[0];
+  ledger.records.unshift({ ...original, launch_id: randomUUID(), tab_id: "already-gone-tab", pane_id: "gone-pane" });
+  const unresolved = { ...original, instance: "team/unknown", slot: "unknown", launch_id: randomUUID(), tab_id: null, pane_id: null, ready: false };
+  ledger.records.push(unresolved);
+  await writeFile(file, JSON.stringify(ledger));
+  const owned = await f.owned();
+  owned.tabs = [];
+  await writeFile(f.herdrState, JSON.stringify(owned));
+  const result = cleanup === "start"
+    ? await f.run("agent", "start", "architect", "--profile", "team")
+    : await f.run("agent", cleanup, ...(cleanup === "stop" ? ["team/architect"] : []));
+  if (cleanup === "start") {
+    const after = JSON.parse(await readFile(file, "utf8"));
+    assert.equal(after.records.length, 2);
+    assert.equal(after.records.filter(record => record.instance === "team/architect").length, 1);
+    assert.ok(after.records.some(record => record.launch_id === unresolved.launch_id));
+    assert.equal((await f.owned()).creates.length, 2);
+    assert.deepEqual((await f.owned()).closes, []);
+    return;
+  }
+  if (cleanup === "list") {
+    assert.doesNotMatch(result.stdout, /team\/architect/);
+    assert.match(result.stdout, /team\/unknown\s+unresolved-create/);
+  } else assert.match(result.stdout, /already gone.*nothing to stop/);
+  assert.deepEqual(JSON.parse(await readFile(file, "utf8")).records, [unresolved]);
+  assert.match((await f.run("agent", "stop", "team/architect")).stdout, /nothing to stop/);
+  await assert.rejects(f.run("agent", "stop", "team/unknown"), /unresolved tab-create/);
+  assert.deepEqual((await f.owned()).closes, []);
+  await f.run("agent", "start", "architect", "--profile", "team");
+  const after = JSON.parse(await readFile(file, "utf8"));
+  assert.equal(after.records.filter(record => record.instance === "team/architect").length, 1);
+  assert.equal((await f.owned()).creates.length, 2, "only an explicit start creates a replacement");
+});
+}
+
+test("cleanup retains moved tabs and all ownership on unavailable or malformed Herdr lists", { timeout: 30000 }, async t => {
+  const f = await fixture(t);
+  await f.run("agent", "start", "architect", "--profile", "team");
+  const file = await f.ledgerPath();
+  const before = await readFile(file, "utf8");
+  const owned = await f.owned();
+  owned.tabs[0].workspace_id = "other-space";
+  await writeFile(f.herdrState, JSON.stringify(owned));
+  assert.match((await f.run("agent", "list")).stdout, /team\/architect\s+out-of-space/);
+  await assert.rejects(f.run("agent", "stop", "team/architect"), /no longer in this space/);
+  assert.equal(await readFile(file, "utf8"), before);
+  for (const reply of [{ error: "unavailable" }, { tabs: [{}] }, { tabs: [{ tab_id: "some-tab" }] }, { result: { type: "error", tabs: [] } }]) {
+    owned.tabListReply = reply;
+    await writeFile(f.herdrState, JSON.stringify(owned));
+    await assert.rejects(f.run("agent", "list"), /ownership retained/);
+    await assert.rejects(f.run("agent", "start", "architect", "--profile", "team"), /ownership retained/);
+    await assert.rejects(f.run("agent", "stop", "team/architect"), /ownership retained/);
+    assert.equal(await readFile(file, "utf8"), before);
+  }
+  delete owned.tabListReply;
+  owned.failTabList = true;
+  await writeFile(f.herdrState, JSON.stringify(owned));
+  await assert.rejects(f.run("agent", "list"), /synthetic Herdr unavailable/);
+  assert.equal(await readFile(file, "utf8"), before);
+  assert.deepEqual((await f.owned()).closes, []);
+  assert.equal((await f.owned()).creates.length, 1);
 });
 
 test("ensure revalidates a later slot completed by an individual start while its first slot waits", { timeout: 60000 }, async t => {
@@ -288,27 +407,31 @@ test("ensure revalidates a later slot completed by an individual start while its
   assert.match((await f.run("--profile", "team")).stdout, /0 new agent/);
 });
 
-test("jailed profile uses the production scoped gateway with real Pi startup and host readiness", { timeout: 60000 }, async t => {
+for (const [resourceSymlinks, customAgentDir] of [[false, false], [true, false], [false, true]]) {
+test(`jailed profile uses ai-jail state defaults (${resourceSymlinks ? "symlink resources" : customAgentDir ? "custom agent directory" : "standard Pi directory"}) and real Pi startup`, { timeout: 60000 }, async t => {
   // Opt-in runs the actual CLI under native ai-jail; normal CI uses the SDK and
   // argument fixture. Neither loads real credentials nor makes provider calls.
-  const f = await fixture(t, { nativeJail: process.env.MUSTR_NATIVE_JAIL_TEST === "1" });
+  const f = await fixture(t, { nativeJail: process.env.MUSTR_NATIVE_JAIL_TEST === "1", resourceSymlinks, customAgentDir });
   assert.match((await f.run("--profile", "team", "--jailed")).stdout, /1 new agent/);
   assert.match((await f.run("--profile", "team", "--jailed")).stdout, /0 new agent/);
   await assert.rejects(f.run("--profile", "team"), /profile drift/);
   const args = JSON.parse(await readFile(join(f.root, "jail-invocation.json"), "utf8"));
-  for (const flag of ["--private-home", "--no-agent-state", "--no-inherit-env", "--no-network", "--no-macos-host-ipc", "--no-docker"]) assert.ok(args.includes(flag), flag);
+  for (const flag of ["--exec", "--terminal-passthrough", "--private-home", "--no-agent-state", "--agent-state", "--no-inherit-env", "--no-network", "--no-macos-host-ipc", "--no-docker", "--no-toolchains", "--no-mise"]) assert.ok(!args.includes(flag), `policy must belong to ai-jail: ${flag}`);
   assert.equal(args.filter(value => value === "--forward-port").length, 1);
   const passedEnv = args.flatMap((value, i) => value === "--env" ? [args[i + 1]] : []);
-  assert.deepEqual(passedEnv.map(value => value.split("=")[0]).sort(), ["MUSTR_LAUNCH_DESCRIPTOR", "PI_CODING_AGENT_DIR"]);
+  assert.deepEqual(passedEnv.map(value => value.split("=")[0]).sort(), customAgentDir ? ["MUSTR_LAUNCH_DESCRIPTOR", "PI_CODING_AGENT_DIR"] : ["MUSTR_LAUNCH_DESCRIPTOR"]);
   const descriptorPath = passedEnv.find(value => value.startsWith("MUSTR_LAUNCH_DESCRIPTOR=")).split("=").slice(1).join("=");
   const descriptor = JSON.parse(await readFile(descriptorPath, "utf8"));
   assert.equal(descriptor.version, 2);
   assert.equal(args[args.indexOf("--forward-port") + 1], String(descriptor.gateway.port));
   const roMaps = args.flatMap((value, i) => value === "--map" ? [args[i + 1]] : []);
-  assert.deepEqual(roMaps, [descriptorPath, join(await realpath(f.agentDir), "extensions")]);
-  assert.equal(args.filter(value => value === "--rw-map").length, 1);
-  const rwMap = args[args.indexOf("--rw-map") + 1];
-  assert.equal(rwMap, join(dirname(descriptorPath), "pi"));
+  assert.deepEqual(roMaps, [descriptorPath], "no Mustr-owned Pi resource mounts");
+  assert.equal(args.filter(value => value === "--rw-map").length, customAgentDir ? 1 : 0);
+  if (customAgentDir) {
+    const agentDir = await realpath(f.agentDir);
+    assert.equal(args[args.indexOf("--rw-map") + 1], agentDir);
+    assert.ok(passedEnv.includes(`PI_CODING_AGENT_DIR=${agentDir}`));
+  }
   assert.ok(!args.some(value => value.includes(descriptor.gateway.token)));
   const receipt = JSON.parse(await readFile(join(dirname(dirname(descriptorPath)), "ready.json"), "utf8"));
   assert.equal(receipt.launch_id, descriptor.launch_id);
@@ -326,10 +449,14 @@ test("jailed profile uses the production scoped gateway with real Pi startup and
     assert.equal(evidence.nativePiCli, true);
     assert.equal(evidence.modelMessages, 0);
     assert.equal(evidence.isolated, true);
+    assert.equal(evidence.sharedPiState, true);
+    assert.equal(await readFile(join(f.agentDir, "state-sharing-result.txt"), "utf8"), "persisted from jail");
+    assert.equal(await readFile(join(f.env.HOME, ".pi-lens/state-sharing-result.txt"), "utf8"), "persisted lens state");
     assert.equal(evidence.exited, true);
-    t.diagnostic("Actual offline Pi CLI + native ai-jail: scoped join/host readiness, forbidden host files/UDS/second port, invalid token/scope, clean exit verified.");
+    t.diagnostic("Actual offline Pi CLI + native ai-jail: shared auth/history/lens state, writable persistence, scoped readiness, forbidden host files/UDS/second port, clean exit verified.");
   }
 });
+}
 
 test("individual unjailed starts ignore other jailed slots; unsafe jailed cwd fails before creation", { timeout: 30000 }, async t => {
   const f = await fixture(t, { laterSlot: true });
@@ -360,6 +487,21 @@ test("installed default profile launches all four high-thinking slots without re
   for (const slot of ["arch", "impl", "review", "research"]) assert.match(listed, new RegExp(String.raw`default/${slot}\s+ready`));
   assert.deepEqual(await readFile(join(f.config, "profiles.toml")), before);
 });
+
+for (const newHub of [false, true]) {
+test(`acknowledged bootstrap failure returns promptly (${newHub ? "new hub shuts down" : "existing hub"})`, { timeout: 30000 }, async t => {
+  const f = await fixture(t, { jailFailure: true, acknowledgeFailure: true });
+  if (newHub) await f.stopHub();
+  const started = Date.now();
+  await assert.rejects(f.run("run", "--headless", "--profile", "team", "--jailed"), /failed during jailed Pi startup.*no retry or cleanup attempted/s);
+  assert.ok(Date.now() - started < 8000, "known failure must not wait for the 20-second readiness deadline");
+  await assert.rejects(f.run("--profile", "team", "--jailed"), /startup\/join is unconfirmed/);
+  const owned = await f.owned();
+  assert.equal(owned.creates.length, 1);
+  assert.equal(owned.runs.length, 1);
+  assert.deepEqual(owned.closes, []);
+});
+}
 
 test("jail failure keeps the owned tab unresolved and never falls back or relaunches", { timeout: 30000 }, async t => {
   const f = await fixture(t, { jailFailure: true });

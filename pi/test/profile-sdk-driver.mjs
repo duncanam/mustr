@@ -50,7 +50,7 @@ const agent = new Agent({
   streamFn: () => { throw new Error("Synthetic profile startup must not request a model"); },
 });
 const extensionRuntime = createExtensionRuntime();
-const extensionPath = `${process.env.PI_CODING_AGENT_DIR}/extensions/mustr/index.ts`;
+const extensionPath = `${process.env.PI_CODING_AGENT_DIR ?? `${process.env.HOME}/.pi/agent`}/extensions/mustr/index.ts`;
 const sourceInfo = { path: extensionPath, source: "inline", scope: "temporary", origin: "top-level" };
 const extension = {
   path: extensionPath, resolvedPath: extensionPath, sourceInfo,
