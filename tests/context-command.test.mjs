@@ -76,6 +76,62 @@ test("mustr context keeps successful discovery JSON unchanged", { timeout: 12000
   assert.equal(result.stderr, "");
 });
 
+test("profile context waits for positive Pi recognition without changing discovery JSON", { timeout: 8000 }, async t => {
+  const f = await fixture(t);
+  const socketPath = join(f.directory, "starting-pi.sock");
+  let calls = 0;
+  const fake = await fakeHerdr(socketPath, (connection, request) => {
+    const reply = paneResult(request);
+    if (++calls <= 2) reply.result.pane.agent = null;
+    connection.end(`${JSON.stringify(reply)}\n`);
+  });
+  try {
+    const { stdout, stderr } = await exec(binary, ["context", "--wait-for-pi"], { env: { ...f.env, HERDR_SOCKET_PATH: socketPath }, timeout: 6000 });
+    const context = JSON.parse(stdout);
+    assert.equal(context.pane_id, "w1:p0");
+    assert.equal(context.space_id, "w1");
+    assert.deepEqual(Object.keys(context).sort(), Object.keys(f.discovery).sort());
+    assert.ok(calls >= 3);
+    assert.equal(stderr, "");
+  } finally { await fake.close(); }
+});
+
+test("profile context refuses changed pane, space, or a different recognized agent", { timeout: 8000 }, async t => {
+  const f = await fixture(t);
+  for (const change of [{ pane_id: "w1:replacement" }, { workspace_id: "w2" }, { agent: "codex" }]) {
+    const socketPath = join(f.directory, `changed-${Object.keys(change)[0]}.sock`);
+    let calls = 0;
+    const fake = await fakeHerdr(socketPath, (connection, request) => {
+      const reply = paneResult(request);
+      reply.result.pane.agent = null;
+      if (++calls > 1) Object.assign(reply.result.pane, change);
+      connection.end(`${JSON.stringify(reply)}\n`);
+    });
+    try {
+      await assert.rejects(
+        exec(binary, ["context", "--wait-for-pi"], { env: { ...f.env, HERDR_SOCKET_PATH: socketPath }, timeout: 6000 }),
+        error => error.code === 1 && error.stdout === "" && /pane identity changed|another agent/.test(error.stderr),
+      );
+    } finally { await fake.close(); }
+  }
+});
+
+test("profile context bounds the wait when Pi is never recognized", { timeout: 8000 }, async t => {
+  const f = await fixture(t);
+  const socketPath = join(f.directory, "unrecognized-pi.sock");
+  const fake = await fakeHerdr(socketPath, (connection, request) => {
+    const reply = paneResult(request);
+    reply.result.pane.agent = null;
+    connection.end(`${JSON.stringify(reply)}\n`);
+  });
+  try {
+    await assert.rejects(
+      exec(binary, ["context", "--wait-for-pi"], { env: { ...f.env, HERDR_SOCKET_PATH: socketPath }, timeout: 6000 }),
+      error => error.code === 1 && error.stdout === "" && /Pi was not recognized.*4 seconds/.test(error.stderr),
+    );
+  } finally { await fake.close(); }
+});
+
 test("mustr context maps a held pane.current reply to concise reserved exit 75", { timeout: 12000 }, async t => {
   const f = await fixture(t);
   const socketPath = join(f.directory, "withheld-herdr.sock");

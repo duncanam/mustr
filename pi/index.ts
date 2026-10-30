@@ -190,10 +190,12 @@ export default function mustr(pi: ExtensionAPI) {
     const launch = jailLaunch ?? launchDescriptor;
     if (launch) {
       if (launch.descriptor_path !== process.env.MUSTR_LAUNCH_DESCRIPTOR) throw new ContextCommandFailure("Profile launch route changed; restart explicitly.");
-      return { pane_id: launch.pane_id, space_id: launch.space_id, server_key: launch.server_key, socket: launch.socket };
+      // Jailed launches have no host Herdr access; their gateway attests scope.
+      // Unjailed startup must observe Pi recognition before its first join.
+      if (launch.gateway || launchReadyWritten) return { pane_id: launch.pane_id, space_id: launch.space_id, server_key: launch.server_key, socket: launch.socket };
     }
     let value: any;
-    try { value = await command(["context"], cwd); }
+    try { value = await command(["context", ...(launch ? ["--wait-for-pi"] : [])], cwd); }
     catch (error) {
       if (isNumericContextExit75(error)) throw new HerdrContextUnavailable();
       throw new ContextCommandFailure(contextFailureMessage(error));
