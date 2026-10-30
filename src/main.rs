@@ -1,6 +1,7 @@
 //! mustr: a user-owned, herdr-scoped hub. Agent reasoning remains in its harness.
 //! Internal modules deliberately do not form a public library API.
 
+mod ai_help;
 mod cli;
 mod config;
 mod delivery;
@@ -79,6 +80,10 @@ fn ensure_profile_name(name: &str) -> Result<()> {
 async fn main() -> Result<()> {
     color_eyre::install()?;
     let cli = Cli::parse();
+    if cli.ai_help {
+        ai_help::print()?;
+        return Ok(());
+    }
     let profile_name = cli.profile.clone();
     let jailed = cli.jailed;
     let paths = Paths::discover(cli.config_dir)?;

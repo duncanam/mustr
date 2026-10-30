@@ -17,7 +17,10 @@ use serde_json::Value;
 use crate::{
     herdr::{Discovery, Herdr},
     install,
-    paths::{Paths, check_regular, create_file, digest, private_dir, replace_file},
+    paths::{
+        Paths, check_regular, create_file, create_file_atomically, digest, private_dir,
+        replace_file,
+    },
     profiles::{Agent, Profile},
     roles, server,
 };
@@ -108,6 +111,17 @@ struct ReadyReceipt {
     role: String,
     model: String,
     thinking: String,
+}
+
+/// Host-only bootstrap outcome; no raw child output or credential-bearing errors.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LaunchFailure {
+    version: u32,
+    launch_id: String,
+    server_key: String,
+    space_id: String,
+    pane_id: String,
 }
 
 #[derive(Clone, Debug)]
@@ -241,6 +255,7 @@ pub(crate) async fn ensure_profile(
     );
     let mut files = LedgerFiles::open(paths, &discovery)?;
     let mut ledger = files.load(&discovery)?;
+    prune_missing_tabs(&herdr, &discovery, &files, &mut ledger)?;
     let tabs = list_tabs(&discovery.space_id.to_string())?;
     let mut planned = Vec::new();
 
@@ -317,6 +332,7 @@ pub(crate) async fn start_one_instance(
     );
     let mut files = LedgerFiles::open(paths, &discovery)?;
     let mut ledger = files.load(&discovery)?;
+    prune_missing_tabs(&herdr, &discovery, &files, &mut ledger)?;
     let tabs = list_tabs(&discovery.space_id.to_string())?;
     match existing_instance(
         &mut ledger,
@@ -350,7 +366,8 @@ pub(crate) async fn list(paths: &Paths, profile: Option<&str>) -> Result<()> {
     let herdr = Herdr::from_env()?;
     let discovery = herdr.discovery().await?;
     let files = LedgerFiles::open(paths, &discovery)?;
-    let ledger = files.load(&discovery)?;
+    let mut ledger = files.load(&discovery)?;
+    prune_missing_tabs(&herdr, &discovery, &files, &mut ledger)?;
     let tabs = list_tabs(&discovery.space_id.to_string())?;
     for record in ledger
         .records
@@ -359,7 +376,9 @@ pub(crate) async fn list(paths: &Paths, profile: Option<&str>) -> Result<()> {
     {
         let state = match (&record.tab_id, &record.pane_id) {
             (None, _) => "unresolved-create".to_owned(),
-            (Some(tab), _) if !tabs.iter().any(|live| live.tab_id == *tab) => "stale".to_owned(),
+            (Some(tab), _) if !tabs.iter().any(|live| live.tab_id == *tab) => {
+                "out-of-space".to_owned()
+            }
             (Some(_), _) if record.ready => "ready".to_owned(),
             _ => "launch-unconfirmed".to_owned(),
         };
@@ -378,17 +397,22 @@ pub(crate) async fn stop(paths: &Paths, instance: &str) -> Result<()> {
     let herdr = Herdr::from_env()?;
     let discovery = herdr.discovery().await?;
     let files = LedgerFiles::open(paths, &discovery)?;
-    let ledger = files.load(&discovery)?;
-    let record = ledger
+    let mut ledger = files.load(&discovery)?;
+    prune_missing_tabs(&herdr, &discovery, &files, &mut ledger)?;
+    let Some(record) = ledger
         .records
         .iter()
         .rev()
         .find(|record| record.instance == instance)
-        .ok_or_else(|| {
-            eyre!("no profile-owned instance {instance:?} in this herdr incarnation/space")
-        })?;
+        .cloned()
+    else {
+        println!(
+            "Instance {instance} is already gone or not managed in this space; nothing to stop."
+        );
+        return Ok(());
+    };
     let tab_id = record.tab_id.as_deref().ok_or_else(|| eyre!("instance {instance:?} has unresolved tab-create outcome; inspect Herdr before editing its ownership record"))?;
-    validate_stop_target(&herdr, &discovery, record).await?;
+    validate_stop_target(&herdr, &discovery, &record).await?;
     ensure!(
         io::stdin().is_terminal() && io::stdout().is_terminal(),
         "agent stop requires an interactive terminal for confirmation"
@@ -404,8 +428,21 @@ pub(crate) async fn stop(paths: &Paths, instance: &str) -> Result<()> {
         return Ok(());
     }
     // Confirmation can take arbitrarily long; it is not ownership evidence.
-    validate_stop_target(&herdr, &discovery, record).await?;
+    prune_missing_tabs(&herdr, &discovery, &files, &mut ledger)?;
+    if !ledger
+        .records
+        .iter()
+        .any(|current| current.launch_id == record.launch_id)
+    {
+        println!("Instance {instance} is already gone; nothing to stop.");
+        return Ok(());
+    }
+    validate_stop_target(&herdr, &discovery, &record).await?;
     run_herdr(&["tab", "close", tab_id])?;
+    ledger
+        .records
+        .retain(|current| current.launch_id != record.launch_id);
+    files.save(&ledger)?;
     println!(
         "Closed managed tab {tab_id}. This did not stop external jobs or cancel/reassign tasks."
     );
@@ -489,7 +526,11 @@ pub(crate) async fn bootstrap(paths: &Paths, launch_id: &str) -> Result<()> {
     );
     drop(files);
     if manifest.jailed {
-        return jail::run(manifest, &launch_directory).await;
+        let result = jail::run(manifest.clone(), &launch_directory).await;
+        if result.is_err() {
+            publish_launch_failure(&manifest, &launch_directory)?;
+        }
+        return result;
     }
     let descriptor_path = launch_directory.join("descriptor.json");
     let mut descriptor = serde_json::to_value(&manifest)?;
@@ -736,6 +777,25 @@ fn start_one(
             files.save(ledger)?;
             return Ok(true);
         }
+        let failure_path = launch_directory.join("failed.json");
+        if let Ok(bytes) = read_private_file(&failure_path, 16 * 1024) {
+            let failure: LaunchFailure =
+                serde_json::from_slice(&bytes).wrap_err("parsing launch failure receipt")?;
+            ensure!(
+                failure.version == MANIFEST_VERSION
+                    && failure.launch_id == launch_id
+                    && failure.server_key == discovery.server_key
+                    && failure.space_id == discovery.space_id.to_string()
+                    && failure.pane_id == pane,
+                "launch failure receipt does not match the owned launch"
+            );
+            files.relock()?;
+            *ledger = files.load(discovery)?;
+            bail!(
+                "profile launch {instance:?} failed during jailed Pi startup in owned tab {}; inspect that tab for the error; no retry or cleanup attempted",
+                tab.tab_id
+            );
+        }
         if Instant::now() >= deadline {
             files.relock()?;
             *ledger = files.load(discovery)?;
@@ -747,6 +807,24 @@ fn start_one(
         }
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+fn publish_launch_failure(manifest: &LaunchDescriptor, directory: &Path) -> Result<()> {
+    if !manifest.ready_path.exists() {
+        let failure = LaunchFailure {
+            version: MANIFEST_VERSION,
+            launch_id: manifest.launch_id.clone(),
+            server_key: manifest.server_key.clone(),
+            space_id: manifest.space_id.clone(),
+            pane_id: manifest.pane_id.clone(),
+        };
+        create_file_atomically(
+            &directory.join("failed.json"),
+            &serde_json::to_vec(&failure)?,
+        )
+        .wrap_err("recording host-side launch failure")?;
+    }
+    Ok(())
 }
 
 fn validate_ready(
@@ -926,6 +1004,64 @@ fn run_herdr_args(args: Vec<String>) -> Result<String> {
         String::from_utf8_lossy(&output.stderr).trim()
     );
     String::from_utf8(output.stdout).wrap_err("herdr output was not UTF-8")
+}
+
+/// Remove only records whose known tab is absent from a valid server-wide list.
+/// A moved tab or an intent with no tab id is not evidence of a dead launch.
+fn prune_missing_tabs(
+    herdr: &Herdr,
+    discovery: &Discovery,
+    files: &LedgerFiles,
+    ledger: &mut Ledger,
+) -> Result<()> {
+    if ledger.records.is_empty() {
+        return Ok(());
+    }
+    herdr.check_instance()?;
+    let output = run_herdr(&["tab", "list"])?;
+    let value: Value = serde_json::from_str(output.trim())
+        .wrap_err("parsing server-wide Herdr tab list; ownership retained")?;
+    let body = value.get("result").unwrap_or(&value);
+    ensure!(
+        value.get("error").is_none()
+            && body.get("error").is_none()
+            && body
+                .get("type")
+                .is_none_or(|kind| kind.as_str() == Some("tab_list")),
+        "invalid server-wide Herdr tab list; ownership retained"
+    );
+    let rows = body
+        .as_array()
+        .or_else(|| body.get("tabs").and_then(Value::as_array))
+        .ok_or_else(|| eyre!("invalid server-wide Herdr tab list; ownership retained"))?;
+    let mut ids = std::collections::HashSet::new();
+    for row in rows {
+        let tab = row
+            .get("tab_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| eyre!("invalid Herdr tab id; ownership retained"))?;
+        ensure!(
+            row.get("workspace_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty())
+                && ids.insert(tab),
+            "invalid or duplicate Herdr tab entry; ownership retained"
+        );
+    }
+    herdr.check_instance()?;
+    ensure!(
+        ledger.server_key == discovery.server_key && ledger.space_id == discovery.space_id.as_str(),
+        "ownership scope changed; cleanup refused"
+    );
+    let before = ledger.records.len();
+    ledger
+        .records
+        .retain(|record| record.tab_id.as_deref().is_none_or(|id| ids.contains(id)));
+    if ledger.records.len() != before {
+        files.save(ledger)?;
+    }
+    Ok(())
 }
 
 fn list_tabs(workspace: &str) -> Result<Vec<LiveTab>> {

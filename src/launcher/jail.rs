@@ -1,8 +1,7 @@
-//! Fixed ai-jail invocation and per-launch Pi state; never map the host home.
+//! Scoped Mustr transport through ai-jail; Pi state and sandbox policy belong to ai-jail.
 
 use std::{
     fs,
-    os::unix::fs::symlink,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -12,7 +11,7 @@ use serde_json::json;
 
 use super::{LaunchDescriptor, gateway::Gateway, pi_agent_dir, write_readonly_file};
 use crate::{
-    paths::{Paths, check_regular, private_dir, runtime_dir},
+    paths::{Paths, private_dir, runtime_dir},
     profiles::Agent,
 };
 
@@ -79,64 +78,16 @@ pub(super) fn validate<'a>(paths: &Paths, agents: impl Iterator<Item = &'a Agent
     Ok(())
 }
 
-fn prepare_pi(source: &Path, destination: &Path) -> Result<Vec<PathBuf>> {
-    private_dir(destination)?;
-    let mut maps = Vec::new();
-    // Preserve installed code/policy resources, not private session archives or
-    // host credentials. External symlink targets still need explicit jail grants.
-    for name in ["extensions", "skills", "prompts", "themes", "npm", "git"] {
-        let path = source.join(name);
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) => {
-                ensure!(
-                    metadata.is_dir() && !metadata.file_type().is_symlink(),
-                    "Pi resource root {} must be a real directory for jailed launch",
-                    path.display()
-                );
-                symlink(&path, destination.join(name))?;
-                maps.push(path);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    for name in [
-        "settings.json",
-        "keybindings.json",
-        "models.json",
-        "mcp.json",
-        "AGENTS.override.md",
-        "AGENTS.md",
-        "AGENTS.MD",
-        "CLAUDE.md",
-        "CLAUDE.MD",
-        "SYSTEM.md",
-        "APPEND_SYSTEM.md",
-    ] {
-        let path = source.join(name);
-        match fs::symlink_metadata(&path) {
-            Ok(metadata) => {
-                check_regular(&path)?;
-                ensure!(
-                    metadata.len() <= 1024 * 1024,
-                    "Pi configuration file is too large: {}",
-                    path.display()
-                );
-                crate::paths::create_file(&destination.join(name), &fs::read(path)?)?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(maps)
-}
-
 pub(super) async fn run(manifest: LaunchDescriptor, launch_directory: &Path) -> Result<()> {
     let sandbox = launch_directory.join("sandbox");
     private_dir(&sandbox)?;
-    let pi_dir = sandbox.join("pi");
-    let maps = prepare_pi(&pi_agent_dir()?, &pi_dir)?;
     let descriptor_path = sandbox.join("descriptor.json");
+    // The host launcher pins PI_CODING_AGENT_DIR even for the standard path.
+    // Only a genuinely custom directory needs an explicit state map.
+    let selected = pi_agent_dir()?;
+    let standard = std::env::var_os("HOME")
+        .and_then(|home| PathBuf::from(home).join(".pi/agent").canonicalize().ok());
+    let custom_agent_dir = (standard.as_ref() != Some(&selected)).then_some(selected);
     let gateway = Gateway::start(manifest.clone()).await?;
     // No host binary/config/state/socket paths or writable readiness route.
     let descriptor = json!({
@@ -151,49 +102,22 @@ pub(super) async fn run(manifest: LaunchDescriptor, launch_directory: &Path) -> 
     write_readonly_file(&descriptor_path, &serde_json::to_vec(&descriptor)?)?;
     let mut command = tokio::process::Command::new("ai-jail");
     command
-        .args([
-            "--no-save-config",
-            "--private-home",
-            "--no-agent-state",
-            "--no-inherit-env",
-            "--no-macos-host-ipc",
-            "--no-docker",
-            "--no-browser",
-            "--no-github",
-            "--no-aws",
-            "--no-kube",
-            "--no-gcloud",
-            "--no-docker-config",
-            "--no-worktree",
-            "--no-gpu",
-            "--no-display",
-            "--no-audio",
-            "--no-x11",
-            "--no-pictures",
-            "--no-tailscale",
-            "--no-ssh",
-            "--no-systemd-user",
-            "--no-host-shm",
-            "--no-network",
-            "--no-toolchains",
-            "--no-mise",
-            "--no-update-check",
-            "--no-audit-log",
-            "--no-terminal-passthrough",
-            "--exec",
-            "--forward-port",
-        ])
+        // Operational/transport flags only: do not override ai-jail's state,
+        // network, environment or other capability policy.
+        .args(["--no-save-config", "--forward-port"])
         .arg(gateway.endpoint.port.to_string())
         .arg("--map")
-        .arg(&descriptor_path)
-        .arg("--rw-map")
-        .arg(&pi_dir);
-    for path in maps {
-        command.arg("--map").arg(path);
+        .arg(&descriptor_path);
+    // ai-jail knows Pi's standard ~/.pi state. Preserve an explicitly selected
+    // custom agent directory with equivalent read-write sharing semantics.
+    if let Some(agent_dir) = custom_agent_dir {
+        command
+            .arg("--rw-map")
+            .arg(&agent_dir)
+            .arg("--env")
+            .arg(format!("PI_CODING_AGENT_DIR={}", agent_dir.display()));
     }
     command
-        .arg("--env")
-        .arg(format!("PI_CODING_AGENT_DIR={}", pi_dir.display()))
         .arg("--env")
         .arg(format!(
             "MUSTR_LAUNCH_DESCRIPTOR={}",
@@ -231,43 +155,4 @@ pub(super) async fn run(manifest: LaunchDescriptor, launch_directory: &Path) -> 
         "jailed Pi exited with {status}; no retry or unjailed fallback attempted"
     );
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn stages_policy_resources_without_host_auth_or_history() {
-        let root = tempfile::tempdir().unwrap();
-        let source = root.path().join("source");
-        let target = root.path().join("target");
-        fs::create_dir_all(source.join("extensions")).unwrap();
-        fs::create_dir_all(source.join("sessions")).unwrap();
-        fs::write(source.join("extensions/policy.ts"), "policy sentinel").unwrap();
-        fs::write(source.join("AGENTS.md"), "user policy sentinel").unwrap();
-        fs::write(
-            source.join("settings.json"),
-            "{\"extensions\":[\"./extensions/policy.ts\"]}",
-        )
-        .unwrap();
-        fs::write(source.join("auth.json"), "PRIVATE AUTH").unwrap();
-        fs::write(source.join("sessions/private.jsonl"), "PRIVATE HISTORY").unwrap();
-        let maps = prepare_pi(&source, &target).unwrap();
-        assert_eq!(maps, [source.join("extensions")]);
-        assert_eq!(
-            fs::read_to_string(target.join("extensions/policy.ts")).unwrap(),
-            "policy sentinel"
-        );
-        assert_eq!(
-            fs::read_to_string(target.join("AGENTS.md")).unwrap(),
-            "user policy sentinel"
-        );
-        assert_eq!(
-            fs::read(target.join("settings.json")).unwrap(),
-            fs::read(source.join("settings.json")).unwrap()
-        );
-        assert!(!target.join("auth.json").exists());
-        assert!(!target.join("sessions").exists());
-    }
 }

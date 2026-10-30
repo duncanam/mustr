@@ -2,6 +2,8 @@
 
 A terminal-native coordination hub for Pi agents in herdr. Run one mustr instance in a tab of each space you want to coordinate; agents join with editable roles and exchange addressed messages. The hub handles task ownership and user-controlled scheduling—not model reasoning.
 
+For a self-contained agent reference, run **`mustr --ai-help`**. It includes all public command options, setup/configuration, profiles, Pi coordination, ai-jail grants and troubleshooting for the installed version. It works outside Herdr without reading configuration or initializing state.
+
 ## Install
 
 Requires Rust 1.89+, Node 22.19+, herdr's socket API, and Pi 1.2+. macOS and Linux; `gh` is needed only for PR watching.
@@ -58,6 +60,8 @@ Every new assignment requires an explicit `reuse` or `fresh` context choice; the
 Attach a checklist with `/mustr-todo path/to/TODO.md`, then enable TODO mode. `/mustr pause` is an explicit hold on Mustr delivery released only by `/mustr resume` or leaving; human and extension turns do not resume coordination. Ordinary Pi tools remain available during the pause. Pi owns input, abort, and provider retry state: visible queued messages/drafts gate delivery, while mustr does not infer input acceptance or retain interruption/final-error holds. A native retry delays autonomous delivery only until Pi settles; mustr does not retry failed work. `/mustr leave` ends participation without stopping external jobs.
 
 ## Configure
+
+Jailed launches use **ai-jail's normal Pi state sharing**: by default, Pi's credentials, settings and sessions are shared read-write and changes persist. Mustr does not create isolated Pi state or require a symlink allowlist. If a dotfiles symlink points outside ai-jail's accessible paths, allow the specific target in trusted **ai-jail configuration**; see [Pi state and symlink setup](docs/configuration.md#jailed-profiles).
 
 `~/.config/mustr/config.toml` contains scheduling/UI settings. Editable prompts live in `~/.config/mustr/roles/*.md`; add domain-specific roles or compose compatible components using TOML front matter. Keep to one functional role—architect, researcher, implementor, or reviewer—per prompt; see [configuration and role boundaries](docs/configuration.md#composing-roles). `$XDG_CONFIG_HOME` and `--config-dir` are supported. `mustr init` and normal installs preserve existing roles. To refresh embedded shipped role files deliberately, run `mustr install pi --overwrite-roles`; customized contents under shipped filenames are replaced after exact backups in `<config>/role-backups/`. Custom-named roles and config/state are untouched. Role files are shared across spaces using that config directory; active prompt snapshots do not change until you explicitly reselect/rejoin after reconciling work. See [role refresh and backup/restore details](docs/configuration.md#refreshing-shipped-role-prompts).
 
