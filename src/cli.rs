@@ -50,7 +50,11 @@ pub(crate) enum Command {
         target: InstallTarget,
     },
     /// Print live caller identity and hub discovery information for adapters.
-    Context,
+    Context {
+        /// Internal profile startup gate; ordinary context discovery remains immediate.
+        #[arg(long, hide = true)]
+        wait_for_pi: bool,
+    },
     /// Manage only profile-owned Pi tabs.
     Agent {
         #[command(subcommand)]

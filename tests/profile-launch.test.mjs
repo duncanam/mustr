@@ -13,7 +13,7 @@ import { binary, delay } from "./support.mjs";
 const exec = promisify(execFile);
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 
-async function fixture(t, { laterSlot = false, holdFirst = false, jailFailure = false, nativeJail = false, shippedProfile = false } = {}) {
+async function fixture(t, { laterSlot = false, holdFirst = false, jailFailure = false, nativeJail = false, shippedProfile = false, pendingDetections = 0 } = {}) {
   const root = await mkdtemp("/tmp/mustr-profile-launch-");
   const config = join(root, "config"), state = join(root, "state"), home = join(root, "home");
   const agentDir = join(root, "pi-agent"), cwd = join(root, "project"), bin = join(root, "bin");
@@ -88,7 +88,7 @@ if (args[0] === "tab" && args[1] === "list") {
   await writeFile(herdrPath, herdrCli, { mode: 0o700 });
   await chmod(herdrPath, 0o700);
   const piPath = join(bin, "pi");
-  await writeFile(piPath, `#!${process.execPath}\nimport { spawnSync } from "node:child_process";\nconst result = spawnSync(process.execPath, [${JSON.stringify(join(repoRoot, nativeJail ? "pi/test/profile-cli-driver.mjs" : "pi/test/profile-sdk-driver.mjs"))}, ...process.argv.slice(2)], { stdio: "inherit", env: process.env });\nif (result.error) throw result.error; process.exit(result.status ?? 1);\n`, { mode: 0o700 });
+  await writeFile(piPath, `#!${process.execPath}\nimport { spawnSync } from "node:child_process";\nimport { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(root)} + "/pi-started-" + process.env.HERDR_PANE_ID, "started");\nconst result = spawnSync(process.execPath, [${JSON.stringify(join(repoRoot, nativeJail ? "pi/test/profile-cli-driver.mjs" : "pi/test/profile-sdk-driver.mjs"))}, ...process.argv.slice(2)], { stdio: "inherit", env: process.env });\nif (result.error) throw result.error; process.exit(result.status ?? 1);\n`, { mode: 0o700 });
   await chmod(piPath, 0o700);
   const jailPath = join(bin, "ai-jail");
   // Argument/environment fixture only: this does NOT claim sandbox enforcement.
@@ -114,14 +114,23 @@ if (result.error) throw result.error;
 process.exit(result.status ?? 1);
 `, { mode: 0o700 });
 
+  const detectionChecks = new Map();
   herdrServer = net.createServer(connection => {
     let buffer = "";
     connection.on("data", async chunk => {
       buffer += chunk;
       if (!buffer.includes("\n")) return;
       const request = JSON.parse(buffer.split("\n", 1)[0]);
+      const pane = request.params.caller_pane_id;
+      let agent = "pi";
+      if (pendingDetections && request.method === "pane.current" && pane !== "host-pane") {
+        const started = await readFile(join(root, `pi-started-${pane}`), "utf8").catch(() => "");
+        const checks = detectionChecks.get(pane) ?? 0;
+        agent = started && checks >= pendingDetections ? "pi" : null;
+        if (started) detectionChecks.set(pane, checks + 1);
+      }
       const result = request.method === "pane.current"
-        ? { pane: { pane_id: request.params.caller_pane_id, workspace_id: "synthetic-space", agent: "pi" } }
+        ? { pane: { pane_id: pane, workspace_id: "synthetic-space", agent } }
         : request.method === "workspace.list" ? { workspaces: [{ workspace_id: "synthetic-space", label: "Synthetic" }] }
         : request.method === "pane.get" ? { pane: JSON.parse(await readFile(herdrState, "utf8")).tabs.find(tab => tab.pane_id === request.params.pane_id) ?? null } : undefined;
       connection.end(`${JSON.stringify(result === undefined ? { id: request.id, error: "unexpected method" } : { id: request.id, result })}\n`);
@@ -168,7 +177,7 @@ process.exit(result.status ?? 1);
   }
 
   return {
-    root, env, config, herdrState, agentDir, cwd,
+    root, env, config, herdrState, agentDir, cwd, detectionChecks,
     run: (...args) => exec(binary, ["--config-dir", config, ...args], { env, cwd, timeout: 30000 }),
     owned: async () => JSON.parse(await readFile(herdrState, "utf8")),
     releaseFirst: () => writeFile(env.MUSTR_TEST_HOLD, "released"),
@@ -359,6 +368,20 @@ test("installed default profile launches all four high-thinking slots without re
   const listed = (await f.run("agent", "list", "--profile", "default")).stdout;
   for (const slot of ["arch", "impl", "review", "research"]) assert.match(listed, new RegExp(String.raw`default/${slot}\s+ready`));
   assert.deepEqual(await readFile(join(f.config, "profiles.toml")), before);
+});
+
+test("default profile waits for Herdr to recognize each Pi before joining and launches all four slots", { timeout: 30000 }, async t => {
+  const f = await fixture(t, { shippedProfile: true, pendingDetections: 2 });
+  assert.match((await f.run("--profile", "default")).stdout, /4 new agent/);
+  const owned = await f.owned();
+  assert.deepEqual(owned.creates.map(tab => tab.label).sort(), ["arch", "impl", "research", "review"]);
+  assert.equal(owned.runs.length, 4, "startup never retries the command that starts Pi");
+  const listed = (await f.run("agent", "list", "--profile", "default")).stdout;
+  for (const slot of ["arch", "impl", "research", "review"]) assert.match(listed, new RegExp(String.raw`default/${slot}\s+ready`));
+  assert.equal(f.detectionChecks.size, 4);
+  assert.ok([...f.detectionChecks.values()].every(checks => checks > 2), "each launch survives pending recognition and confirms Pi");
+  assert.match((await f.run("--profile", "default")).stdout, /0 new agent/);
+  assert.equal((await f.owned()).creates.length, 4);
 });
 
 test("jail failure keeps the owned tab unresolved and never falls back or relaunches", { timeout: 30000 }, async t => {

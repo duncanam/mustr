@@ -130,18 +130,26 @@ async fn main() -> Result<()> {
                 print_role_refresh(&report);
             }
         }
-        Command::Context => match herdr::Herdr::from_env()?.discovery().await {
-            Ok(discovery) => println!("{}", serde_json::to_string(&discovery)?),
-            Err(error) => {
-                if let Some(unavailable) = error.downcast_ref::<HerdrUnavailable>() {
-                    // This command-only status is the adapter's narrow transient
-                    // context contract. Avoid color-eyre chains/backtraces here.
-                    eprintln!("{unavailable}");
-                    std::process::exit(CONTEXT_UNAVAILABLE_EXIT_CODE);
+        Command::Context { wait_for_pi } => {
+            let herdr = herdr::Herdr::from_env()?;
+            let result = if wait_for_pi {
+                herdr.discovery_wait_for_pi().await
+            } else {
+                herdr.discovery().await
+            };
+            match result {
+                Ok(discovery) => println!("{}", serde_json::to_string(&discovery)?),
+                Err(error) => {
+                    if let Some(unavailable) = error.downcast_ref::<HerdrUnavailable>() {
+                        // This command-only status is the adapter's narrow transient
+                        // context contract. Avoid color-eyre chains/backtraces here.
+                        eprintln!("{unavailable}");
+                        std::process::exit(CONTEXT_UNAVAILABLE_EXIT_CODE);
+                    }
+                    return Err(error);
                 }
-                return Err(error);
             }
-        },
+        }
         Command::Run { headless } => {
             let profile = profile_name
                 .as_deref()
