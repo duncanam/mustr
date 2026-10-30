@@ -2,6 +2,8 @@
 
 A terminal-native coordination hub for Pi agents in herdr. Run one mustr instance in a tab of each space you want to coordinate; agents join with editable roles and exchange addressed messages. The hub handles task ownership and user-controlled scheduling—not model reasoning.
 
+For a self-contained agent reference, run **`mustr --ai-help`**. It includes all public command options, setup/configuration, profiles, Pi coordination, ai-jail grants and troubleshooting for the installed version. It works outside Herdr without reading configuration or initializing state.
+
 ## Install
 
 Requires Rust 1.89+, Node 22.19+, herdr's socket API, and Pi 1.2+. macOS and Linux; `gh` is needed only for PR watching.

@@ -47,6 +47,12 @@ Composable-role regressions cover ordered/shared graph expansion, invalid header
 
 Fresh-start regressions span three boundaries: Rust reset/actor/store tests check scoped persistence, fences and failure recovery; `pi/test/adapter-reset.test.mjs` exercises actual adapter handlers against controlled race/transport fixtures; `pi/test/adapter-runtime.test.mjs` uses the production adapter with real pinned Pi command/session replacement APIs and an isolated Unix-socket peer, proving fresh context and receipt-gated role activation without a model. `tests/reset-ui.test.mjs` plus its uv-owned PTY helper exercise actual human confirmation/cancellation and scoped hub-only clearing. These do not claim a live installed multi-agent reset or termination of external jobs.
 
+## Embedded agent help
+
+`mustr --ai-help` exits before path discovery, initialization, configuration loading or Herdr access. `docs/ai-help.md` is embedded at build time; update its operational guidance when workflows change. `src/ai_help.rs` appends version-matched long help for the entire public Clap command tree, skips hidden/internal interfaces and synthetic help proxies, fixes formatting and suppresses all environment-bound values. It invokes no external commands and reads no live state.
+
+`tests/ai-help.test.mjs` compares every generated public command section with the real CLI's long help, including nested commands/options. It verifies guide content, installed-version labeling, hidden-interface exclusion, deterministic uncolored output, hostile environment-value suppression, no initialization with missing HOME/Herdr or invalid configuration, and no installer/launcher/tool execution. These checks use isolated temporary state and executable tripwires, never live configuration.
+
 ## Profile launcher evidence and limits
 
 `profiles/default.toml` is embedded into the binary and seeded only when the destination is missing. Profile/parser tests verify the four slot/role/model/thinking contracts, one manager, inherited cwd, jail opt-in and non-destructive seeding (including links). Installer integration covers fresh setup, explicit missing-file repair, preservation of edited/invalid profiles even with `--overwrite-roles`, and validates model IDs/high thinking against Pi's bundled offline catalog. The profile launcher integration also launches all four shipped defaults through the real SDK with synthetic provider implementations, never provider requests.

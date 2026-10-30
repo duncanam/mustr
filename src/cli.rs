@@ -8,6 +8,10 @@ use clap_verbosity_flag::{InfoLevel, Verbosity};
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
 pub(crate) struct Cli {
+    /// Print the self-contained agent guide and all public command options, then exit without initializing state.
+    #[arg(long, global = true)]
+    pub ai_help: bool,
+
     /// Configuration directory (defaults to $XDG_CONFIG_HOME/mustr or ~/.config/mustr).
     #[arg(long, env = "MUSTR_CONFIG_DIR", global = true)]
     pub config_dir: Option<PathBuf>,

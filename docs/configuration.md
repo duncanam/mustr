@@ -2,7 +2,7 @@
 
 ## Paths and CLI
 
-Run `mustr init` to create configuration and restore missing shipped role files and `profiles.toml`; it never overwrites existing files. The first ordinary command also initializes a fresh configuration, but later ordinary commands respect deleted roles/profiles. Normal installer commands preserve roles and seed `profiles.toml` only when missing; the explicit `--overwrite-roles` installer option is documented below. `--help` and `--version` do not need herdr or configuration.
+Run `mustr init` to create configuration and restore missing shipped role files and `profiles.toml`; it never overwrites existing files. The first ordinary command also initializes a fresh configuration, but later ordinary commands respect deleted roles/profiles. Normal installer commands preserve roles and seed `profiles.toml` only when missing; the explicit `--overwrite-roles` installer option is documented below. `--help`, `--version` and `--ai-help` do not need herdr or configuration and do not initialize state. `mustr --ai-help` prints the installed version's self-contained agent guide plus a generated reference for every public command and option; it never prints current configuration, environment values or private state.
 
 | Purpose | Default | Override |
 |---|---|---|
@@ -14,6 +14,7 @@ Run `mustr init` to create configuration and restore missing shipped role files 
 Configuration, state, and adapter-directory overrides must be absolute paths. The adapter remembers the installed binary and configuration directory; `MUSTR_BIN` and `MUSTR_CONFIG_DIR` override those. Re-run `mustr install pi` after moving the executable.
 
 ```sh
+mustr --ai-help             # complete static agent guide; works outside herdr
 mustr                      # hub and dashboard for this herdr space
 mustr run --headless        # same per-space hub, no dashboard
 mustr roles                # available role names and descriptions
