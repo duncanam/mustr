@@ -47,7 +47,12 @@ Roles can be selected before the hub starts. Agents keep their own normal conver
 | `f` | Switch Messages / Tasks tab |
 | `r` | Start fresh in this space / inspect reset status (confirmation required) |
 | `↑` / `↓`, `k` / `j` | Scroll messages or browse tasks in the active tab |
-| `?`, `q` | Help, quit |
+| `a` | Show/hide completed profile startup results |
+| `[` / `]` | Scroll visible profile startup results |
+| `?` | Help |
+| `q` | Cancel unfinished profile startup, then quit; otherwise quit |
+
+For a new interactive profile hub, the dashboard opens during startup and shows per-agent results. Cancellation waits for any dispatched operation to resolve and leaves created tabs and started agents open; it does not launch Pi into a tab whose creation finishes after cancellation. Headless or existing-hub profile ensures remain noninteractive.
 
 Messages and Tasks share a pane with independent scroll positions. The pane shows queued task counts and FIFO positions; a queued task has not been dispatched or started. The pane border also shows total tasks and accepted completions for this space; awaiting-review and cancelled tasks are not counted as completed. Cancelling a task changes hub bookkeeping only and does not stop external jobs.
 

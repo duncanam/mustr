@@ -14,7 +14,7 @@ import { binary, delay } from "./support.mjs";
 const exec = promisify(execFile);
 const repoRoot = dirname(dirname(fileURLToPath(import.meta.url)));
 
-async function fixture(t, { laterSlot = false, holdFirst = false, jailFailure = false, acknowledgeFailure = false, nativeJail = false, shippedProfile = false, resourceSymlinks = false, customAgentDir = false, pendingDetections = 0 } = {}) {
+async function fixture(t, { laterSlot = false, holdFirst = false, jailFailure = false, acknowledgeFailure = false, nativeJail = false, shippedProfile = false, resourceSymlinks = false, customAgentDir = false, pendingDetections = 0, interactiveProfile = false, holdCreate = false } = {}) {
   const root = await mkdtemp("/tmp/mustr-profile-launch-");
   const config = join(root, "config"), state = join(root, "state"), home = join(root, "home");
   const agentDir = customAgentDir ? join(root, "pi-agent") : join(home, ".pi/agent"), cwd = join(root, "project"), bin = join(root, "bin");
@@ -32,6 +32,7 @@ async function fixture(t, { laterSlot = false, holdFirst = false, jailFailure = 
     MUSTR_TEST_HERDR_STATE: herdrState,
     MUSTR_TEST_SDK_DRIVER: join(repoRoot, "pi/test/profile-sdk-driver.mjs"),
     MUSTR_TEST_HOLD: holdFirst ? join(root, "release-first") : "",
+    MUSTR_TEST_HOLD_CREATE: holdCreate ? join(root, "release-create") : "",
     PATH: `${bin}:${process.env.PATH}`,
   };
   delete env.PI_CODING_AGENT_DIR;
@@ -69,6 +70,13 @@ if (args[0] === "tab" && args[1] === "list") {
   current.tabs.push({ tab_id: tab.tab_id, workspace_id: tab.workspace_id, pane_id: tab.pane_id, pane_count: tab.pane_count, env: tab.env });
   current.creates.push({ tab_id: tab.tab_id, pane_id: tab.pane_id, label: value("--label", ""), cwd: value("--cwd", "") });
   save(current);
+  if (process.env.MUSTR_TEST_HOLD_CREATE && number === 1) {
+    const deadline = Date.now() + 15000;
+    while (!existsSync(process.env.MUSTR_TEST_HOLD_CREATE)) {
+      if (Date.now() >= deadline) throw new Error("Timed out waiting for test to release tab create");
+      await delay(20);
+    }
+  }
   console.log(JSON.stringify({ tab: { tab_id: tab.tab_id, workspace_id: tab.workspace_id }, root_pane: { pane_id: tab.pane_id } }));
 } else if (args[0] === "pane" && args[1] === "run") {
   const current = read(), pane = args[2], tab = current.tabs.find(item => item.pane_id === pane), command = args[3];
@@ -177,14 +185,16 @@ process.exit(result.status ?? 1);
   await mkdir(join(home, ".pi-lens"));
   await writeFile(join(home, ".pi-lens/state-sentinel"), "synthetic lens state");
 
-  hub = spawn(binary, ["--config-dir", config, "run", "--headless"], { env, stdio: ["ignore", "ignore", "pipe"] });
+  if (!interactiveProfile) {
+    hub = spawn(binary, ["--config-dir", config, "run", "--headless"], { env, stdio: ["ignore", "ignore", "pipe"] });
+  }
   let hubError = "";
-  hub.stderr.setEncoding("utf8"); hub.stderr.on("data", chunk => { hubError += chunk; });
+  if (hub) { hub.stderr.setEncoding("utf8"); hub.stderr.on("data", chunk => { hubError += chunk; }); }
   const contextResult = JSON.parse((await exec(binary, ["--config-dir", config, "context"], { env, timeout: 10000 })).stdout);
   const hubSocket = contextResult.socket;
   const deadline = Date.now() + 10000;
   let connected = false;
-  while (Date.now() < deadline && !connected) {
+  while (!interactiveProfile && Date.now() < deadline && !connected) {
     try {
       await new Promise((resolve, reject) => {
         const socket = net.createConnection(hubSocket);
@@ -195,7 +205,7 @@ process.exit(result.status ?? 1);
     } catch { await delay(50); }
     if (hub.exitCode !== null) throw new Error(`synthetic hub exited early: ${hubError}`);
   }
-  assert.ok(connected, `synthetic hub did not become ready: ${hubError}`);
+  if (!interactiveProfile) assert.ok(connected, `synthetic hub did not become ready: ${hubError}`);
   if (nativeJail) {
     const forbiddenFiles = [join(home, "credential-sentinel"), join(config, "host-sentinel"), join(state, "host-sentinel")];
     if (resourceSymlinks) forbiddenFiles.push(join(home, "dotfiles/private-sentinel"));
@@ -228,6 +238,40 @@ process.exit(result.status ?? 1);
     run: (...args) => exec(binary, ["--config-dir", config, ...args], { env, cwd, timeout: 30000 }),
     owned: async () => JSON.parse(await readFile(herdrState, "utf8")),
     releaseFirst: () => writeFile(env.MUSTR_TEST_HOLD, "released"),
+    releaseCreate: () => writeFile(env.MUSTR_TEST_HOLD_CREATE, "released"),
+  };
+}
+
+async function profilePty(f, extraArgs = []) {
+  const project = join(f.root, "profile-pty");
+  await mkdir(project, { recursive: true });
+  await writeFile(join(project, "pyproject.toml"), '[project]\nname = "mustr-profile-startup-test"\nversion = "0.0.0"\nrequires-python = ">=3.9"\ndependencies = []\n');
+  const child = spawn("uv", ["run", "--project", project, join(repoRoot, "tests/profile-startup-pty.py"), binary, "--config-dir", f.config, ...extraArgs, "--profile", "team", "run"], { env: f.env, stdio: ["pipe", "pipe", "pipe"], detached: true });
+  const lines = createInterface({ input: child.stdout });
+  let stderr = "";
+  child.stderr.on("data", chunk => { stderr += chunk; });
+  const iterator = lines[Symbol.asyncIterator]();
+  const next = async () => {
+    let timer;
+    const result = await Promise.race([
+      iterator.next(),
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`profile PTY timed out: ${stderr}`)), 30000); }),
+    ]).finally(() => clearTimeout(timer));
+    assert.ok(!result.done, `profile PTY closed early: ${stderr}`);
+    return JSON.parse(result.value);
+  };
+  return {
+    child,
+    lines,
+    next,
+    close: async () => {
+      lines.close();
+      if (child.exitCode !== null || child.signalCode !== null) return;
+      const exited = once(child, "exit");
+      try { process.kill(-child.pid, "SIGTERM"); } catch (error) { if (error.code !== "ESRCH") throw error; }
+      await Promise.race([exited, delay(5000).then(() => { if (child.exitCode === null) child.kill("SIGKILL"); })]);
+      await exited;
+    },
   };
 }
 
@@ -416,6 +460,140 @@ test("ensure revalidates a later slot completed by an individual start while its
   assert.match((await f.run("--profile", "team")).stdout, /0 new agent/);
 });
 
+test("interactive profile dashboard shows startup and q cancels after the in-flight operation settles", { timeout: 60000 }, async t => {
+  const f = await fixture(t, { laterSlot: true, holdFirst: true, interactiveProfile: true });
+  const pty = await profilePty(f);
+  try {
+    assert.deepEqual(await pty.next(), { event: "startup-visible" });
+    const deadline = Date.now() + 5000;
+    let beforeCancel = await f.owned();
+    while (!beforeCancel.runs.length && Date.now() < deadline) {
+      await delay(20);
+      beforeCancel = await f.owned();
+    }
+    assert.equal(beforeCancel.creates.length, 1);
+    assert.equal(beforeCancel.runs.length, 1);
+    pty.child.stdin.write("q\n");
+    assert.deepEqual(await pty.next(), { event: "cancel-visible" });
+    await f.releaseFirst();
+    let completed = await pty.next();
+    if (completed.event === "status-ready") completed = await pty.next();
+    assert.equal(completed.event, "finished", `startup failed to reconcile: ${completed.output} ${JSON.stringify(await f.owned())}`);
+    assert.equal(completed.code, 0, completed.output);
+    const owned = await f.owned();
+    assert.equal(owned.creates.length, 1, "cancellation prevents creating the next slot");
+    assert.equal(owned.runs.length, 1, "cancellation prevents dispatching the next pane command");
+    assert.deepEqual(owned.closes, [], "started tab remains open");
+    assert.match(completed.output, /architect · ready/);
+    assert.match(completed.output, /Startup cancelled; launched agents remain open\./);
+  } finally {
+    await f.releaseFirst();
+    await pty.close();
+  }
+});
+
+test("profile startup without a terminal cancels before dispatching Pi", { timeout: 15000 }, async t => {
+  const f = await fixture(t, { laterSlot: true, interactiveProfile: true });
+  await assert.rejects(f.run("--profile", "team"), /dashboard needs a terminal/);
+  const owned = await f.owned();
+  assert.equal(owned.runs.length, 0, "TUI initialization failure must not launch agents");
+  assert.deepEqual(owned.closes, []);
+});
+
+test("q during tab creation retains ownership but does not dispatch a Pi launch", { timeout: 30000 }, async t => {
+  const f = await fixture(t, { laterSlot: true, holdCreate: true, interactiveProfile: true });
+  const pty = await profilePty(f);
+  try {
+    assert.deepEqual(await pty.next(), { event: "startup-visible" });
+    const deadline = Date.now() + 5000;
+    while (!(await f.owned()).creates.length) {
+      assert.ok(Date.now() < deadline, "startup reaches the held tab creation");
+      await delay(20);
+    }
+    assert.equal((await f.owned()).runs.length, 0);
+    pty.child.stdin.write("q\n");
+    assert.deepEqual(await pty.next(), { event: "cancel-visible" });
+    await f.releaseCreate();
+    let completed = await pty.next();
+    if (completed.event === "status-ready") completed = await pty.next();
+    assert.equal(completed.event, "finished", completed.output);
+    assert.equal(completed.code, 0, completed.output);
+    const owned = await f.owned();
+    assert.equal(owned.creates.length, 1);
+    assert.equal(owned.runs.length, 0, "a cancelled tab creation must not be followed by pane.run");
+    assert.deepEqual(owned.closes, []);
+    const ledger = JSON.parse(await readFile(await f.ledgerPath(), "utf8"));
+    assert.equal(ledger.records.length, 1);
+    assert.equal(ledger.records[0].tab_id, owned.creates[0].tab_id);
+    assert.equal(ledger.records[0].pane_id, owned.creates[0].pane_id);
+    assert.equal(ledger.records[0].ready, false);
+    assert.match(completed.output, /tab created; Pi was not started/);
+  } finally {
+    await f.releaseCreate();
+    await pty.close();
+  }
+});
+
+test("q during the only slot reconciles the launch and reports cancellation", { timeout: 30000 }, async t => {
+  const f = await fixture(t, { holdFirst: true, interactiveProfile: true });
+  const pty = await profilePty(f);
+  try {
+    assert.deepEqual(await pty.next(), { event: "startup-visible" });
+    const deadline = Date.now() + 5000;
+    while (!(await f.owned()).runs.length) {
+      assert.ok(Date.now() < deadline, "startup reaches the held pane command");
+      await delay(20);
+    }
+    pty.child.stdin.write("q\n");
+    assert.deepEqual(await pty.next(), { event: "cancel-visible" });
+    await f.releaseFirst();
+    let completed = await pty.next();
+    if (completed.event === "status-ready") completed = await pty.next();
+    assert.equal(completed.event, "finished", completed.output);
+    assert.equal(completed.code, 0, completed.output);
+    assert.match(completed.output, /Startup cancelled; launched agents remain open\./);
+    const owned = await f.owned();
+    assert.equal(owned.creates.length, 1);
+    assert.equal(owned.runs.length, 1);
+    assert.deepEqual(owned.closes, []);
+  } finally {
+    await f.releaseFirst();
+    await pty.close();
+  }
+});
+
+test("interactive profile failure preserves failed and not-attempted slot reasons", { timeout: 60000 }, async t => {
+  const f = await fixture(t, { laterSlot: true, holdFirst: true, jailFailure: true, interactiveProfile: true });
+  const pty = await profilePty(f, ["--jailed"]);
+  try {
+    assert.deepEqual(await pty.next(), { event: "startup-visible" });
+    const deadline = Date.now() + 5000;
+    let owned = await f.owned();
+    while (!owned.runs.length && Date.now() < deadline) {
+      await delay(20);
+      owned = await f.owned();
+    }
+    assert.equal(owned.runs.length, 1);
+    pty.child.stdin.write("q\n");
+    assert.deepEqual(await pty.next(), { event: "cancel-visible" });
+    await f.releaseFirst();
+    let completed = await pty.next();
+    if (completed.event === "status-ready") completed = await pty.next();
+    assert.equal(completed.event, "finished", completed.output);
+    assert.notEqual(completed.code, 0, "failed interactive startup must preserve a nonzero exit status");
+    assert.match(completed.output, /architect · failed/);
+    assert.match(completed.output, /implementor · not attempted/);
+    assert.match(completed.output, /jailed Pi exited with exit status: 37/);
+    const after = await f.owned();
+    assert.equal(after.creates.length, 1);
+    assert.equal(after.runs.length, 1);
+    assert.deepEqual(after.closes, []);
+  } finally {
+    await f.releaseFirst();
+    await pty.close();
+  }
+});
+
 for (const [resourceSymlinks, customAgentDir] of [[false, false], [true, false], [false, true]]) {
 test(`jailed profile uses ai-jail state defaults (${resourceSymlinks ? "symlink resources" : customAgentDir ? "custom agent directory" : "standard Pi directory"}) and real Pi startup`, { timeout: 60000 }, async t => {
   // Opt-in runs the actual CLI under native ai-jail; normal CI uses the SDK and
@@ -504,7 +682,7 @@ test(`acknowledged bootstrap failure returns promptly (${newHub ? "new hub shuts
   const started = Date.now();
   await assert.rejects(f.run("run", "--headless", "--profile", "team", "--jailed"), /failed during jailed Pi startup.*no retry or cleanup attempted/s);
   assert.ok(Date.now() - started < 8000, "known failure must not wait for the 20-second readiness deadline");
-  await assert.rejects(f.run("--profile", "team", "--jailed"), /startup\/join is unconfirmed/);
+  await assert.rejects(f.run("run", "--headless", "--profile", "team", "--jailed"), /startup\/join is unconfirmed/);
   const owned = await f.owned();
   assert.equal(owned.creates.length, 1);
   assert.equal(owned.runs.length, 1);

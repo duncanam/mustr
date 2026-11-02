@@ -57,7 +57,15 @@ mustr agent stop default/impl/extra         # interactive confirmation if live
 
 `mustr --profile default` is equivalent to the profile run form. A profile run
 starts the hub/dashboard if needed; if one exists, it ensures missing slots and
-leaves that dashboard unchanged. Repeating ensure/default-slot start does not
+leaves that dashboard unchanged. A newly created interactive hub displays its
+dashboard immediately with per-slot starting/ready/failed/not-attempted results.
+Press `q` to cancel remaining startup; an already-dispatched operation resolves
+safely before quit, without closing created tabs or started agents. Cancellation
+after tab creation does not dispatch Pi into that tab. After startup, use `a` to
+show/hide retained results and `[`/`]` to scroll them. Headless runs and ensures
+against an existing hub remain noninteractive. A failed startup retains its
+failure exit status after the user inspects results and quits; cancellation
+alone is a normal quit. Repeating ensure/default-slot start does not
 duplicate a managed slot. Repeating an extra instance name is refused.
 Use slot keys from the selected profile, not role names guessed from examples.
 The shipped default slots are `arch`, `impl`, `review`, `research`, with their
@@ -206,7 +214,10 @@ never prove an external tool/job stopped. Do not resubmit uncertain mutations.
 
 Keys: `t` TODO continuation, `c` manager check-ins, `p` PR watching, `f`
 Messages/Tasks, `r` confirmed fresh-space reset, arrows or `j`/`k` scroll,
-`?` help, `q` quit dashboard/hub without killing participants or their jobs.
+`?` help, `a` show/hide completed profile startup results, `[`/`]` scroll
+visible startup results. During startup `q` cancels remaining launches and waits
+for the dispatched operation to resolve before quitting; otherwise `q` quits the
+dashboard/hub. Neither quit nor startup cancellation kills participants or jobs.
 
 Manager check-ins default on for a fresh space, preserve saved opt-out, wait
 for an idle/unpaused admitted manager and do not fall back to other workers.
