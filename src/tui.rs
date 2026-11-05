@@ -17,6 +17,7 @@ use ratatui::{
 };
 
 use crate::{
+    launcher::{ProfileStartup, SlotState},
     protocol::*,
     service::{Service, now},
 };
@@ -89,6 +90,9 @@ struct View {
     pr_dialog: Option<pr_ui::Dialog>,
     help: bool,
     notice: String,
+    profile_startup: Option<ProfileStartup>,
+    profile_results_visible: bool,
+    profile_results_scroll: u16,
 }
 
 impl View {
@@ -102,6 +106,9 @@ impl View {
             pr_dialog: None,
             help: false,
             notice: String::new(),
+            profile_startup: None,
+            profile_results_visible: false,
+            profile_results_scroll: 0,
         }
     }
 
@@ -167,13 +174,22 @@ impl View {
 }
 
 pub(crate) async fn run(service: Service, color: bool) -> Result<()> {
+    run_with_profile(service, color, None, None).await
+}
+
+pub(crate) async fn run_with_profile(
+    service: Service,
+    color: bool,
+    startup: Option<tokio::sync::watch::Receiver<ProfileStartup>>,
+    cancel: Option<tokio::sync::watch::Sender<bool>>,
+) -> Result<()> {
     ensure!(
         io::stdin().is_terminal() && io::stdout().is_terminal(),
         "dashboard needs a terminal; use mustr run --headless"
     );
     // color-eyre's panic hook is installed first; Ratatui wraps it to restore terminal state.
     let mut terminal = ratatui::try_init()?;
-    let result = event_loop(&mut terminal, service, color).await;
+    let result = event_loop(&mut terminal, service, color, startup, cancel).await;
     let restored = ratatui::try_restore();
     result?;
     restored?;
@@ -184,10 +200,17 @@ async fn event_loop(
     terminal: &mut ratatui::DefaultTerminal,
     service: Service,
     color: bool,
+    mut startup: Option<tokio::sync::watch::Receiver<ProfileStartup>>,
+    cancel: Option<tokio::sync::watch::Sender<bool>>,
 ) -> Result<()> {
     let mut events = EventStream::new();
     let mut snapshots = service.snapshots.clone();
     let mut view = View::in_space(snapshots.borrow().space_id.clone());
+    if let Some(receiver) = &startup {
+        view.profile_startup = Some(receiver.borrow().clone());
+        view.profile_results_visible = !receiver.borrow().complete;
+    }
+    let mut cancel_requested = false;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     loop {
@@ -199,6 +222,21 @@ async fn event_loop(
             _ = terminate.recv() => break,
             _ = tick.tick() => {},
             changed = snapshots.changed() => { if changed.is_err() { break; } },
+            changed = async { match startup.as_mut() { Some(receiver) => receiver.changed().await, None => std::future::pending().await } } => {
+                if changed.is_err() { startup = None; }
+                else if let Some(receiver) = &startup {
+                    view.profile_startup = Some(receiver.borrow().clone());
+                    if !receiver.borrow().complete {
+                        view.profile_results_visible = true;
+                    } else if cancel_requested {
+                        view.profile_results_visible = true;
+                        terminal.draw(|frame| draw(frame, &snapshot, &mut view, color))?;
+                        break;
+                    } else {
+                        view.profile_results_visible = false;
+                    }
+                }
+            },
             event = events.next() => match event {
                 Some(Ok(Event::Key(key))) if key.kind == KeyEventKind::Press => {
                     if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) { break; }
@@ -251,6 +289,23 @@ async fn event_loop(
                                     Err(error) => reset_ui::Dialog::error(error.to_string()),
                                 }
                             });
+                        },
+                        KeyCode::Char('q') if view.profile_startup.as_ref().is_some_and(|startup| !startup.complete) => {
+                            if !cancel_requested {
+                                cancel_requested = true;
+                                if let Some(cancel) = &cancel { cancel.send_replace(true); }
+                                view.notice = "Cancellation requested; waiting for the in-flight startup operation to resolve".into();
+                            }
+                        },
+                        KeyCode::Char('a') if view.profile_startup.as_ref().is_some_and(|startup| startup.complete) => {
+                            view.profile_results_visible = !view.profile_results_visible;
+                            view.profile_results_scroll = 0;
+                        },
+                        KeyCode::Char(']') if view.profile_results_visible => {
+                            view.profile_results_scroll = view.profile_results_scroll.saturating_add(1);
+                        },
+                        KeyCode::Char('[') if view.profile_results_visible => {
+                            view.profile_results_scroll = view.profile_results_scroll.saturating_sub(1);
                         },
                         KeyCode::Char('q') => break,
                         KeyCode::Char('?') => view.help = !view.help,
@@ -308,6 +363,24 @@ async fn event_loop(
                 Some(Err(error)) => return Err(error.into()),
                 None => break,
                 _ => {},
+            }
+        }
+    }
+    if view
+        .profile_startup
+        .as_ref()
+        .is_some_and(|startup| !startup.complete)
+    {
+        if let Some(cancel) = &cancel {
+            cancel.send_replace(true);
+        }
+        while let Some(receiver) = startup.as_mut() {
+            if receiver.borrow().complete {
+                view.profile_startup = Some(receiver.borrow().clone());
+                break;
+            }
+            if receiver.changed().await.is_err() {
+                break;
             }
         }
     }
@@ -430,7 +503,22 @@ fn draw(frame: &mut Frame, snapshot: &Snapshot, view: &mut View, color: bool) {
     draw_header(frame, header, snapshot, view, color);
     frame.render_widget(Paragraph::new(mode_lines), modes);
     if view.help {
-        draw_help(frame, body, color);
+        draw_help(frame, body, color, view.profile_startup.is_some());
+    } else if view.profile_results_visible && view.profile_startup.is_some() {
+        let startup = view
+            .profile_startup
+            .as_ref()
+            .expect("startup state checked");
+        let progress_height =
+            startup_panel_height(startup, body.width, body.height.saturating_sub(2));
+        let [progress, _, dashboard] = Layout::vertical([
+            Constraint::Length(progress_height),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .areas(body);
+        draw_profile_startup(frame, progress, startup, color, view.profile_results_scroll);
+        draw_bound_dashboard(frame, dashboard, snapshot, view, color);
     } else if view.space(snapshot).is_some() {
         let space = view.space_id.clone();
         draw_space(frame, body, snapshot, &space, automation, view, color);
@@ -1180,8 +1268,8 @@ fn message_preview(text: &str) -> String {
     preview
 }
 
-fn draw_help(frame: &mut Frame, area: Rect, color: bool) {
-    let controls = vec![
+fn draw_help(frame: &mut Frame, area: Rect, color: bool, profile_startup: bool) {
+    let mut controls = vec![
         Line::styled("Keyboard", accent(color).add_modifier(Modifier::BOLD)),
         Line::raw("f               Messages / Tasks"),
         Line::raw("↑ ↓ / k j       scroll active tab"),
@@ -1190,11 +1278,21 @@ fn draw_help(frame: &mut Frame, area: Rect, color: bool) {
         Line::raw("p  PR watcher on/off or discover"),
         Line::raw("r  start fresh / reset status (confirmation required)"),
         Line::raw("? / Esc         close help"),
-        Line::raw("q / Ctrl-C      stop hub"),
+        Line::raw(if profile_startup {
+            "q / Ctrl-C      quit (q cancels profile startup first)"
+        } else {
+            "q / Ctrl-C      stop hub"
+        }),
         Line::raw(""),
         Line::raw("One dashboard per space;"),
         Line::raw("launch mustr in other spaces."),
     ];
+    if profile_startup {
+        controls.extend([
+            Line::raw("a               show/hide completed profile results"),
+            Line::raw("[ / ]           scroll profile startup results"),
+        ]);
+    }
     let workflow = vec![
         Line::styled(
             "Connect your workflow",
@@ -1235,9 +1333,137 @@ fn draw_help(frame: &mut Frame, area: Rect, color: bool) {
     }
 }
 
+fn startup_panel_height(startup: &ProfileStartup, width: u16, maximum: u16) -> u16 {
+    let width = usize::from(width.max(1));
+    let wrapped_lines = |text: &str| Line::raw(text).width().div_ceil(width);
+    let content = startup.slots.iter().fold(1usize, |height, slot| {
+        let status = match &slot.state {
+            SlotState::Starting => "starting",
+            SlotState::Ready => "ready",
+            SlotState::Failed(_) => "failed",
+            SlotState::NotAttempted(_) => "not attempted",
+        };
+        let row = format!("{} · {}  {}", slot.slot, status, slot.instance);
+        let reason = match &slot.state {
+            SlotState::Failed(reason) | SlotState::NotAttempted(reason) => {
+                wrapped_lines(&format!("  {reason}"))
+            }
+            SlotState::Starting | SlotState::Ready => 0,
+        };
+        height + wrapped_lines(&row).max(1) + reason
+    }) + usize::from(startup.cancelled || startup.complete);
+    height(content).min(maximum.max(1))
+}
+
+fn draw_bound_dashboard(
+    frame: &mut Frame,
+    area: Rect,
+    snapshot: &Snapshot,
+    view: &mut View,
+    color: bool,
+) {
+    if view.space(snapshot).is_some() {
+        let space = view.space_id.clone();
+        draw_space(
+            frame,
+            area,
+            snapshot,
+            &space,
+            &snapshot.automation,
+            view,
+            color,
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(vec![
+                Line::styled(
+                    format!(
+                        "Bound space {} is unavailable.",
+                        clean(view.space_id.as_str())
+                    ),
+                    bold(),
+                ),
+                Line::raw("This dashboard never switches spaces."),
+                Line::styled("No agent sessions are read or launched.", muted()),
+            ])
+            .wrap(Wrap { trim: false }),
+            area,
+        );
+    }
+}
+
+fn draw_profile_startup(
+    frame: &mut Frame,
+    area: Rect,
+    startup: &ProfileStartup,
+    color: bool,
+    scroll: u16,
+) {
+    let mut lines = vec![Line::styled(
+        format!("Profile startup · {}", clean(&startup.profile)),
+        bold(),
+    )];
+    for slot in &startup.slots {
+        let (state, reason) = match &slot.state {
+            SlotState::Starting => ("starting", None),
+            SlotState::Ready => ("ready", None),
+            SlotState::Failed(reason) => ("failed", Some(reason.as_str())),
+            SlotState::NotAttempted(reason) => ("not attempted", Some(reason.as_str())),
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{} · {}", clean(&slot.slot), state),
+                match &slot.state {
+                    SlotState::Ready => tone(color, Color::Green),
+                    SlotState::Failed(_) => tone(color, Color::Red),
+                    SlotState::NotAttempted(_) => tone(color, Color::Yellow),
+                    SlotState::Starting => accent(color),
+                },
+            ),
+            Span::raw(format!("  {}", clean(&slot.instance))),
+        ]));
+        if let Some(reason) = reason {
+            lines.push(Line::styled(format!("  {}", clean(reason)), muted()));
+        }
+    }
+    if startup.cancelled {
+        lines.push(Line::styled(
+            "Startup cancelled; launched agents remain open.",
+            muted(),
+        ));
+    } else if startup.complete {
+        lines.push(Line::styled("Profile startup reconciled.", muted()));
+    }
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        area,
+    );
+}
+
 fn draw_footer(frame: &mut Frame, area: Rect, snapshot: &Snapshot, view: &View, color: bool) {
     let keys = if view.help {
         "? / Esc close help · q quit"
+    } else if view
+        .profile_startup
+        .as_ref()
+        .is_some_and(|startup| !startup.complete)
+    {
+        "q cancel profile startup · [ ] scroll results · launched agents stay open"
+    } else if view
+        .profile_startup
+        .as_ref()
+        .is_some_and(|startup| startup.complete)
+        && view.profile_results_visible
+    {
+        "[ ] scroll results · a close results · q quit"
+    } else if view
+        .profile_startup
+        .as_ref()
+        .is_some_and(|startup| startup.complete)
+    {
+        "a startup results · q quit"
     } else if area.width < 64 {
         "f view r reset ? help q quit"
     } else if area.width < 96 {
@@ -1282,6 +1508,12 @@ fn draw_footer(frame: &mut Frame, area: Rect, snapshot: &Snapshot, view: &View, 
             },
             tone(color, Color::Yellow),
         )
+    } else if view
+        .profile_startup
+        .as_ref()
+        .is_some_and(|startup| startup.complete)
+    {
+        Line::raw("Profile startup reconciled · press a to inspect per-slot results")
     } else {
         Line::styled(
             if area.width < 60 {
@@ -1583,6 +1815,98 @@ mod tests {
         assert_eq!(roster.1, tasks.1);
         assert!(roster.0 < messages.0);
         assert_eq!(tasks.1, messages.1);
+    }
+
+    #[test]
+    fn profile_startup_rows_show_in_progress_ready_failure_and_skipped_reasons() {
+        let snapshot = empty_space();
+        let mut view = selected_view(&snapshot);
+        view.profile_results_visible = true;
+        view.profile_startup = Some(ProfileStartup {
+            profile: "team".into(),
+            slots: vec![
+                crate::launcher::SlotResult {
+                    slot: "architect".into(),
+                    instance: "team/architect".into(),
+                    state: SlotState::Starting,
+                },
+                crate::launcher::SlotResult {
+                    slot: "successful".into(),
+                    instance: "team/successful".into(),
+                    state: SlotState::Ready,
+                },
+                crate::launcher::SlotResult {
+                    slot: "implementor".into(),
+                    instance: "team/implementor".into(),
+                    state: SlotState::Failed("synthetic launch failure".into()),
+                },
+                crate::launcher::SlotResult {
+                    slot: "reviewer".into(),
+                    instance: "team/reviewer".into(),
+                    state: SlotState::NotAttempted(
+                        "previous slot failed: synthetic launch failure".into(),
+                    ),
+                },
+            ],
+            newly_started: Vec::new(),
+            cancelled: false,
+            complete: false,
+        });
+        let text = screen(&render(&snapshot, &view, 120, 30, false));
+        for expected in [
+            "Profile startup · team",
+            "successful · ready",
+            "architect · starting",
+            "implementor · failed",
+            "synthetic launch failure",
+            "reviewer · not attempted",
+            "previous slot failed:",
+            "q cancel profile startup",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?}:\\n{text}");
+        }
+    }
+
+    #[test]
+    fn completed_profile_results_do_not_replace_dashboard_or_help() {
+        let snapshot = populated();
+        let mut view = selected_view(&snapshot);
+        view.profile_startup = Some(ProfileStartup {
+            profile: "team".into(),
+            slots: vec![crate::launcher::SlotResult {
+                slot: "architect".into(),
+                instance: "team/architect".into(),
+                state: SlotState::Ready,
+            }],
+            newly_started: vec!["team/architect".into()],
+            cancelled: false,
+            complete: true,
+        });
+        let dashboard = screen(&render(&snapshot, &view, 120, 30, false));
+        assert!(
+            dashboard.contains("Keep the dashboard compact"),
+            "{dashboard}"
+        );
+        assert!(dashboard.contains("a startup results"), "{dashboard}");
+        assert!(!dashboard.contains("Profile startup · team"), "{dashboard}");
+
+        view.notice = "Manager check-ins disabled by user".into();
+        let notice = screen(&render(&snapshot, &view, 120, 30, false));
+        assert!(
+            notice.contains("Manager check-ins disabled by user"),
+            "{notice}"
+        );
+        view.notice.clear();
+
+        view.profile_results_visible = true;
+        let results = screen(&render(&snapshot, &view, 120, 30, false));
+        assert!(results.contains("architect · ready"), "{results}");
+        assert!(results.contains("Keep the dashboard compact"), "{results}");
+
+        view.help = true;
+        let help = screen(&render(&snapshot, &view, 120, 30, false));
+        assert!(help.contains("Keyboard"), "{help}");
+        assert!(!help.contains("Profile startup · team"), "{help}");
     }
 
     #[test]

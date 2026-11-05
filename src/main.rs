@@ -194,15 +194,78 @@ async fn main() -> Result<()> {
                 }
                 Err(error) => return Err(error),
             };
-            if let Some(profile) = &profile
-                && let Err(error) = launcher::ensure_profile(&paths, profile, jailed).await
-            {
-                server.shutdown().await;
-                return Err(error);
+            let mut startup_task = None;
+            let mut startup_progress = None;
+            let mut startup_cancel = None;
+            if let Some(profile) = &profile {
+                if headless {
+                    if let Err(error) = launcher::ensure_profile(&paths, profile, jailed).await {
+                        server.shutdown().await;
+                        return Err(error);
+                    }
+                } else {
+                    let initial = launcher::ProfileStartup {
+                        profile: profile.name.clone(),
+                        slots: profile
+                            .agents
+                            .values()
+                            .map(|agent| launcher::SlotResult {
+                                slot: agent.slot.clone(),
+                                instance: format!("{}/{}", profile.name, agent.slot),
+                                state: launcher::SlotState::NotAttempted(
+                                    "waiting for profile startup".into(),
+                                ),
+                            })
+                            .collect(),
+                        newly_started: Vec::new(),
+                        cancelled: false,
+                        complete: false,
+                    };
+                    let (progress_tx, progress_rx) = tokio::sync::watch::channel(initial);
+                    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+                    let paths = paths.clone();
+                    let profile = profile.clone();
+                    let runtime = tokio::runtime::Handle::current();
+                    startup_task = Some(tokio::task::spawn_blocking(move || {
+                        let result = runtime.block_on(launcher::ensure_profile_with_progress(
+                            &paths,
+                            &profile,
+                            jailed,
+                            progress_tx.clone(),
+                            cancel_rx,
+                        ));
+                        match result {
+                            Ok(startup) => startup.check_failures(),
+                            Err(error) => {
+                                let mut failed = progress_tx.borrow().clone();
+                                for slot in &mut failed.slots {
+                                    if matches!(slot.state, launcher::SlotState::NotAttempted(_)) {
+                                        slot.state = launcher::SlotState::NotAttempted(format!(
+                                            "profile startup preflight failed: {error:#}"
+                                        ));
+                                    }
+                                }
+                                failed.complete = true;
+                                progress_tx.send_replace(failed);
+                                Err(error)
+                            }
+                        }
+                    }));
+                    startup_progress = Some(progress_rx);
+                    startup_cancel = Some(cancel_tx);
+                }
             }
             let result = if headless {
                 tracing::info!("headless mode; SIGINT/SIGTERM stops the hub, not its participants");
                 wait_for_shutdown().await
+            } else if startup_progress.is_some() {
+                tui::run_with_profile(
+                    server.service.clone(),
+                    config.ui.color && std::env::var_os("NO_COLOR").is_none(),
+                    startup_progress,
+                    startup_cancel.clone(),
+                )
+                .await
             } else {
                 tui::run(
                     server.service.clone(),
@@ -210,8 +273,21 @@ async fn main() -> Result<()> {
                 )
                 .await
             };
+            if result.is_err()
+                && let Some(cancel) = &startup_cancel
+            {
+                cancel.send_replace(true);
+            }
+            let startup_result = match startup_task {
+                Some(task) => task
+                    .await
+                    .map_err(color_eyre::Report::from)
+                    .and_then(|result| result),
+                None => Ok(()),
+            };
             server.shutdown().await;
             result?;
+            startup_result?;
         }
         Command::Agent { command } => match command {
             AgentCommand::Start { slot, name } => {

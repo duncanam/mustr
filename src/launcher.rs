@@ -240,11 +240,69 @@ impl LedgerFiles {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SlotState {
+    Starting,
+    Ready,
+    Failed(String),
+    NotAttempted(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SlotResult {
+    pub(crate) slot: String,
+    pub(crate) instance: String,
+    pub(crate) state: SlotState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProfileStartup {
+    pub(crate) profile: String,
+    pub(crate) slots: Vec<SlotResult>,
+    pub(crate) newly_started: Vec<String>,
+    pub(crate) cancelled: bool,
+    pub(crate) complete: bool,
+}
+
+impl ProfileStartup {
+    pub(crate) fn check_failures(&self) -> Result<()> {
+        if let Some(failure) = self.slots.iter().find_map(|slot| match &slot.state {
+            SlotState::Failed(reason) => Some(format!("{}: {reason}", slot.instance)),
+            _ => None,
+        }) {
+            bail!("profile startup failed: {failure}");
+        }
+        Ok(())
+    }
+}
+
 pub(crate) async fn ensure_profile(
     paths: &Paths,
     profile: &Profile,
     jail_override: bool,
 ) -> Result<Vec<String>> {
+    let (progress, _receiver) = tokio::sync::watch::channel(ProfileStartup {
+        profile: profile.name.clone(),
+        slots: Vec::new(),
+        newly_started: Vec::new(),
+        cancelled: false,
+        complete: false,
+    });
+    let (_cancel, cancel_receiver) = tokio::sync::watch::channel(false);
+    let startup =
+        ensure_profile_with_progress(paths, profile, jail_override, progress, cancel_receiver)
+            .await?;
+    startup.check_failures()?;
+    Ok(startup.newly_started)
+}
+
+pub(crate) async fn ensure_profile_with_progress(
+    paths: &Paths,
+    profile: &Profile,
+    jail_override: bool,
+    progress: tokio::sync::watch::Sender<ProfileStartup>,
+    cancel: tokio::sync::watch::Receiver<bool>,
+) -> Result<ProfileStartup> {
     validate_jail_request(paths, profile, jail_override)?;
     install::validate_profile_adapter(&pi_agent_dir()?)?;
     let herdr = Herdr::from_env()?;
@@ -258,6 +316,21 @@ pub(crate) async fn ensure_profile(
     prune_missing_tabs(&herdr, &discovery, &files, &mut ledger)?;
     let tabs = list_tabs(&discovery.space_id.to_string())?;
     let mut planned = Vec::new();
+    let mut startup = ProfileStartup {
+        profile: profile.name.clone(),
+        slots: profile
+            .agents
+            .values()
+            .map(|agent| SlotResult {
+                slot: agent.slot.clone(),
+                instance: format!("{}/{}", profile.name, agent.slot),
+                state: SlotState::NotAttempted("startup has not reached this slot".into()),
+            })
+            .collect(),
+        newly_started: Vec::new(),
+        cancelled: false,
+        complete: false,
+    };
 
     for agent in profile.agents.values() {
         let mut agent = agent.clone();
@@ -272,27 +345,116 @@ pub(crate) async fn ensure_profile(
             &instance,
             &agent,
         )? {
-            Existing::Ready => {}
+            Existing::Ready => {
+                if let Some(slot) = startup
+                    .slots
+                    .iter_mut()
+                    .find(|slot| slot.instance == instance)
+                {
+                    slot.state = SlotState::Ready;
+                }
+            }
             Existing::Missing => planned.push((agent, instance)),
         }
     }
     files.save(&ledger)?;
+    progress.send_replace(startup.clone());
 
-    let mut started = Vec::new();
-    for (agent, instance) in planned {
-        if start_one(
+    for (index, (agent, instance)) in planned.iter().enumerate() {
+        if *cancel.borrow() {
+            startup.cancelled = true;
+            for (_, remaining) in planned.iter().skip(index) {
+                if let Some(slot) = startup
+                    .slots
+                    .iter_mut()
+                    .find(|slot| slot.instance == *remaining)
+                {
+                    slot.state = SlotState::NotAttempted("cancelled before launch began".into());
+                }
+            }
+            break;
+        }
+        if let Some(slot) = startup
+            .slots
+            .iter_mut()
+            .find(|slot| slot.instance == *instance)
+        {
+            slot.state = SlotState::Starting;
+        }
+        progress.send_replace(startup.clone());
+        match start_one(
             paths,
             &discovery,
             &mut files,
             &mut ledger,
-            &profile.name,
-            &agent,
-            &instance,
-        )? {
-            started.push(instance);
+            SlotLaunch {
+                profile: &profile.name,
+                agent,
+                instance,
+                cancel: Some(&cancel),
+            },
+        ) {
+            Ok(StartOutcome::Cancelled(reason)) => {
+                startup.cancelled = true;
+                if let Some(slot) = startup
+                    .slots
+                    .iter_mut()
+                    .find(|slot| slot.instance == *instance)
+                {
+                    slot.state = SlotState::NotAttempted(reason);
+                }
+                for (_, remaining) in planned.iter().skip(index + 1) {
+                    if let Some(slot) = startup
+                        .slots
+                        .iter_mut()
+                        .find(|slot| slot.instance == *remaining)
+                    {
+                        slot.state =
+                            SlotState::NotAttempted("cancelled before launch began".into());
+                    }
+                }
+                break;
+            }
+            Ok(outcome) => {
+                if matches!(outcome, StartOutcome::Started) {
+                    startup.newly_started.push(instance.clone());
+                }
+                if let Some(slot) = startup
+                    .slots
+                    .iter_mut()
+                    .find(|slot| slot.instance == *instance)
+                {
+                    slot.state = SlotState::Ready;
+                }
+            }
+            Err(error) => {
+                let reason = format!("{error:#}");
+                if let Some(slot) = startup
+                    .slots
+                    .iter_mut()
+                    .find(|slot| slot.instance == *instance)
+                {
+                    slot.state = SlotState::Failed(reason.clone());
+                }
+                for (_, remaining) in planned.iter().skip(index + 1) {
+                    if let Some(slot) = startup
+                        .slots
+                        .iter_mut()
+                        .find(|slot| slot.instance == *remaining)
+                    {
+                        slot.state =
+                            SlotState::NotAttempted(format!("previous slot failed: {reason}"));
+                    }
+                }
+                break;
+            }
         }
+        progress.send_replace(startup.clone());
     }
-    Ok(started)
+    startup.cancelled |= *cancel.borrow();
+    startup.complete = true;
+    progress.send_replace(startup.clone());
+    Ok(startup)
 }
 
 pub(crate) async fn start_one_instance(
@@ -355,9 +517,12 @@ pub(crate) async fn start_one_instance(
         &discovery,
         &mut files,
         &mut ledger,
-        &profile.name,
-        &agent,
-        &instance,
+        SlotLaunch {
+            profile: &profile.name,
+            agent: &agent,
+            instance: &instance,
+            cancel: None,
+        },
     )?;
     Ok(instance)
 }
@@ -623,15 +788,33 @@ fn existing_instance(
     )
 }
 
+struct SlotLaunch<'a> {
+    profile: &'a str,
+    agent: &'a Agent,
+    instance: &'a str,
+    cancel: Option<&'a tokio::sync::watch::Receiver<bool>>,
+}
+
+enum StartOutcome {
+    Started,
+    AlreadyReady,
+    Cancelled(String),
+}
+
 fn start_one(
     paths: &Paths,
     discovery: &Discovery,
     files: &mut LedgerFiles,
     ledger: &mut Ledger,
-    profile: &str,
-    agent: &Agent,
-    instance: &str,
-) -> Result<bool> {
+    launch: SlotLaunch<'_>,
+) -> Result<StartOutcome> {
+    let SlotLaunch {
+        profile,
+        agent,
+        instance,
+        cancel,
+    } = launch;
+    let cancelled = || cancel.is_some_and(|receiver| *receiver.borrow());
     let agent_dir = pi_agent_dir()?;
     install::validate_profile_adapter(&agent_dir)?;
     // Earlier slots release the lock while Pi starts. An individual start may
@@ -643,7 +826,12 @@ fn start_one(
         == Existing::Ready
     {
         files.save(ledger)?;
-        return Ok(false);
+        return Ok(StartOutcome::AlreadyReady);
+    }
+    if cancelled() {
+        return Ok(StartOutcome::Cancelled(
+            "cancelled before launch began".into(),
+        ));
     }
     let launch_id = uuid::Uuid::new_v4().to_string();
     let launch_directory = files.launch_directory(&launch_id)?;
@@ -689,6 +877,17 @@ fn start_one(
         "--env".to_owned(),
         format!("PI_CODING_AGENT_DIR={}", agent_dir.display()),
     ]);
+    if cancelled() {
+        // No Herdr mutation has been dispatched, so only our private intent
+        // can be removed. Never remove a record once tab creation is sent.
+        ledger
+            .records
+            .retain(|record| record.launch_id != launch_id);
+        files.save(ledger)?;
+        return Ok(StartOutcome::Cancelled(
+            "cancelled before tab creation".into(),
+        ));
+    }
     let output = run_herdr_args(args)
         .wrap_err("tab-create outcome is unresolved; no retry will be attempted")?;
     let (tab, pane) = parse_created_tab(&output, &discovery.space_id.to_string())?;
@@ -702,6 +901,12 @@ fn start_one(
         )
     })?;
 
+    if cancelled() {
+        return Ok(StartOutcome::Cancelled(format!(
+            "tab created; Pi was not started after cancellation; owned tab {} remains open",
+            tab.tab_id
+        )));
+    }
     let descriptor_path = launch_directory.join("descriptor.json");
     let ready_path = launch_directory.join("ready.json");
     let manifest = LaunchDescriptor {
@@ -748,6 +953,12 @@ fn start_one(
         ),
         shell_quote(&launch_id)
     );
+    if cancelled() {
+        return Ok(StartOutcome::Cancelled(format!(
+            "tab created; Pi was not started after cancellation; owned tab {} remains open",
+            tab.tab_id
+        )));
+    }
     files.unlock();
     if let Err(error) = run_herdr(&["pane", "run", &pane, &command]) {
         files.relock()?;
@@ -775,7 +986,7 @@ fn start_one(
             validate_ready(&receipt, &ledger.records[index], discovery, agent)?;
             ledger.records[index].ready = true;
             files.save(ledger)?;
-            return Ok(true);
+            return Ok(StartOutcome::Started);
         }
         let failure_path = launch_directory.join("failed.json");
         if let Ok(bytes) = read_private_file(&failure_path, 16 * 1024) {
